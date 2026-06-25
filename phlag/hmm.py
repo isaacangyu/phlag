@@ -471,7 +471,7 @@ class PhlagHMMEmissions(HMMEmissions):
         m_step_state: Union[Scalar, Float[Array, "emission_dim num_classes"]],
     ) -> Tuple[
         ParamsCategoricalHMMEmissions, Union[Scalar, Float[Array, "emission_dim num_classes"]]
-    ]:
+    ]:  # TODO: Simplfy and don't do penalty.
         # Tuple[ParamsCategoricalHMMEmissions, Any]:
         emission_stats = pytree_sum(batch_stats, axis=0)
         S = self.concentration + emission_stats["sum_x"]
@@ -480,38 +480,6 @@ class PhlagHMMEmissions(HMMEmissions):
             emission_stats = pytree_sum(batch_stats, axis=0)
             S = self.concentration + emission_stats["sum_x"]
             probs = tfd.Dirichlet(S).mode()
-            if self.parameterization[1] is EmissionParam.FREE:
-                pass
-            elif self.parameterization[1] is EmissionParam.REPULSION:
-                # Not recommended...
-                probs = probs.at[1].set(
-                    jax.vmap(
-                        lambda x, y: self.map_estimate_kl(x, y, True),
-                        # lambda x, y: self.map_estimate_bfgs(x, y, True),
-                        # lambda x, y: self.map_estimate_lagrange(x, y, True),
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(m_step_state, S[1])
-                )
-            else:
-                raise ValueError(f"Invalid emission parameterization for : {self.parameterization}")
-
-            if self.parameterization[0] is EmissionParam.FREE:
-                pass
-            elif self.parameterization[0] is EmissionParam.ATTRACTION:
-                probs = probs.at[0].set(
-                    jax.vmap(
-                        self.map_estimate_kl,
-                        # self.map_estimate_bfgs,
-                        # self.map_estimate_lagrange,
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(m_step_state, S[0])
-                )
-            elif self.parameterization[0] is EmissionParam.ANCHOR:
-                probs = probs.at[0].set(m_step_state)
-            else:
-                raise ValueError(f"Invalid emission parameterization: {self.parameterization}")
             params = params._replace(probs=probs)
         return params, m_step_state
 
