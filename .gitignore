@@ -140,6 +140,7 @@ celerybeat.pid
 .venv
 env/
 venv/
+micromamba/
 phlag_env/
 ENV/
 env.bak/
@@ -206,3 +207,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# results
+results*.txt

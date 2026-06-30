@@ -263,8 +263,9 @@ class PhlagHMMTransitions(HMMTransitions):
         return params, m_step_state
 
 
-class ParamsCategoricalHMMEmissions(NamedTuple):
-    probs: Union[Float[Array, "state_dim emission_dim"], ParameterProperties]
+class ParamsGaussianHMMEmissions(NamedTuple):
+    means: Union[Float[Array, "state_dim emission_dim"], ParameterProperties]
+    covariances: Union[Float[Array, "state_dim emission_dim emission_dim"], ParameterProperties]
 
 
 class EmissionParam(Enum):
@@ -301,10 +302,11 @@ class PhlagHMMEmissions(HMMEmissions):
         return (self.emission_dim,)
 
     def distribution(
-        self, params: ParamsCategoricalHMMEmissions, state: IntScalar, inputs=None
+        self, params: ParamsGaussianHMMEmissions, state: IntScalar, inputs=None
     ) -> tfd.Distribution:
-        return tfd.Independent(
-            tfd.Categorical(probs=params.probs[state]), reinterpreted_batch_ndims=1
+        return tfd.MultivariateNormalFullCovariance(
+            loc=params.means[state], 
+            covariance_matrix=params.covariances[state]
         )
 
     def log_prior(self, params: ParamsCategoricalHMMEmissions) -> Scalar:
@@ -339,19 +341,14 @@ class PhlagHMMEmissions(HMMEmissions):
             probs=ParameterProperties(constrainer=tfb.SoftmaxCentered())
         )
         return params, props
-
-    def collect_suff_stats(
-        self,
-        params: ParamsCategoricalHMMEmissions,
-        posterior: HMMPosterior,
-        emissions: Array,
-        inputs=None,
-    ) -> dict:
-        return dict(
-            sum_x=jnp.einsum(
-                "tk,tdi->kdi", posterior.smoothed_probs, one_hot(emissions, self.num_classes)
-            )
-        )
+    
+    def collect_suff_stats(self, params: ParamsGaussianHMMEmissions, posterior: Any, emissions: Array, inputs=None) -> dict:
+        # posterior.smoothed_probs has shape (T, num_states)
+        # emissions has shape (T, emission_dim)
+        sum_weights = jnp.sum(posterior.smoothed_probs, axis=0)
+        sum_x = jnp.einsum("tk,td->kd", posterior.smoothed_probs, emissions)
+        sum_xxT = jnp.einsum("tk,ti,tj->kij", posterior.smoothed_probs, emissions, emissions)
+        return dict(sum_weights=sum_weights, sum_x=sum_x, sum_xxT=sum_xxT)
 
     def initialize_m_step_state(
         self, params: ParamsCategoricalHMMEmissions, props: ParamsCategoricalHMMEmissions
@@ -472,15 +469,22 @@ class PhlagHMMEmissions(HMMEmissions):
     ) -> Tuple[
         ParamsCategoricalHMMEmissions, Union[Scalar, Float[Array, "emission_dim num_classes"]]
     ]:  # TODO: Simplfy and don't do penalty.
-        # Tuple[ParamsCategoricalHMMEmissions, Any]:
-        emission_stats = pytree_sum(batch_stats, axis=0)
-        S = self.concentration + emission_stats["sum_x"]
-        probs = tfd.Dirichlet(S).mode()
         if props.probs.trainable:
+            stats = pytree_sum(batch_stats, axis=0)
             emission_stats = pytree_sum(batch_stats, axis=0)
-            S = self.concentration + emission_stats["sum_x"]
-            probs = tfd.Dirichlet(S).mode()
-            params = params._replace(probs=probs)
+            sum_weights = stats["sum_weights"][:, None] 
+            sum_x = stats["sum_x"]                     
+            sum_xxT = stats["sum_xxT"]                 
+
+            # Analytical updates for continuous targets
+            means = sum_x / (sum_weights + 1e-12)
+            mu_muT = jnp.einsum("ki,kj->kij", means, means)
+            covariances = (sum_xxT / (sum_weights[..., None] + 1e-12)) - mu_muT
+        
+            # Add regularizer matrix to guarantee positive-definiteness 
+            eps = 1e-5
+            covariances += jnp.stack([jnp.eye(self.emission_dim) * eps for _ in range(self.num_states)])
+            params = params._replace(means=means, covariances=covariances)
         return params, m_step_state
 
     def state_divergence(self, params: ParamsCategoricalHMMEmissions) -> Float:
