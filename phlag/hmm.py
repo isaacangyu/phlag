@@ -309,7 +309,7 @@ class PhlagHMMEmissions(HMMEmissions):
             covariance_matrix=params.covariances[state]
         )
 
-    def log_prior(self, params: ParamsCategoricalHMMEmissions) -> Scalar:
+    def log_prior(self, params: ParamsGaussianHMMEmissions) -> Scalar:
         return tfd.Dirichlet(self.concentration).log_prob(params.probs).sum()
 
     def initialize(
@@ -317,7 +317,7 @@ class PhlagHMMEmissions(HMMEmissions):
         key: Optional[PRNGKeyT] = jr.PRNGKey(0),
         method: str = "prior",
         emission_probs: Optional[Float[Array, "num_states emission_dim num_classes"]] = None,
-    ) -> Tuple[ParamsCategoricalHMMEmissions, ParamsCategoricalHMMEmissions]:
+    ) -> Tuple[ParamsGaussianHMMEmissions, ParamsGaussianHMMEmissions]:
         if emission_probs is None:
             if method.lower() == "prior":
                 if key is None:
@@ -336,8 +336,8 @@ class PhlagHMMEmissions(HMMEmissions):
             )
             emission_probs = emission_probs / jnp.sum(emission_probs, axis=-1)[:, :, None]
 
-        params = ParamsCategoricalHMMEmissions(probs=emission_probs)
-        props = ParamsCategoricalHMMEmissions(
+        params = ParamsGaussianHMMEmissions(probs=emission_probs)
+        props = ParamsGaussianHMMEmissions(
             probs=ParameterProperties(constrainer=tfb.SoftmaxCentered())
         )
         return params, props
@@ -351,12 +351,12 @@ class PhlagHMMEmissions(HMMEmissions):
         return dict(sum_weights=sum_weights, sum_x=sum_x, sum_xxT=sum_xxT)
 
     def initialize_m_step_state(
-        self, params: ParamsCategoricalHMMEmissions, props: ParamsCategoricalHMMEmissions
+        self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
     ) -> Any:
         return None
 
     def update_m_step_state(
-        self, params: ParamsCategoricalHMMEmissions, props: ParamsCategoricalHMMEmissions
+        self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
     ) -> Any:
         return None
 
@@ -462,12 +462,12 @@ class PhlagHMMEmissions(HMMEmissions):
 
     def m_step(
         self,
-        params: ParamsCategoricalHMMEmissions,
-        props: ParamsCategoricalHMMEmissions,
+        params: ParamsGaussianHMMEmissions,
+        props: ParamsGaussianHMMEmissions,
         batch_stats: dict,
         m_step_state: Union[Scalar, Float[Array, "emission_dim num_classes"]],
     ) -> Tuple[
-        ParamsCategoricalHMMEmissions, Union[Scalar, Float[Array, "emission_dim num_classes"]]
+        ParamsGaussianHMMEmissions, Union[Scalar, Float[Array, "emission_dim num_classes"]]
     ]:  # TODO: Simplfy and don't do penalty.
         if props.probs.trainable:
             stats = pytree_sum(batch_stats, axis=0)
@@ -487,7 +487,7 @@ class PhlagHMMEmissions(HMMEmissions):
             params = params._replace(means=means, covariances=covariances)
         return params, m_step_state
 
-    def state_divergence(self, params: ParamsCategoricalHMMEmissions) -> Float:
+    def state_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
         probs = params.probs
         total_divergence = 0
         for i in range(probs.shape[0]):
@@ -501,7 +501,7 @@ class PhlagHMMEmissions(HMMEmissions):
 class ParamsPhlagHMM(NamedTuple):
     initial: ParamsStandardHMMInitialState
     transitions: ParamsStandardHMMTransitions
-    emissions: ParamsCategoricalHMMEmissions
+    emissions: ParamsGaussianHMMEmissions
 
 
 class PhlagHMM(HMM):
