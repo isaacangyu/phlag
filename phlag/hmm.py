@@ -295,10 +295,13 @@ class PhlagHMMEmissions(HMMEmissions):
     def distribution(
         self, params: ParamsGaussianHMMEmissions, state: IntScalar, inputs=None
     ) -> tfd.Distribution:
-        return tfd.MultivariateNormalFullCovariance(
-            loc=params.means[state], 
-            covariance_matrix=params.covariances[state]
-        )
+        mean = params.means[state]
+        # Safely capture the diagonal entries from the 3x3 matrix space
+        variance_diag = jnp.diagonal(params.covariances[state])
+        # Ensure numerical stability across JAX boundaries via clipping/absolute values
+        std_dev = jnp.sqrt(jnp.clip(variance_diag, a_min=1e-6))
+
+        return tfd.MultivariateNormalDiag(loc=mean, scale_diag=std_dev)
 
     def log_prior(self, params: ParamsGaussianHMMEmissions) -> Scalar:
         # Return 0 for now (flat prior on continuous emissions)
@@ -312,17 +315,26 @@ class PhlagHMMEmissions(HMMEmissions):
     ) -> Tuple[ParamsGaussianHMMEmissions, ParamsGaussianHMMEmissions]:
         if emission_probs is None:
             raise ValueError("emission_probs must be provided")
-        else:
-            # Infer num_classes from shape
-            num_classes = emission_probs.shape[-1]
-            self._ensure_concentration_shape(num_classes)
-            assert jnp.all(emission_probs >= 0)
-            assert jnp.allclose(
-                jnp.sum(emission_probs, axis=-1), jnp.ones(emission_probs.shape[:-1]), atol=1e-03
-            )
-            emission_probs = emission_probs / jnp.sum(emission_probs, axis=-1)[:, :, None]
 
-        params = ParamsGaussianHMMEmissions(means=emission_probs, covariances=emission_probs)
+        if emission_probs.ndim == 3 and emission_probs.shape[-1] == 2:
+            num_states, emission_dim, _ = emission_probs.shape
+            means = emission_probs[..., 0]
+            variances = emission_probs[..., 1]
+            covariances = jnp.stack(
+                [jnp.diag(variances[state]) for state in range(num_states)], axis=0
+            )
+            params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
+        elif emission_probs.ndim == 2:
+            means = emission_probs
+            num_states, emission_dim = means.shape
+            covariances = jnp.stack([jnp.eye(emission_dim) for _ in range(num_states)], axis=0)
+            params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
+        else:
+            raise ValueError(
+                "Unsupported emission_probs shape. Expected [num_states, emission_dim, 2] "
+                "for mean/variance initialization or [num_states, emission_dim] for means only."
+            )
+
         props = ParamsGaussianHMMEmissions(
             means=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
             covariances=ParameterProperties(constrainer=tfb.SoftmaxCentered())

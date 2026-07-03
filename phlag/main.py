@@ -4,7 +4,6 @@ import os
 import argparse
 
 import jax
-import dendropy
 import numpy as np
 import jax.numpy as jnp
 import jax.random as jrand
@@ -12,7 +11,6 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 
 from collections import defaultdict
 from functools import partial
-from io import StringIO
 from tqdm import tqdm
 from skbio.stats.composition import ilr, multi_replace
 
@@ -22,7 +20,6 @@ from . import utils
 E_STEP_EPS = 0.0001
 PSI_EPS = 0.001
 NUM_STATES = 2
-MAX_INCIDENT_LENGTH = 2.0
 BETA_PRIME = 0.0025
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
 
@@ -31,11 +28,7 @@ class Phlag:
     def __init__(self, args):
         self.args = args
 
-        self.read_species_tree()
         self.validate_parameters()
-        self.determine_focal_edges()
-        self.st.deroot()
-        self.st.encode_bipartitions()
         
         # Purely ingest CASTER scores instead of computing or reading QQS
         self.read_caster_scores(self.args.caster_scores)
@@ -45,39 +38,11 @@ class Phlag:
         self.initialize_hmm()
         self.initialize_output()
 
-    def read_species_tree(self):
-        self.taxa = utils.get_canonical_taxon_namespace(self.args.species_tree)
-        self.st = dendropy.Tree.get(
-            path=self.args.species_tree,
-            schema="newick",
-            preserve_underscores=True,
-            taxon_namespace=self.taxa,
-        )
-        self.st.suppress_unifurcations()
-        self.st.collapse_basal_bifurcation()
-        self.st.encode_bipartitions(
-            collapse_unrooted_basal_bifurcation=True, suppress_unifurcations=True
-        )
-        self.lbl_to_nd = utils.map_label_to_node(self.st)
-
     def validate_parameters(self):
         if self.args.n_iters < 1:
             raise ValueError(f"--n-iters must be >= 1, got {self.args.n_iters}")
-        if self.args.focal_edge not in self.lbl_to_nd:
-            raise ValueError(f"Focal edge label '{self.args.focal_edge}' not found in species tree")
-
-    def determine_focal_edges(self):
-        self.focal_edges = []
-        edge = utils.focal_edge_from_label(self.st, self.args.focal_edge, self.lbl_to_nd)
-        if self.args.expand_edges:
-            self.focal_edges.extend(
-                incident
-                for incident in utils.get_incident_edges(self.st, edge, self.lbl_to_nd)
-                if incident.length < MAX_INCIDENT_LENGTH or incident == edge
-            )
-        else:
-            self.focal_edges.append(edge)
-        self.num_edges = len(self.focal_edges)
+        if self.args.window_size is not None and self.args.window_size < 1:
+            raise ValueError(f"--window-size must be >= 1, got {self.args.window_size}")
 
     def read_caster_scores(self, path):
         """
@@ -123,27 +88,101 @@ class Phlag:
         else:
             self.Y = raw_caster_matrix
 
-    def focal_edge_lengths(self):
-        return [edge.head_node.label + ": " + str(edge.length) for edge in self.focal_edges]
-
     def initialize_output(self):
         self.output_file = self.args.output_file
-        self.output_str = f"# {' '.join(sys.argv)}"
-        self.output_str += "\n# Initial tree: " + self.st.as_string(schema="newick")
-        self.output_str += "# Initial focal edge lengths: " + ", ".join(self.focal_edge_lengths())
+        headers = [f"# {' '.join(sys.argv)}"]
+        self.output_str = "\n".join(headers)
 
     def compute_output(self):
-        emission_divergence_str = ", ".join(
-            list(map(lambda x: str(x), self.hmm.state_emission_divergence(self.params).tolist()))
-        )
+        divergence = self.hmm.state_emission_divergence(self.params)
+        try:
+            emission_divergence_str = ", ".join(map(str, divergence.tolist()))
+        except TypeError:
+            emission_divergence_str = str(float(divergence))
         most_likely_states = self.hmm.most_likely_states(self.params, self.Y)
         ps = self.hmm.smoother(self.params, self.Y).smoothed_probs[:, 1]
         
-        self.output_str += "\n# Final tree: " + self.st.as_string(schema="newick")
-        self.output_str += "# Final focal edge lengths: " + ", ".join(self.focal_edge_lengths())
-        self.output_str += "\n# State divergence: " + emission_divergence_str
+        headers = []
+        headers.append("# State divergence: " + emission_divergence_str)
+        
+        self.output_str += "\n" + "\n".join(headers)
         self.output_str += "\n" + ",".join(map(str, most_likely_states.astype(int).tolist()))
         self.output_str += "\n" + ",".join(map(lambda x: str(x), jnp.round(ps, decimals=3).tolist()))
+        
+        # Output histogram counting the number of ones in a given window size if parameter is passed
+        hist_str = self.generate_histogram(most_likely_states)
+        if hist_str:
+            self.output_str += hist_str
+
+    def generate_histogram(self, most_likely_states):
+        window_size = self.args.window_size
+        if window_size is None:
+            return ""
+
+        num_positions = len(most_likely_states)
+        window_counts = []
+        for start in range(0, num_positions, window_size):
+            end = min(start + window_size, num_positions)
+            count = int(jnp.sum(most_likely_states[start:end] == 1))
+            window_counts.append((start, end, count))
+
+        # 1. Text-based ASCII histogram
+        lines = [
+            "",
+            f"# Window-based counts of flagged positions (ones) (window size = {window_size}):",
+            "# Range       | Count | Bar",
+        ]
+        
+        max_count = max([c for _, _, c in window_counts]) if window_counts else 0
+        bar_max_width = 40
+        
+        for start, end, count in window_counts:
+            bar_len = int((count / max_count) * bar_max_width) if max_count > 0 else 0
+            bar = "*" * bar_len
+            range_str = f"{start:<6}-{end:<6}"
+            lines.append(f"# {range_str} | {count:<5} | {bar}")
+            
+        text_hist = "\n".join(lines) + "\n"
+
+        # 2. Matplotlib visual plot saving
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            sns.set_theme(style="whitegrid")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            windows = [f"{start}-{end}" for start, end, _ in window_counts]
+            counts = [c for _, _, c in window_counts]
+            
+            bars = ax.bar(windows, counts, color=sns.color_palette("viridis", len(counts)), edgecolor='none')
+            
+            ax.set_title(f"Flagged Positions Count per Window (Size = {window_size})", fontsize=14, fontweight="bold", pad=15)
+            ax.set_xlabel("Genomic Window Range (bp)", fontsize=12, labelpad=10)
+            ax.set_ylabel("Count of Flagged (Anomalous) States (1s)", fontsize=12, labelpad=10)
+            plt.xticks(rotation=45, ha='right', fontsize=9)
+            
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:
+                    ax.annotate(f'{height}',
+                                xy=(bar.get_x() + bar.get_width() / 2, height),
+                                xytext=(0, 3),
+                                textcoords="offset points",
+                                ha='center', va='bottom', fontsize=9, fontweight="semibold")
+                                
+            plt.tight_layout()
+            
+            output_path = pathlib.Path(self.output_file)
+            plot_path = output_path.with_name(f"{output_path.stem}_histogram.png")
+            plt.savefig(plot_path, dpi=300)
+            plt.close()
+            print(f"Saved visual window histogram to: {plot_path}")
+            
+        except Exception as e:
+            print(f"Warning: Could not generate visual histogram plot: {e}")
+
+        return text_hist
 
     def initialize_hmm(self):
         # Fixed prior hyperparameters
@@ -166,7 +205,7 @@ class Phlag:
         
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
-            self.num_edges,
+            self.Y.shape[-1],
             emission_lambda=self.emission_lambda,
             emission_concentration=self.gamma,
             emission_parameterization=self.emission_parameterization,
@@ -180,19 +219,20 @@ class Phlag:
         data_std = jnp.std(self.Y, axis=0)
         
         # Implement symmetry breaking: Anchor state 0 to the baseline mean,
-        # and seed state 1 slightly further along the alternative dimensions
-        state0_init = data_mean
-        state1_init = data_mean + (1.0 * data_std)
-        
-        # Stack the perturbed matrices to form distinct starting emission spaces
+        # and seed state 1 slightly further along the alternative dimensions.
+        # Initialize emissions using mean and variance for each state.
+        state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
+        state1_init = jnp.stack([data_mean + data_std, data_std ** 2], axis=-1)
+
+        # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
-        
+
         self.params, self.props = self.hmm.initialize(
             initial_probs=INITIAL_PROBS, emission_probs=init_emissions
         )
         self.props.transitions.transition_matrix.trainable = True
-        self.props.emissions.probs.trainable = True
-        self.props.initial.probs.trainable = True
+        self.props.emissions.means.trainable = True
+        self.props.emissions.covariances.trainable = True
         
         self.hmm.initialize_m_step_state(self.params, self.props)
         self.n_iters = self.args.n_iters
@@ -220,13 +260,6 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "-s",
-        "--species-tree",
-        type=pathlib.Path,
-        required=True,
-        help="Path to species tree in Newick format",
-    )
-    parser.add_argument(
         "-o", "--output-file", type=pathlib.Path, required=True, help="Path to save the output"
     )
     parser.add_argument(
@@ -240,16 +273,11 @@ def parse_arguments():
         help="Increment for inner EM iterations (default: 50)",
     )
     parser.add_argument(
-        "-e",
-        "--focal-edge",
-        type=str,
-        required=True,
-        help="Focal edge specified by inner node label.",
-    )
-    parser.add_argument(
-        "--expand-edges",
-        action="store_true",
-        help="Incorporate the signal from neighboring/incident edges.",
+        "-w",
+        "--window-size",
+        type=int,
+        default=None,
+        help="Optional window size to calculate and plot/output a histogram of flagged ones counts in non-overlapping windows.",
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
