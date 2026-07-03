@@ -263,7 +263,7 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "-o", "--output-file", type=pathlib.Path, required=True, help="Path to save the output"
+        "-o", "--output-file", type=pathlib.Path, required=False, default=None, help="Path to save the output"
     )
     parser.add_argument(
         "-L", "--n-iters", type=int, default=5, help="Number of (outer) iterations (default: 5)"

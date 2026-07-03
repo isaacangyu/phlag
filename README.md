@@ -2,9 +2,9 @@
 
 **Phlag** detects and flags phylogenetic anomalies across the genome.
 
-Given a species tree and CASTER scores across genomic positions, Phlag detects strong deviations from the multi-species coalescent (MSC) using a hidden Markov model (HMM).
+Given CASTER topology scores across genomic positions ordered along a chromosome, Phlag detects strong deviations from the multi-species coalescent (MSC) using a hidden Markov model (HMM).
 
-The input is CASTER topology scores at genomic positions ordered along a chromosome. The output is a set of flagged subsequences corresponding to regions with anomalous topology distributions.
+---
 
 ## Installation
 
@@ -18,69 +18,61 @@ cd phlag
 pip install .
 ```
 
-<!-- You can simply use pip. -->
-<!-- ```shell -->
-<!-- pip install phlag -->
-<!-- ``` -->
+---
 
-<!-- Alternatively, install Phlag from the source. -->
-<!-- ```shell -->
-<!-- git clone https://github.com/bo1929/phlag.git -->
-<!-- cd phlag -->
-<!-- pip install . -->
-<!-- ``` -->
+## 1. Caster CLI Utility
 
-## Quickstart with a toy example
-
-The `test/` directory contains a simulated dataset based on a Neoaves species tree with 191 taxa. We use it to demonstrate how Phlag detects a genomic region where the MSC model is violated.
-
-We have a species tree (`test/neoaves.nwk`) and 1500 CASTER score positions (`test/qqs.tsv`) ordered along a chromosome. The sequence contains a mixture of regions with two different topology distributions:
-
-- **Background**: Positions following the standard MSC with the original species tree parameters.
-- **Anomalous**: Positions with altered topology distributions due to a 10-fold increase in effective population size on the branch leading to the *Charadriiformes* clade (labeled `N159`).
-
-Out of the 1500 consecutive positions, 150 (10%) are anomalous. They form one contiguous block at indices [913, 1063) (0-indexed). The goal is to recover that region with Phlag.
-
-### Input
-
-- **Species tree** (`-s`): A Newick species tree with labeled internal nodes. Optional when running without a focal edge.
-- **CASTER scores** (`-c`): TSV file with CASTER topology scores (pos, ABBA, BABA, AABB) at genomic positions.
-- **Focal edge** (`-e`): Optional label of an internal node defining the edge to target. When omitted, Phlag runs without focal-edge-specific diagnostics.
+The `caster` command-line utility slices range coordinates and runs the D* statistic calculation on multiple sequence alignments.
 
 ### Usage
 
 ```shell
-phlag \
-  -s test/neoaves.nwk \
-  -c caster/data/apeC_w50_s50_n.tsv \
-  -e N159 \
-  -L 1 \
-  -o results-neoaves-N159.txt
+caster caster/data/ape.fa -l 0 -r 200000 -w 1000 -s 100 -n -m caster/data/ape_mapping.tsv
 ```
-
-One Liner
-```shell
-phlag -c caster/data/apeC_w50_s50_n.tsv -L 1 -o results-neoaves-N159.txt
-```
-
-For all options, run `phlag --help`.
 
 ### Options
 
-- **`-L, --n-iters`** (default: `5`): Number of outer EM iterations.
-- **`-l, --increment-steps`** (default: `50`): Number of inner EM iterations per outer iteration.
-- **`--expand-edges`**: Include signal from neighboring/incident edges in addition to the focal edge.
-- **`--ilr-transform`**: Apply isometric log-ratio transformation to CASTER scores.
-- **`--emission-parameterization`** (default: `attraction`): Parameterization of emission probabilities (`free`, `attraction`, or `anchor`).
+* **`fasta_file`** (positional, required): Input multiple sequence alignment FASTA file path.
+* **`-l, --left`** (required): Left coordinate range bound (0-indexed, inclusive).
+* **`-r, --right`** (required): Right coordinate range bound (0-indexed, exclusive).
+* **`-w, --window-size`** (default: `10000`): Sliding window size (bp) for calculating D* statistic.
+* **`-s, --step-size`** (default: `10000`): Step size (stride translation step) for sliding window.
+* **`-n, --normalize`**: Apply min-max normalization to D* scores.
+* **`-m, --mapping`**: Optional population/clade structure mapping file path (required for alignments with >4 taxons).
 
 ### Output
 
-The output file contains:
+The output TSV files are stored inside `caster/data/`. The utility automatically removes the letter `C` from the input FASTA filename stem (e.g. `apeC` -> `ape`), appends the coordinate bounds, formats/abbreviates large numbers using `k` and `m`, and adds `_n` if normalized.
 
-- **Header lines** (prefixed with `#`):
-  - The invoked command.
-  - The initial species tree with branch lengths in coalescent units (CU).
-  - Labels and branch lengths of the focal edge.
-  - State divergence: distance between emission distributions of the two HMM states.
-- **State labels**: A comma-separated sequence where `1` is for flagged (anomalous), `0` is for standard MSC.
-- **Posterior probabilities**: Smoothed posterior probability of the anomalous state for each position.
+* **Example output file name**: `caster/data/ape_0_200k_w1k_s100_n.tsv`
+
+---
+
+## 2. Phlag HMM CLI Utility
+
+The `phlag` utility fits a Gaussian HMM to the CASTER topology scores to flag anomalous genomic regions.
+
+### Usage
+
+```shell
+phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 1 -w 100
+```
+
+### Options
+
+* **`-c, --caster-scores`** (required): TSV file containing the CASTER scores.
+* **`-L, --n-iters`** (default: `5`): Number of outer EM iterations.
+* **`-l, --increment-steps`** (default: `50`): Number of inner EM iterations per outer iteration.
+* **`-w, --window-size`**: Genomic window size (in rows/positions) to compute a text-based ASCII histogram and save a visual bar chart plot.
+* **`-o, --output-file`** (optional): Custom path to save the output report (automatically defaults to saving in the `test/` directory).
+* **`--ilr-transform`**: Apply isometric log-ratio transformation to CASTER scores.
+* **`--emission-parameterization`** (default: `attraction`): Parameterization of emission probabilities (`free`, `attraction`, or `anchor`).
+
+### Output
+
+The output report and visual histogram plot are automatically saved in the `test/` directory, named `results_` + `input_filename` (e.g., [test/results_ape_0_200k_w1k_s100_n.tsv](file:///c:/Users/isaac/phlag/test/results_ape_0_200k_w1k_s100_n.tsv)).
+
+The report file contains:
+* **Header lines** (prefixed with `#`): Including the command run and HMM state emission divergence.
+* **State path**: A comma-separated sequence of discrete binary states (`0` for standard MSC, `1` for anomalous flagged states).
+* **ASCII Histogram**: Counts of anomalous positions in non-overlapping genomic windows.
