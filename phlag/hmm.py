@@ -172,22 +172,6 @@ def hellinger2_distance(p: Float[Array, "num_classes"], q: Float[Array, "num_cla
     return jnp.sum((jnp.sqrt(p) - jnp.sqrt(q)) ** 2) * 0.5
 
 
-def kl_divergence(p: Float[Array, "num_classes"], q: Float[Array, "num_classes"]) -> Float:
-    d1 = jnp.sum(kl_div(p + 1e-10, q + 1e-10))
-    d2 = jnp.sum(kl_div(q + 1e-10, p + 1e-10))
-    return (d1 + d2) / 2
-
-
-def total_variation_distance(
-    p: Float[Array, "num_classes"], q: Float[Array, "num_classes"]
-) -> Float:
-    return 0.5 * jnp.sum(jnp.abs(p - q))
-
-
-def l2(p: Float[Array, "num_classes"], q: Float[Array, "num_classes"]) -> Float:
-    return jnp.sqrt(jnp.sum((p - q) ** 2))
-
-
 def divergence_e(e_0: Float[Array, "num_classes"], e_1: Float[Array, "num_classes"]) -> Float:
     return hellinger2_distance(e_1, e_0)
 
@@ -264,8 +248,8 @@ class PhlagHMMTransitions(HMMTransitions):
 
 
 class ParamsGaussianHMMEmissions(NamedTuple):
-    means: Union[Float[Array, "state_dim emission_dim"], ParameterProperties]
-    covariances: Union[Float[Array, "state_dim emission_dim emission_dim"], ParameterProperties]
+    means: Union[Float[Array, "num_states emission_dim"], ParameterProperties]
+    covariances: Union[Float[Array, "num_states emission_dim emission_dim"], ParameterProperties]
 
 
 class EmissionParam(Enum):
@@ -280,22 +264,29 @@ class PhlagHMMEmissions(HMMEmissions):
         self,
         num_states: int,
         emission_dim: int,
-        num_classes: int,
         penalty_lambda: float,
         parameterization: Tuple[EmissionParam, ...],
         concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
-        self.num_classes = num_classes
         self.penalty_lambda = penalty_lambda
         self.parameterization = parameterization
-        self.concentration = concentration * jnp.ones(self.num_classes)
+        self.concentration = concentration
 
     def set_emission_prior_concentration(
         self, concentration: Union[Scalar, Float[Array, "num_classes"]]
     ):
         self.concentration = concentration
+    
+    def _ensure_concentration_shape(self, num_classes: int):
+        """Ensure concentration has correct shape for the given num_classes."""
+        if jnp.asarray(self.concentration).size == 1:
+            self.concentration = self.concentration * jnp.ones(num_classes)
+        elif jnp.asarray(self.concentration).size != num_classes:
+            raise ValueError(
+                f"Concentration size {jnp.asarray(self.concentration).size} does not match num_classes {num_classes}"
+            )
 
     @property
     def emission_shape(self) -> Tuple[int]:
@@ -310,7 +301,8 @@ class PhlagHMMEmissions(HMMEmissions):
         )
 
     def log_prior(self, params: ParamsGaussianHMMEmissions) -> Scalar:
-        return tfd.Dirichlet(self.concentration).log_prob(params.probs).sum()
+        # Return 0 for now (flat prior on continuous emissions)
+        return 0.0
 
     def initialize(
         self,
@@ -319,26 +311,21 @@ class PhlagHMMEmissions(HMMEmissions):
         emission_probs: Optional[Float[Array, "num_states emission_dim num_classes"]] = None,
     ) -> Tuple[ParamsGaussianHMMEmissions, ParamsGaussianHMMEmissions]:
         if emission_probs is None:
-            if method.lower() == "prior":
-                if key is None:
-                    raise ValueError("A key must be provided when emissions is not")
-                prior = tfd.Dirichlet(self.concentration)
-                emission_probs = prior.sample(
-                    seed=key, sample_shape=(self.num_states, self.emission_dim)
-                )
-            else:
-                raise Exception("Invalid initialization method: {}".format(method))
+            raise ValueError("emission_probs must be provided")
         else:
-            assert emission_probs.shape == (self.num_states, self.emission_dim, self.num_classes)
+            # Infer num_classes from shape
+            num_classes = emission_probs.shape[-1]
+            self._ensure_concentration_shape(num_classes)
             assert jnp.all(emission_probs >= 0)
             assert jnp.allclose(
                 jnp.sum(emission_probs, axis=-1), jnp.ones(emission_probs.shape[:-1]), atol=1e-03
             )
             emission_probs = emission_probs / jnp.sum(emission_probs, axis=-1)[:, :, None]
 
-        params = ParamsGaussianHMMEmissions(probs=emission_probs)
+        params = ParamsGaussianHMMEmissions(means=emission_probs, covariances=emission_probs)
         props = ParamsGaussianHMMEmissions(
-            probs=ParameterProperties(constrainer=tfb.SoftmaxCentered())
+            means=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
+            covariances=ParameterProperties(constrainer=tfb.SoftmaxCentered())
         )
         return params, props
     
@@ -360,116 +347,14 @@ class PhlagHMMEmissions(HMMEmissions):
     ) -> Any:
         return None
 
-    def map_estimate_kl(
-        self,
-        e_est: Float[Array, "num_classes"],
-        cstats: Float[Array, "num_classes"],
-        reverse: bool = False,
-    ) -> Float[Array, "num_classes"]:
-        """
-        Regularized estimate for a categorical distribution.
-        reverse = False:
-            Forward KL similarity (Bayesian Dirichlet MAP, closed form)
-        reverse = True:
-            Forward KL dissimilarity (repulsion), solved numerically
-        """
-        eps = 1e-12
-        max_iter = 100
-        if not reverse:
-            alpha = self.penalty_lambda * e_est
-            v = cstats + alpha - 1.0
-            v = jnp.maximum(v, eps)
-            e_curr = v / jnp.sum(v)
-        else:
-
-            def objective(theta):
-                p = jax.nn.softmax(theta)
-                ll = jnp.sum(cstats * jnp.log(p + eps))
-                kl = jnp.sum(p * (jnp.log(p + eps) - jnp.log(e_est + eps)))
-                return -(ll + self.penalty_lambda * kl)
-
-            grad_obj = jax.grad(objective)
-            theta = cstats / jnp.sum(cstats)
-            lr = 0.1
-            for _ in range(max_iter):
-                theta = theta - lr * grad_obj(theta)
-
-            e_curr = jax.nn.softmax(theta)
-        return e_curr
-
-    def map_estimate_bfgs(
-        self,
-        e_est: Float[Array, "num_classes"],
-        cstats: Float[Array, "num_classes"],
-        inverse: bool = False,
-    ) -> Float[Array, "num_classes"]:
-        def neg_log_posterior(logits: Float[Array, "num_classes"]) -> Float[Array, ""]:
-            e_curr = softmax(logits)
-            neg_log_likelihood = -jnp.sum(cstats * jnp.log(e_curr + 1e-10))
-            if inverse:
-                neg_log_prior = self.penalty_lambda * (1 - divergence_e(e_est, e_curr))
-            else:
-                neg_log_prior = self.penalty_lambda * divergence_e(e_est, e_curr)
-            return neg_log_likelihood + neg_log_prior
-
-        e_init = e_est
-        result = minimize(fun=neg_log_posterior, x0=e_init, method="BFGS", tol=1e-5)
-        return softmax(result.x)
-
-    def map_estimate_lagrange(
-        self,
-        e_est: Float[Array, "num_classes"],
-        cstats: Float[Array, "num_classes"],
-        inverse: bool = False,
-    ) -> Float[Array, "num_classes"]:
-        """
-        MAP estimate using Lagrange multiplier method with inverse support using dot product repulsion
-        """
-        max_iter = 1000
-        tol = 1e-6
-
-        def f1(nu):
-            return jnp.sum(cstats / (nu + self.penalty_lambda * e_est)) - 1.0
-
-        def f0(nu):
-            return jnp.sum(cstats / (nu - self.penalty_lambda * e_est)) - 1.0
-
-        if inverse:
-            f = f1
-            lower = 0.0
-        else:
-            f = f0
-            lower = self.penalty_lambda * jnp.max(e_est) + 1e-10
-
-        upper = jnp.sum(cstats) * 10.0
-        nu_low, nu_high, _ = while_loop(
-            lambda val: (val[2] < max_iter) & ((val[1] - val[0]) > tol),
-            lambda val: (
-                jnp.where(f((val[0] + val[1]) / 2) > 0, (val[0] + val[1]) / 2, val[0]),
-                jnp.where(f((val[0] + val[1]) / 2) < 0, (val[0] + val[1]) / 2, val[1]),
-                val[2] + 1,
-            ),
-            (lower, upper, 0),
-        )
-        nu_opt = (nu_low + nu_high) / 2
-
-        if inverse:
-            q = cstats / (nu_opt + self.penalty_lambda * e_est)
-        else:
-            q = cstats / (nu_opt - self.penalty_lambda * e_est)
-
-        return q / (jnp.sum(q) + 1e-10)
-
     def m_step(
         self,
         params: ParamsGaussianHMMEmissions,
         props: ParamsGaussianHMMEmissions,
         batch_stats: dict,
-        m_step_state: Union[Scalar, Float[Array, "emission_dim num_classes"]],
-    ) -> Tuple[
-        ParamsGaussianHMMEmissions, Union[Scalar, Float[Array, "emission_dim num_classes"]]
-    ]:  # TODO: Simplfy and don't do penalty.
-        if props.probs.trainable:
+        m_step_state: Any,
+    ) -> Tuple[ParamsGaussianHMMEmissions, Any]:
+        if props.means.trainable or props.covariances.trainable:
             stats = pytree_sum(batch_stats, axis=0)
             emission_stats = pytree_sum(batch_stats, axis=0)
             sum_weights = stats["sum_weights"][:, None] 
@@ -488,13 +373,13 @@ class PhlagHMMEmissions(HMMEmissions):
         return params, m_step_state
 
     def state_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
-        probs = params.probs
+        means = params.means
+        # Compute mean divergence between states (Euclidean distance)
         total_divergence = 0
-        for i in range(probs.shape[0]):
-            for j in range(i, probs.shape[0]):
-                total_divergence += jax.vmap(divergence_e, in_axes=(0, 0), out_axes=0)(
-                    probs[i], probs[j]
-                )
+        for i in range(means.shape[0]):
+            for j in range(i + 1, means.shape[0]):
+                # L2 distance between means
+                total_divergence += jnp.sqrt(jnp.sum((means[i] - means[j]) ** 2))
         return total_divergence
 
 
@@ -509,7 +394,6 @@ class PhlagHMM(HMM):
         self,
         num_states: int = 2,
         emission_dim: int = 1,
-        num_classes: int = 2,
         emission_lambda: Scalar = 1,
         emission_parameterization: Tuple[EmissionParam, ...] = None,
         emission_concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
@@ -520,7 +404,6 @@ class PhlagHMM(HMM):
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
-        self.num_classes = num_classes
         self.emission_lambda = emission_lambda
         if emission_parameterization is not None:
             self.emission_parameterization = emission_parameterization
@@ -545,7 +428,6 @@ class PhlagHMM(HMM):
         self.emission_component = PhlagHMMEmissions(
             self.num_states,
             self.emission_dim,
-            self.num_classes,
             penalty_lambda=self.emission_lambda,
             concentration=self.emission_concentration,
             parameterization=self.emission_parameterization,

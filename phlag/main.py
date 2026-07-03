@@ -61,33 +61,22 @@ class Phlag:
         self.lbl_to_nd = utils.map_label_to_node(self.st)
 
     def validate_parameters(self):
-        if self.args.beta is None:
-            raise ValueError("--beta hyperparameter must be explicitly set when running alignment mode.")
-        if not (0 < self.args.rho < 1):
-            raise ValueError(f"--rho must be in (0, 1), got {self.args.rho}")
-        if self.args.beta <= 0:
-            raise ValueError(f"--beta must be positive, got {self.args.beta}")
-        if not (0 < self.args.eta < 1):
-            raise ValueError(f"--eta must be in (0, 1), got {self.args.eta}")
         if self.args.n_iters < 1:
             raise ValueError(f"--n-iters must be >= 1, got {self.args.n_iters}")
-        for lbl in self.args.focal_edges:
-            if lbl not in self.lbl_to_nd:
-                raise ValueError(f"Focal edge label '{lbl}' not found in species tree")
+        if self.args.focal_edge not in self.lbl_to_nd:
+            raise ValueError(f"Focal edge label '{self.args.focal_edge}' not found in species tree")
 
     def determine_focal_edges(self):
-        if self.args.focal_edges:
-            self.focal_edges = []
-            for lbl in self.args.focal_edges:
-                edge = utils.focal_edge_from_label(self.st, lbl, self.lbl_to_nd)
-                if self.args.expand_edges:
-                    self.focal_edges.extend(
-                        incident
-                        for incident in utils.get_incident_edges(self.st, edge, self.lbl_to_nd)
-                        if incident.length < MAX_INCIDENT_LENGTH or incident == edge
-                    )
-                else:
-                    self.focal_edges.append(edge)
+        self.focal_edges = []
+        edge = utils.focal_edge_from_label(self.st, self.args.focal_edge, self.lbl_to_nd)
+        if self.args.expand_edges:
+            self.focal_edges.extend(
+                incident
+                for incident in utils.get_incident_edges(self.st, edge, self.lbl_to_nd)
+                if incident.length < MAX_INCIDENT_LENGTH or incident == edge
+            )
+        else:
+            self.focal_edges.append(edge)
         self.num_edges = len(self.focal_edges)
 
     def read_caster_scores(self, path):
@@ -133,8 +122,6 @@ class Phlag:
             self.Y = ilr(multi_replace(raw_caster_matrix, delta=1e-7))
         else:
             self.Y = raw_caster_matrix
-            
-        self.num_classes = self.Y.shape[-1]
 
     def focal_edge_lengths(self):
         return [edge.head_node.label + ": " + str(edge.length) for edge in self.focal_edges]
@@ -159,25 +146,27 @@ class Phlag:
         self.output_str += "\n" + ",".join(map(lambda x: str(x), jnp.round(ps, decimals=3).tolist()))
 
     def initialize_hmm(self):
-        self.emission_lambda = self.args.emission_lambda
-        self.gamma = self.args.emission_concentration
-        self.nu = self.args.initial_probs_concentration
+        # Fixed prior hyperparameters
+        self.emission_lambda = 1.0
+        self.gamma = 1.1
+        self.nu = 1.1
+        eta = 0.5
         
         # Generic Dirichlet structure setup for continuous emission tracking
         self.psi = jnp.ones((NUM_STATES, NUM_STATES)) + PSI_EPS
         self.occupancy_bias = jnp.zeros(NUM_STATES)
         self.occupancy_bias = self.occupancy_bias.at[-1].set(
-            -jnp.log((1 - self.args.eta) / (self.args.eta))
+            -jnp.log((1 - eta) / (eta))
         )
         
+        emission_parameterization_mode = self.args.emission_parameterization
         self.emission_parameterization = (
-            hmm.EmissionParam(self.args.emission_parameterization),
+            hmm.EmissionParam(emission_parameterization_mode),
         ) + tuple(hmm.EmissionParam("free") for _ in range(NUM_STATES - 1))
         
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
             self.num_edges,
-            self.num_classes,
             emission_lambda=self.emission_lambda,
             emission_concentration=self.gamma,
             emission_parameterization=self.emission_parameterization,
@@ -252,11 +241,10 @@ def parse_arguments():
     )
     parser.add_argument(
         "-e",
-        "--focal-edges",
-        nargs="+",
+        "--focal-edge",
         type=str,
         required=True,
-        help="Focal edge(s) specified by inner node label(s).",
+        help="Focal edge specified by inner node label.",
     )
     parser.add_argument(
         "--expand-edges",
@@ -265,44 +253,6 @@ def parse_arguments():
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
-    hmm_group.add_argument(
-        "--rho",
-        type=float,
-        default=0.9,
-        help="Hyperparameter to control sensitivity (default 0.9)",
-    )
-    hmm_group.add_argument(
-        "--beta",
-        type=float,
-        default=5.0,
-        help="Hyperparameter to control contiguity of flagged regions (default: 5.0)",
-    )
-    hmm_group.add_argument(
-        "--emission-lambda",
-        "--lambda",
-        type=float,
-        default=1.0,
-        help="Hyperparameter to control deviation of anomalies from baseline (default: 1.0)",
-    )
-    hmm_group.add_argument(
-        "--initial-probs-concentration",
-        type=float,
-        default=1.1,
-        help="Initial probabilities concentration (default: 1.1)",
-    )
-    hmm_group.add_argument(
-        "--emission-concentration",
-        type=float,
-        default=1.1,
-        help="Emission prior concentration (default: 1.1)",
-    )
-    hmm_group.add_argument(
-        "--eta",
-        "--occupancy-bias",
-        type=float,
-        default=0.5,
-        help="A global occupancy penalty on the marginal log-likelihood (default: 0.5)",
-    )
     hmm_group.add_argument(
         "--emission-parameterization",
         type=str.lower,
