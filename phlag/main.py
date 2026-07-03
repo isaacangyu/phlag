@@ -89,7 +89,11 @@ class Phlag:
             self.Y = raw_caster_matrix
 
     def initialize_output(self):
-        self.output_file = self.args.output_file
+        input_path = pathlib.Path(self.args.caster_scores)
+        repo_root = pathlib.Path(__file__).parent.parent.resolve()
+        test_dir = repo_root / "test"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        self.output_file = test_dir / f"results_{input_path.name}"
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -107,7 +111,6 @@ class Phlag:
         
         self.output_str += "\n" + "\n".join(headers)
         self.output_str += "\n" + ",".join(map(str, most_likely_states.astype(int).tolist()))
-        self.output_str += "\n" + ",".join(map(lambda x: str(x), jnp.round(ps, decimals=3).tolist()))
         
         # Output histogram counting the number of ones in a given window size if parameter is passed
         hist_str = self.generate_histogram(most_likely_states)

@@ -38,6 +38,7 @@ Repository = "https://github.com/bo1929/phlag"
 
 [project.scripts]
 phlag = "phlag.main:main"
+caster = "phlag.caster:main"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

@@ -43,19 +43,24 @@ Out of the 1500 consecutive positions, 150 (10%) are anomalous. They form one co
 
 ### Input
 
-- **Species tree** (`-s`): A Newick species tree with labeled internal nodes.
+- **Species tree** (`-s`): A Newick species tree with labeled internal nodes. Optional when running without a focal edge.
 - **CASTER scores** (`-c`): TSV file with CASTER topology scores (pos, ABBA, BABA, AABB) at genomic positions.
-- **Focal edge** (`-e`): Label of an internal node defining the edge to target. In this example, the clade under suspicion is `N159`.
+- **Focal edge** (`-e`): Optional label of an internal node defining the edge to target. When omitted, Phlag runs without focal-edge-specific diagnostics.
 
 ### Usage
 
 ```shell
 phlag \
   -s test/neoaves.nwk \
-  -c test/qqs.tsv \
+  -c caster/data/apeC_w50_s50_n.tsv \
   -e N159 \
-  -L 10 \
+  -L 1 \
   -o results-neoaves-N159.txt
+```
+
+One Liner
+```shell
+phlag -c caster/data/apeC_w50_s50_n.tsv -L 1 -o results-neoaves-N159.txt
 ```
 
 For all options, run `phlag --help`.
