@@ -55,28 +55,25 @@ The `phlag` utility fits a Gaussian HMM to the CASTER topology scores to flag an
 ### Usage
 
 ```shell
-phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 1 -w 100
+phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 1 -s 100
 ```
-
 ### Required Arguments
 
 * **`-c, --caster-scores`**: Path to TSV containing the CASTER scores.
 * **`-L, --n-iters`** (default: `5`): Number of outer EM iterations.
 * **`-l, --increment-steps`** (default: `50`): Number of inner EM iterations per outer iteration.
-* **`-s, --step-size`**: Genomic step size for counts of anomalies.
-
-### Optional Arguments
-
-* **`-o, --output-file`** (default: extracts input filename): Custom path to save the output report.
+* **`-s, --step-size`**: Genomic step size (in rows/positions) to compute a text-based ASCII histogram and save a visual bar chart plot.
+* **`-o, --output-file`** (optional): Custom path to save the output report (automatically defaults to saving in the `test/` directory).
 * **`--ilr-transform`**: Apply isometric log-ratio transformation to CASTER scores.
 * **`--emission-parameterization`** (default: `attraction`): Parameterization of emission probabilities (`free`, `attraction`, or `anchor`).
 
 ### Output
 
-The output report and histogram are automatically saved in the `test/` directory, named `results_` + `input_filename` (e.g., [test/results_ape_0_200k_w1k_s100_n.tsv](file:///c:/Users/isaac/phlag/test/results_ape_0_200k_w1k_s100_n.tsv)).
+The output report and visual histogram plot are automatically saved in the `test/` directory.
+* **Report file**: Named `report_` + `input_filename` (e.g., [test/report_ape_0_200k_w1k_s100_n.tsv](file:///c:/Users/isaac/phlag/test/report_ape_0_200k_w1k_s100_n.tsv)).
+* **Visual Plot**: Named `histogram_` + `input_filename_stem.png` (e.g., [test/histogram_ape_0_200k_w1k_s100_n.png](file:///c:/Users/isaac/phlag/test/histogram_ape_0_200k_w1k_s100_n.png)).
 
-The report contains:
+The report file contains:
 * **Header lines** (prefixed with `#`): Including the command run and HMM state emission divergence.
-* **State path**: A sequence of binary states (`0` for standard MSC, `1` for anomalous states).
-
-and the histogram contains counts of anomalous positions in non-overlapping genomic windows.
+* **State path**: A comma-separated sequence of discrete binary states (`0` for standard MSC, `1` for anomalous flagged states).
+* **ASCII Histogram**: Counts of anomalous positions in non-overlapping genomic steps.

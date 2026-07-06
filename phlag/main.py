@@ -41,8 +41,8 @@ class Phlag:
     def validate_parameters(self):
         if self.args.n_iters < 1:
             raise ValueError(f"--n-iters must be >= 1, got {self.args.n_iters}")
-        if self.args.window_size is not None and self.args.window_size < 1:
-            raise ValueError(f"--window-size must be >= 1, got {self.args.window_size}")
+        if self.args.step_size is not None and self.args.step_size < 1:
+            raise ValueError(f"--step-size must be >= 1, got {self.args.step_size}")
 
     def read_caster_scores(self, path):
         """
@@ -93,7 +93,7 @@ class Phlag:
         repo_root = pathlib.Path(__file__).parent.parent.resolve()
         test_dir = repo_root / "test"
         test_dir.mkdir(parents=True, exist_ok=True)
-        self.output_file = test_dir / f"results_{input_path.name}"
+        self.output_file = test_dir / f"report_{input_path.name}"
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -118,28 +118,28 @@ class Phlag:
             self.output_str += hist_str
 
     def generate_histogram(self, most_likely_states):
-        window_size = self.args.window_size
-        if window_size is None:
+        step_size = self.args.step_size
+        if step_size is None:
             return ""
 
         num_positions = len(most_likely_states)
-        window_counts = []
-        for start in range(0, num_positions, window_size):
-            end = min(start + window_size, num_positions)
+        step_counts = []
+        for start in range(0, num_positions, step_size):
+            end = min(start + step_size, num_positions)
             count = int(jnp.sum(most_likely_states[start:end] == 1))
-            window_counts.append((start, end, count))
+            step_counts.append((start, end, count))
 
         # 1. Text-based ASCII histogram
         lines = [
             "",
-            f"# Window-based counts of flagged positions (ones) (window size = {window_size}):",
+            f"# Step-based counts of flagged positions (ones) (step size = {step_size}):",
             "# Range       | Count | Bar",
         ]
         
-        max_count = max([c for _, _, c in window_counts]) if window_counts else 0
+        max_count = max([c for _, _, c in step_counts]) if step_counts else 0
         bar_max_width = 40
         
-        for start, end, count in window_counts:
+        for start, end, count in step_counts:
             bar_len = int((count / max_count) * bar_max_width) if max_count > 0 else 0
             bar = "*" * bar_len
             range_str = f"{start:<6}-{end:<6}"
@@ -155,13 +155,13 @@ class Phlag:
             sns.set_theme(style="whitegrid")
             fig, ax = plt.subplots(figsize=(10, 6))
             
-            windows = [f"{start}-{end}" for start, end, _ in window_counts]
-            counts = [c for _, _, c in window_counts]
+            steps = [f"{start}-{end}" for start, end, _ in step_counts]
+            counts = [c for _, _, c in step_counts]
             
-            bars = ax.bar(windows, counts, color=sns.color_palette("viridis", len(counts)), edgecolor='none')
+            bars = ax.bar(steps, counts, color=sns.color_palette("viridis", len(counts)), edgecolor='none')
             
-            ax.set_title(f"Flagged Positions Count per Window (Size = {window_size})", fontsize=14, fontweight="bold", pad=15)
-            ax.set_xlabel("Genomic Window Range (bp)", fontsize=12, labelpad=10)
+            ax.set_title(f"Flagged Positions Count per Step (Size = {step_size})", fontsize=14, fontweight="bold", pad=15)
+            ax.set_xlabel("Genomic Step Range (bp)", fontsize=12, labelpad=10)
             ax.set_ylabel("Count of Flagged (Anomalous) States (1s)", fontsize=12, labelpad=10)
             plt.xticks(rotation=45, ha='right', fontsize=9)
             
@@ -177,7 +177,8 @@ class Phlag:
             plt.tight_layout()
             
             output_path = pathlib.Path(self.output_file)
-            plot_path = output_path.with_name(f"{output_path.stem}_histogram.png")
+            input_path = pathlib.Path(self.args.caster_scores)
+            plot_path = output_path.with_name(f"histogram_{input_path.stem}.png")
             plt.savefig(plot_path, dpi=300)
             plt.close()
             print(f"Saved visual window histogram to: {plot_path}")
@@ -276,11 +277,11 @@ def parse_arguments():
         help="Increment for inner EM iterations (default: 50)",
     )
     parser.add_argument(
-        "-w",
-        "--window-size",
+        "-s",
+        "--step-size",
         type=int,
         default=None,
-        help="Optional window size to calculate and plot/output a histogram of flagged ones counts in non-overlapping windows.",
+        help="Optional step size to calculate and plot/output a histogram of flagged ones counts in non-overlapping steps.",
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
