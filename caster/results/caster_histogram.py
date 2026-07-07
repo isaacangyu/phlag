@@ -8,9 +8,8 @@ import seaborn as sns
 from scipy.stats import norm
 
 class CasterPlotter:
-    def __init__(self, scores_file, normalize='zero-one', distribution=None, data_dir='../data'):
+    def __init__(self, scores_file, distribution='gaussian', data_dir='../data'):
         self.scores_file = scores_file
-        self.normalize = normalize
         self.distribution = distribution
         self.data_dir = data_dir
         
@@ -26,28 +25,24 @@ class CasterPlotter:
         if self.df is not None:
             # 1. Run empirical histograms with vertical statistic indicators
             self.plot_caster_histograms()
+            # self.plot_dstar_histogram()
             
             # 2. Conditionally overlay parametric distributions if requested
             if self.distribution:
-                self.plot_distribution(dist_type=self.distribution)
+                self.plot_distribution(target='topology')
 
     def extract_filename_parameters(self):
-        """Extracts genomic filename, window size, step size, and normalization token from path."""
+        """Extracts genomic filename and normalization token from path."""
         base_name = os.path.basename(self.scores_file)
         
-        # Regex to match: {filename}_w{windowSize}_s{stepSize}[_n].tsv
-        match = re.match(r"(.+?)_w(\d+)_s(\d+)(_n)?\.(tsv|txt|csv)", base_name)
-        if match:
-            self.gene_name = match.group(1)
-            self.window_size = match.group(2)
-            self.step_size = match.group(3)
-            self.is_normalized_file = bool(match.group(4))
+        # Check if the filename ends with normalized suffix before the extension
+        name_part, ext = os.path.splitext(base_name)
+        if name_part.endswith('_n'):
+            self.gene_name = name_part[:-2]
+            self.is_normalized_file = True
         else:
-            # Fallback values if filename doesn't match the specific C++ output structure
-            self.gene_name = os.path.splitext(base_name)[0]
-            self.window_size = "Unknown"
-            self.step_size = "Unknown"
-            self.is_normalized_file = (self.normalize == 'zero-one')
+            self.gene_name = name_part
+            self.is_normalized_file = False
 
     def load_data(self):
         """Parses the tab-separated value file into a Pandas DataFrame."""
@@ -66,12 +61,27 @@ class CasterPlotter:
             self.df = None
 
     def calculate_summary_statistics(self, series):
-        """Calculates mean, median, and standard deviation for a given pandas Series."""
-        return {
-            'mean': series.mean(),
-            'median': series.median(),
-            'std': series.std()
-        }
+        """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
+        if self.distribution:
+            dist_name = self.distribution.lower()
+            if dist_name in ['gaussian', 'normal']:
+                dist_name = 'norm'
+            
+            import scipy.stats as stats_module
+            dist_class = getattr(stats_module, dist_name)
+            fit_vals = dist_class.fit(series)
+            
+            param_names = []
+            if dist_class.shapes:
+                param_names.extend([s.strip() for s in dist_class.shapes.split(',')])
+            param_names.extend(['loc', 'scale'])
+            self.params = dict(zip(param_names, fit_vals))
+        else:
+            self.params = {
+                'loc': series.mean(),
+                'scale': series.std()
+            }
+        return self.params
 
     def plot_caster_histograms(self):
         """Generates empirical histograms with central tendency vertical guidelines."""
@@ -89,97 +99,130 @@ class CasterPlotter:
             
             colors = sns.color_palette(n_colors=len(avg_cols))
             for i, col in enumerate(avg_cols):
-                stats = self.calculate_summary_statistics(self.df[col])
+                mean_val = self.df[col].mean()
+                median_val = self.df[col].median()
                 color = colors[i]
-                plt.axvline(x=stats['mean'], color=color, linestyle='-', linewidth=2, 
-                            label=f"{col} Mean ({stats['mean']:.4f})")
-                plt.axvline(x=stats['median'], color=color, linestyle=':', linewidth=2, 
-                            label=f"{col} Med ({stats['median']:.4f})")
+                plt.axvline(x=mean_val, color=color, linestyle='-', linewidth=2, 
+                            label=f"{col} Mean ({mean_val:.4f})")
+                plt.axvline(x=median_val, color=color, linestyle=':', linewidth=2, 
+                            label=f"{col} Med ({median_val:.4f})")
                 
-            plt.title(f'Topology Average Scores: {self.gene_name} (Window={self.window_size}, Step={self.step_size})', fontsize=13)
+            plt.title(f'Topology Average Scores: {self.gene_name}', fontsize=13)
             plt.xlabel(f'{norm_label} Weight Value')
             plt.ylabel('Density')
             plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
             plt.tight_layout()
             
-            # Saved explicitly to current directory (.)
-            save_path_top = f'{self.gene_name}_w{self.window_size}_topology.png'
+            # Saved explicitly to caster/results
+            output_dir = os.path.dirname(os.path.abspath(__file__))
+            save_path_top = os.path.join(output_dir, f'histogram_topology_{self.gene_name}.png')
             plt.savefig(save_path_top, dpi=300)
-            print(f"Saved empirical topology distribution chart to current directory: {save_path_top}")
+            print(f"Saved empirical topology distribution chart to: {save_path_top}")
             plt.show()
 
-        # 2. Histogram for the D* Statistic Distribution
-        dstar_cols = [c for c in self.df.columns if 'D*' in c or 'D' in c and len(c) == 1 or 'dstar' in c]
-        if dstar_cols:
-            self.dstar_col_name = dstar_cols[0]
-            plt.figure(figsize=(10, 6))
-            sns.histplot(data=self.df, x=self.dstar_col_name, kde=True, color='purple', bins=50, stat='density', alpha=0.5)
-            
-            dstar_stats = self.calculate_summary_statistics(self.df[self.dstar_col_name])
-            
-            # Guidelines markers
-            if not self.is_normalized_file:
-                plt.axvline(x=0, color='black', linestyle='--', linewidth=1.5, label='Null ILS Expectation (0.0)')
-            plt.axvline(x=dstar_stats['mean'], color='darkred', linestyle='-', linewidth=2, 
-                        label=f"D* Mean ({dstar_stats['mean']:.4f})")
-            plt.axvline(x=dstar_stats['median'], color='blue', linestyle=':', linewidth=2, 
-                        label=f"D* Median ({dstar_stats['median']:.4f})")
-            plt.axvline(x=dstar_stats['mean'] - dstar_stats['std'], color='purple', linestyle='-.', linewidth=1, 
-                        label=f"-1 Std ({dstar_stats['mean'] - dstar_stats['std']:.4f})")
-            plt.axvline(x=dstar_stats['mean'] + dstar_stats['std'], color='purple', linestyle='-.', linewidth=1, 
-                        label=f"+1 Std ({dstar_stats['mean'] + dstar_stats['std']:.4f})")
-            
-            plt.title(f'Genomic $D^*$ Profile: {self.gene_name} (Window={self.window_size}, Step={self.step_size})', fontsize=13)
-            plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
-            plt.ylabel('Density')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.tight_layout()
-            
-            # Saved explicitly to current directory (.)
-            save_path_dstar = f'{self.gene_name}_w{self.window_size}_dstar.png'
-            plt.savefig(save_path_dstar, dpi=300)
-            print(f"Saved empirical D* distribution chart to current directory: {save_path_dstar}")
-            plt.show()
-
-    def plot_distribution(self, dist_type='gaussian'):
-        """Fits a parametric theoretical PDF curve overlay over the genomic D* metrics."""
+    def plot_dstar_histogram(self):
+        """Generates empirical histogram for the D* statistic distribution."""
         dstar_cols = [c for c in self.df.columns if 'D*' in c or 'D' in c and len(c) == 1 or 'dstar' in c]
         if not dstar_cols:
             return
             
-        col_name = dstar_cols[0]
-        if dist_type.lower() in ['gaussian', 'normal']:
-            plt.figure(figsize=(10, 6))
+        self.dstar_col_name = dstar_cols[0]
+        plt.figure(figsize=(10, 6))
+        sns.histplot(data=self.df, x=self.dstar_col_name, kde=True, color='purple', bins=50, stat='density', alpha=0.5)
+        
+        mean_val = self.df[self.dstar_col_name].mean()
+        median_val = self.df[self.dstar_col_name].median()
+        std_val = self.df[self.dstar_col_name].std()
+        
+        # Guidelines markers
+        if not self.is_normalized_file:
+            plt.axvline(x=0, color='black', linestyle='--', linewidth=1.5, label='Null ILS Expectation (0.0)')
+        plt.axvline(x=mean_val, color='darkred', linestyle='-', linewidth=2, 
+                    label=f"D* Mean ({mean_val:.4f})")
+        plt.axvline(x=median_val, color='blue', linestyle=':', linewidth=2, 
+                    label=f"D* Median ({median_val:.4f})")
+        plt.axvline(x=mean_val - std_val, color='purple', linestyle='-.', linewidth=1, 
+                    label=f"-1 Std ({mean_val - std_val:.4f})")
+        plt.axvline(x=mean_val + std_val, color='purple', linestyle='-.', linewidth=1, 
+                    label=f"+1 Std ({mean_val + std_val:.4f})")
+        
+        plt.title(f'Genomic $D^*$ Profile: {self.gene_name}', fontsize=13)
+        plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
+        plt.ylabel('Density')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        
+        # Saved explicitly to caster/results
+        output_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path_dstar = os.path.join(output_dir, f'histogram_dstar_{self.gene_name}.png')
+        plt.savefig(save_path_dstar, dpi=300)
+        print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
+        plt.show()
+
+    def plot_distribution(self, target='topology'):
+        """Fits a parametric theoretical PDF curve overlay over either genomic D* metrics or average topology scores."""
+        if target == 'dstar':
+            cols_to_plot = [c for c in self.df.columns if 'D*' in c or 'D' in c and len(c) == 1 or 'dstar' in c]
+        elif target == 'topology':
+            cols_to_plot = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        else:
+            print(f"Unknown target: {target}. Must be 'dstar' or 'topology'.")
+            return
             
-            # Plot the raw background histogram data bars out first
-            sns.histplot(data=self.df, x=col_name, stat='density', color='lightgray', bins=50, alpha=0.6, label='Observed Data')
+        if not cols_to_plot:
+            return
             
-            # Extract summary statistics to establish curve boundaries
-            stats = self.calculate_summary_statistics(self.df[col_name])
-            mu, sigma = stats['mean'], stats['std']
+        if self.distribution:
+            plt.figure(figsize=(12, 7) if target == 'topology' else (10, 6))
+            
+            # Create the distribution from scipy.stats with the params dict
+            dist_name = self.distribution.lower()
+            if dist_name in ['gaussian', 'normal']:
+                dist_name = 'norm'
+                
+            import scipy.stats as stats_module
+            dist_class = getattr(stats_module, dist_name)
+            
+            # Choose colors
+            colors = sns.color_palette(n_colors=len(cols_to_plot))
+            
+            # Plot the background histogram(s)
+            if target == 'topology':
+                for i, col in enumerate(cols_to_plot):
+                    sns.histplot(data=self.df, x=col, stat='density', color=colors[i], bins=50, alpha=0.15, label=f'Observed {col}')
+            else:
+                col_name = cols_to_plot[0]
+                sns.histplot(data=self.df, x=col_name, stat='density', color='lightgray', bins=50, alpha=0.6, label='Observed Data')
             
             # Create array coordinates for the continuous math function curve
             xmin, xmax = plt.xlim()
             x = np.linspace(xmin, xmax, 200)
-            p = norm.pdf(x, mu, sigma) 
             
-            # Draw standard normal fit
-            plt.plot(x, p, color='crimson', linewidth=2.5, 
-                     label=f'Fitted Gaussian PDF\n($\\mu$={mu:.3f}, $\\sigma$={sigma:.3f})')
+            # Fit and plot PDF overlay for each target column
+            for i, col in enumerate(cols_to_plot):
+                self.calculate_summary_statistics(self.df[col])
+                dist = dist_class(**self.params)
+                p = dist.pdf(x)
+                
+                param_str = ", ".join([f"{k}={v:.3f}" for k, v in self.params.items()])
+                color = colors[i] if target == 'topology' else 'crimson'
+                label = f'Fitted {col} {dist_name.capitalize()} PDF\n({param_str})' if target == 'topology' else f'Fitted {dist_name.capitalize()} PDF\n({param_str})'
+                
+                plt.plot(x, p, color=color, linewidth=2.5, label=label)
             
-            plt.title(f'Gaussian Parametric Model Fit: {self.gene_name} (Window={self.window_size}, Step={self.step_size})', fontsize=13)
-            plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
+            title_suffix = "Topology Scores" if target == 'topology' else "Genomic $D^*$ Value"
+            plt.title(f'{dist_name.capitalize()} Parametric Model Fit: {self.gene_name} ({title_suffix})', fontsize=13)
+            plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} Weight Value' if target == 'topology' else f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
             plt.ylabel('Probability Density')
-            plt.legend(loc='upper left')
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') if target == 'topology' else plt.legend(loc='upper left')
             plt.tight_layout()
             
-            # Saved explicitly to current directory (.)
-            save_path_fit = f'{self.gene_name}_w{self.window_size}_gaussian_fit.png'
+            # Saved explicitly to caster/results
+            output_dir = os.path.dirname(os.path.abspath(__file__))
+            save_path_fit = os.path.join(output_dir, f'distribution_{target}_{self.gene_name}_{dist_name}_fit.png')
             plt.savefig(save_path_fit, dpi=300)
-            print(f"Saved continuous Gaussian distribution fit profile to current directory: {save_path_fit}")
+            print(f"Saved continuous {dist_name.capitalize()} distribution fit profile to: {save_path_fit}")
             plt.show()
-        else:
-            print(f"Parametric distribution model layout type '{dist_type}' is not supported.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -187,7 +230,7 @@ if __name__ == "__main__":
         sys.exit(1)
         
     input_file = sys.argv[1]
-    dist_param = sys.argv[2] if len(sys.argv) > 2 else None
+    dist_param = sys.argv[2] if len(sys.argv) > 2 else 'gaussian'
     
     # Executing the object-oriented analysis engine pipeline
     plotter = CasterPlotter(scores_file=input_file, distribution=dist_param)

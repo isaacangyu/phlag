@@ -75,6 +75,19 @@ def parse_arguments():
         default=None,
         help="Optional population mapping file path"
     )
+    parser.add_argument(
+        "-p",
+        "--plot",
+        action="store_true",
+        help="Generate empirical topology histograms and plots using CasterPlotter"
+    )
+    parser.add_argument(
+        "-d",
+        "--distribution",
+        type=str,
+        default=None,
+        help="Optional distribution to fit and overlay (e.g., gaussian, norm) when plotting"
+    )
     
     return parser.parse_args()
 
@@ -157,6 +170,19 @@ def main():
             f.writelines(output_lines)
         print(f"Success: TSV output file generated at: {final_output_path}")
         print(result.stdout)
+        
+        # 6. Plotting
+        if args.distribution and not args.plot:
+            args.plot = True
+            
+        if args.plot:
+            sys.path.append(str(repo_root / "caster" / "results"))
+            try:
+                from caster_histogram import CasterPlotter
+                print("Generating empirical topology histograms...")
+                CasterPlotter(scores_file=str(final_output_path), distribution=args.distribution)
+            except Exception as e:
+                print(f"Error generating plots: {e}")
         
     finally:
         shutil.rmtree(temp_dir)

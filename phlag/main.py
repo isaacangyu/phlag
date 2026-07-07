@@ -178,10 +178,10 @@ class Phlag:
             
             output_path = pathlib.Path(self.output_file)
             input_path = pathlib.Path(self.args.caster_scores)
-            plot_path = output_path.with_name(f"histogram_{input_path.stem}.png")
+            plot_path = output_path.with_name(f"states_{input_path.stem}.png")
             plt.savefig(plot_path, dpi=300)
             plt.close()
-            print(f"Saved visual window histogram to: {plot_path}")
+            print(f"Saved visual window states plot to: {plot_path}")
             
         except Exception as e:
             print(f"Warning: Could not generate visual histogram plot: {e}")
