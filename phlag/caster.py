@@ -88,6 +88,14 @@ def parse_arguments():
         default=None,
         help="Optional distribution to fit and overlay (e.g., gaussian, norm) when plotting"
     )
+    parser.add_argument(
+        "-t",
+        "--topologies",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of topologies to plot (e.g., ABBA BABA AABB). Default is all."
+    )
     
     return parser.parse_args()
 
@@ -180,7 +188,7 @@ def main():
             try:
                 from caster_histogram import CasterPlotter
                 print("Generating empirical topology histograms...")
-                CasterPlotter(scores_file=str(final_output_path), distribution=args.distribution)
+                CasterPlotter(scores_file=str(final_output_path), distribution=args.distribution, topologies=args.topologies)
             except Exception as e:
                 print(f"Error generating plots: {e}")
         

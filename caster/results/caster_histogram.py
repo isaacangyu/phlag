@@ -8,10 +8,11 @@ import seaborn as sns
 from scipy.stats import norm
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir='../data'):
+    def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir
+        self.topologies = topologies
         
         # Keep data_dir path generation fallback strictly for file tracking input workflows
         os.makedirs(self.data_dir, exist_ok=True)
@@ -23,13 +24,9 @@ class CasterPlotter:
         self.load_data()
         
         if self.df is not None:
-            # 1. Run empirical histograms with vertical statistic indicators
+            # 1. Run empirical histograms with optional parametric distribution overlay
             self.plot_caster_histograms()
             # self.plot_dstar_histogram()
-            
-            # 2. Conditionally overlay parametric distributions if requested
-            if self.distribution:
-                self.plot_distribution(target='topology')
 
     def extract_filename_parameters(self):
         """Extracts genomic filename and normalization token from path."""
@@ -84,41 +81,120 @@ class CasterPlotter:
         return self.params
 
     def plot_caster_histograms(self):
-        """Generates empirical histograms with central tendency vertical guidelines."""
+        """Generates empirical histograms with central tendency vertical guidelines and optional parametric distribution overlay."""
         norm_label = 'Normalized (Min-Max)' if self.is_normalized_file else 'Raw'
 
-        # 1. Histogram for Average Topology Scores (ABBA vs BABA vs AABB)
+        # Determine topology columns to plot
         avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
-        if len(avg_cols) >= 3:
-            plt.figure(figsize=(12, 7))
-            melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
-                                     var_name='Topology', value_name='Score')
+        if self.topologies is not None:
+            filtered_cols = []
+            for col in avg_cols:
+                for t in self.topologies:
+                    if t.lower() in col.lower():
+                        filtered_cols.append(col)
+                        break
+            avg_cols = filtered_cols
+
+        if not avg_cols:
+            print("No matching topology columns found to plot.")
+            return
+
+        plt.figure(figsize=(12, 7))
+        melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
+                                 var_name='Topology', value_name='Score')
+        
+        # Plot empirical histogram (no KDE spline, as requested: kde=False)
+        sns.histplot(data=melted_df, x='Score', hue='Topology', element='step', 
+                     stat='density', common_norm=False, kde=False, alpha=0.3, bins=50)
+        
+        colors = sns.color_palette(n_colors=len(avg_cols))
+        
+        # Determine if normal distribution overlay is requested
+        overlay_dist = False
+        dist_class = None
+        dist_name = ""
+        if self.distribution:
+            dist_name = self.distribution.lower()
+            if dist_name in ['gaussian', 'normal']:
+                dist_name = 'norm'
+            try:
+                import scipy.stats as stats_module
+                dist_class = getattr(stats_module, dist_name)
+                overlay_dist = True
+            except Exception as e:
+                print(f"Could not load distribution module for '{self.distribution}': {e}")
+
+        # Fit and plot theoretical distribution and expected value / std lines
+        xmin, xmax = plt.xlim()
+        x = np.linspace(xmin, xmax, 200)
+
+        for i, col in enumerate(avg_cols):
+            color = colors[i]
+            mean_val = self.df[col].mean()
             
-            sns.histplot(data=melted_df, x='Score', hue='Topology', element='step', 
-                         stat='density', common_norm=False, kde=True, alpha=0.3, bins=50)
-            
-            colors = sns.color_palette(n_colors=len(avg_cols))
-            for i, col in enumerate(avg_cols):
-                mean_val = self.df[col].mean()
-                median_val = self.df[col].median()
-                color = colors[i]
+            if overlay_dist:
+                # Fit the distribution to get parameters (e.g. loc and scale)
+                self.calculate_summary_statistics(self.df[col])
+                dist = dist_class(**self.params)
+                p = dist.pdf(x)
+                
+                # Plot the theoretical PDF curve overlay
+                param_str = ", ".join([f"{k}={v:.3f}" for k, v in self.params.items()])
+                pdf_label = f'Fitted {col} {dist_name.capitalize()} PDF\n({param_str})'
+                plt.plot(x, p, color=color, linewidth=2.5, label=pdf_label)
+                
+                # If normal distribution, use the fitted loc and scale for expected value and std lines
+                if dist_name == 'norm':
+                    fit_mean = self.params['loc']
+                    fit_std = self.params['scale']
+                    
+                    # Expected Value (E[X] or Mean) - Plot only one line!
+                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, 
+                                label=f"{col} E[X] ({fit_mean:.4f})")
+                    # +/- 1 Std bounds
+                    plt.axvline(x=fit_mean - fit_std, color=color, linestyle=':', linewidth=1.5, 
+                                label=f"{col} -1 Std ({fit_mean - fit_std:.4f})")
+                    plt.axvline(x=fit_mean + fit_std, color=color, linestyle=':', linewidth=1.5, 
+                                label=f"{col} +1 Std ({fit_mean + fit_std:.4f})")
+                else:
+                    # For other distributions, plot fitted expected value/mean if available
+                    fit_mean = self.params.get('loc', mean_val)
+                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, 
+                                label=f"{col} Fitted E[X] ({fit_mean:.4f})")
+            else:
+                # No distribution overlay requested, just plot the empirical mean line
                 plt.axvline(x=mean_val, color=color, linestyle='-', linewidth=2, 
                             label=f"{col} Mean ({mean_val:.4f})")
-                plt.axvline(x=median_val, color=color, linestyle=':', linewidth=2, 
-                            label=f"{col} Med ({median_val:.4f})")
                 
-            plt.title(f'Topology Average Scores: {self.gene_name}', fontsize=13)
-            plt.xlabel(f'{norm_label} Weight Value')
-            plt.ylabel('Density')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.tight_layout()
-            
-            # Saved explicitly to caster/results
-            output_dir = os.path.dirname(os.path.abspath(__file__))
-            save_path_top = os.path.join(output_dir, f'histogram_topology_{self.gene_name}.png')
-            plt.savefig(save_path_top, dpi=300)
-            print(f"Saved empirical topology distribution chart to: {save_path_top}")
-            plt.show()
+        title_suffix = f" & Fitted {dist_name.capitalize()} PDF" if overlay_dist else ""
+        plt.title(f'Topology Average Scores{title_suffix}: {self.gene_name}', fontsize=13)
+        plt.xlabel(f'{norm_label} Weight Value')
+        plt.ylabel('Density')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        
+        # Determine filename suffix dynamically based on plotted topologies
+        all_avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        is_all_topologies = (len(avg_cols) == len(all_avg_cols))
+        
+        if is_all_topologies:
+            suffix = "topologies"
+        else:
+            topo_names = []
+            for col in avg_cols:
+                match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+                if match:
+                    topo_names.append(match.group(1).upper())
+                else:
+                    topo_names.append(col.replace('avg*', '').replace('avg_', ''))
+            suffix = "_".join(topo_names)
+
+        # Saved explicitly to caster/results
+        output_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path_top = os.path.join(output_dir, f'histogram_{suffix}_{self.gene_name}.png')
+        plt.savefig(save_path_top, dpi=300)
+        print(f"Saved empirical topology distribution chart to: {save_path_top}")
+        plt.show()
 
     def plot_dstar_histogram(self):
         """Generates empirical histogram for the D* statistic distribution."""
@@ -159,78 +235,15 @@ class CasterPlotter:
         print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
         plt.show()
 
-    def plot_distribution(self, target='topology'):
-        """Fits a parametric theoretical PDF curve overlay over either genomic D* metrics or average topology scores."""
-        if target == 'dstar':
-            cols_to_plot = [c for c in self.df.columns if 'D*' in c or 'D' in c and len(c) == 1 or 'dstar' in c]
-        elif target == 'topology':
-            cols_to_plot = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
-        else:
-            print(f"Unknown target: {target}. Must be 'dstar' or 'topology'.")
-            return
-            
-        if not cols_to_plot:
-            return
-            
-        if self.distribution:
-            plt.figure(figsize=(12, 7) if target == 'topology' else (10, 6))
-            
-            # Create the distribution from scipy.stats with the params dict
-            dist_name = self.distribution.lower()
-            if dist_name in ['gaussian', 'normal']:
-                dist_name = 'norm'
-                
-            import scipy.stats as stats_module
-            dist_class = getattr(stats_module, dist_name)
-            
-            # Choose colors
-            colors = sns.color_palette(n_colors=len(cols_to_plot))
-            
-            # Plot the background histogram(s)
-            if target == 'topology':
-                for i, col in enumerate(cols_to_plot):
-                    sns.histplot(data=self.df, x=col, stat='density', color=colors[i], bins=50, alpha=0.15, label=f'Observed {col}')
-            else:
-                col_name = cols_to_plot[0]
-                sns.histplot(data=self.df, x=col_name, stat='density', color='lightgray', bins=50, alpha=0.6, label='Observed Data')
-            
-            # Create array coordinates for the continuous math function curve
-            xmin, xmax = plt.xlim()
-            x = np.linspace(xmin, xmax, 200)
-            
-            # Fit and plot PDF overlay for each target column
-            for i, col in enumerate(cols_to_plot):
-                self.calculate_summary_statistics(self.df[col])
-                dist = dist_class(**self.params)
-                p = dist.pdf(x)
-                
-                param_str = ", ".join([f"{k}={v:.3f}" for k, v in self.params.items()])
-                color = colors[i] if target == 'topology' else 'crimson'
-                label = f'Fitted {col} {dist_name.capitalize()} PDF\n({param_str})' if target == 'topology' else f'Fitted {dist_name.capitalize()} PDF\n({param_str})'
-                
-                plt.plot(x, p, color=color, linewidth=2.5, label=label)
-            
-            title_suffix = "Topology Scores" if target == 'topology' else "Genomic $D^*$ Value"
-            plt.title(f'{dist_name.capitalize()} Parametric Model Fit: {self.gene_name} ({title_suffix})', fontsize=13)
-            plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} Weight Value' if target == 'topology' else f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
-            plt.ylabel('Probability Density')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') if target == 'topology' else plt.legend(loc='upper left')
-            plt.tight_layout()
-            
-            # Saved explicitly to caster/results
-            output_dir = os.path.dirname(os.path.abspath(__file__))
-            save_path_fit = os.path.join(output_dir, f'distribution_{target}_{self.gene_name}_{dist_name}_fit.png')
-            plt.savefig(save_path_fit, dpi=300)
-            print(f"Saved continuous {dist_name.capitalize()} distribution fit profile to: {save_path_fit}")
-            plt.show()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python caster_histogram.py [path_to_caster_w{W}_s{S}.tsv] [optional_distribution: gaussian]")
-        sys.exit(1)
-        
-    input_file = sys.argv[1]
-    dist_param = sys.argv[2] if len(sys.argv) > 2 else 'gaussian'
+    import argparse
+    parser = argparse.ArgumentParser(description="Empirical topology and parametric fit plotter.")
+    parser.add_argument("scores_file", type=str, help="Path to CASTER scores TSV file.")
+    parser.add_argument("distribution", type=str, nargs="?", default="gaussian", help="Optional parametric distribution to fit (default: gaussian).")
+    parser.add_argument("-t", "--topologies", type=str, nargs="+", default=None, help="List of topologies to plot (default: all).")
+    
+    args = parser.parse_args()
     
     # Executing the object-oriented analysis engine pipeline
-    plotter = CasterPlotter(scores_file=input_file, distribution=dist_param)
+    plotter = CasterPlotter(scores_file=args.scores_file, distribution=args.distribution, topologies=args.topologies)
