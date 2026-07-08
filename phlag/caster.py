@@ -19,6 +19,14 @@ def format_val(val):
         return f"{val // 1000}k"
     return str(val)
 
+def int_or_abbrev(val_str):
+    val_str = str(val_str).strip().lower()
+    if val_str.endswith('k'):
+        return int(float(val_str[:-1]) * 1000)
+    elif val_str.endswith('m'):
+        return int(float(val_str[:-1]) * 1000000)
+    return int(val_str)
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Caster: Compute D* statistic on a genomic range."
@@ -34,15 +42,15 @@ def parse_arguments():
     # Left and Right indices
     parser.add_argument(
         "-l",
-        "--left",
-        type=int,
+        dest="left",
+        type=int_or_abbrev,
         required=True,
         help="Left index of range (0-indexed, inclusive)"
     )
     parser.add_argument(
         "-r",
-        "--right",
-        type=int,
+        dest="right",
+        type=int_or_abbrev,
         required=True,
         help="Right index of range (0-indexed, exclusive)"
     )
@@ -50,57 +58,33 @@ def parse_arguments():
     # Dstar parameters
     parser.add_argument(
         "-w",
-        "--window-size",
-        type=int,
+        dest="window_size",
+        type=int_or_abbrev,
         default=10000,
         help="Window size (default: 10000)"
     )
     parser.add_argument(
-        "-s",
-        "--step-size",
-        type=int,
-        default=10000,
-        help="Step size (default: 10000)"
-    )
-    parser.add_argument(
         "-n",
-        "--normalize",
+        dest="normalize",
         action="store_true",
         help="Apply min-max normalization to D* scores"
     )
-    parser.add_argument(
-        "-m",
-        "--mapping",
-        type=pathlib.Path,
-        default=None,
-        help="Optional population mapping file path"
-    )
-    parser.add_argument(
-        "-p",
-        "--plot",
-        action="store_true",
-        help="Generate empirical topology histograms and plots using CasterPlotter"
-    )
-    parser.add_argument(
-        "-d",
-        "--distribution",
-        type=str,
-        default=None,
-        help="Optional distribution to fit and overlay (e.g., gaussian, norm) when plotting"
-    )
-    parser.add_argument(
-        "-t",
-        "--topologies",
-        type=str,
-        nargs="+",
-        default=None,
-        help="List of topologies to plot (e.g., ABBA BABA AABB). Default is all."
-    )
-    
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
+    # Inject defaults for removed CLI flags
+    args.step_size = args.window_size
+    
+    # Auto-detect mapping file in same directory as fasta_file
+    args.mapping = None
+    default_map = args.fasta_file.parent / f"{args.fasta_file.stem}_mapping.tsv"
+    if default_map.exists():
+        args.mapping = default_map
+    else:
+        fallback_map = args.fasta_file.parent / "ape_mapping.tsv"
+        if fallback_map.exists():
+            args.mapping = fallback_map
     
     # 1. Validation
     if not args.fasta_file.exists():
@@ -179,18 +163,7 @@ def main():
         print(f"Success: TSV output file generated at: {final_output_path}")
         print(result.stdout)
         
-        # 6. Plotting
-        if args.distribution and not args.plot:
-            args.plot = True
-            
-        if args.plot:
-            sys.path.append(str(repo_root / "caster" / "results"))
-            try:
-                from caster_histogram import CasterPlotter
-                print("Generating empirical topology histograms...")
-                CasterPlotter(scores_file=str(final_output_path), distribution=args.distribution, topologies=args.topologies)
-            except Exception as e:
-                print(f"Error generating plots: {e}")
+        pass
         
     finally:
         shutil.rmtree(temp_dir)

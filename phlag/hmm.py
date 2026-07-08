@@ -213,7 +213,7 @@ class PhlagHMMTransitions(HMMTransitions):
         return params, props
 
     def log_prior(self, params: ParamsStandardHMMTransitions) -> Scalar:
-        return tfd.Dirichlet(self.concentration).log_prob(params.transition_matrix).sum()
+        return 0.0
 
     def _compute_transition_matrices(
         self, params: ParamsStandardHMMTransitions, inputs=None
@@ -242,7 +242,7 @@ class PhlagHMMTransitions(HMMTransitions):
                 transition_matrix = jnp.array([[1.0]])
             else:
                 expected_trans_counts = batch_stats.sum(axis=0)
-                transition_matrix = tfd.Dirichlet(self.concentration + expected_trans_counts).mode()
+                transition_matrix = expected_trans_counts / (expected_trans_counts.sum(axis=-1, keepdims=True) + 1e-12)
             params = params._replace(transition_matrix=transition_matrix)
         return params, m_step_state
 
@@ -504,6 +504,9 @@ class PhlagHMM(HMM):
             self.transitions_m_step_state,
             self.emissions_m_step_state,
         )
+
+    def log_prior(self, params: HMMParameterSet) -> Scalar:
+        return 0.0
 
     def state_emission_divergence(self, params: HMMParameterSet) -> Float[Array, "emission_dim"]:
         return self.emission_component.state_divergence(params.emissions)

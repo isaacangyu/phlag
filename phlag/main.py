@@ -27,6 +27,9 @@ INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
 class Phlag:
     def __init__(self, args):
         self.args = args
+        # Inject defaults for removed CLI flags
+        self.args.n_iters = 5
+        self.args.step_size = None
 
         self.validate_parameters()
         
@@ -39,10 +42,7 @@ class Phlag:
         self.initialize_output()
 
     def validate_parameters(self):
-        if self.args.n_iters < 1:
-            raise ValueError(f"--n-iters must be >= 1, got {self.args.n_iters}")
-        if self.args.step_size is not None and self.args.step_size < 1:
-            raise ValueError(f"--step-size must be >= 1, got {self.args.step_size}")
+        pass
 
     def read_caster_scores(self, path):
         """
@@ -230,9 +230,11 @@ class Phlag:
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
-
+        p0, p1 = 0.2, 0.2
+        initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
+        
         self.params, self.props = self.hmm.initialize(
-            initial_probs=INITIAL_PROBS, emission_probs=init_emissions
+            initial_probs=INITIAL_PROBS, emission_probs=init_emissions, transition_matrix=initial_transition_matrix
         )
         self.props.transitions.transition_matrix.trainable = True
         self.props.emissions.means.trainable = True
@@ -258,35 +260,34 @@ class Phlag:
             f.write(self.output_str)
 
 
+def int_or_abbrev(val_str):
+    val_str = str(val_str).strip().lower()
+    if val_str.endswith('k'):
+        return int(float(val_str[:-1]) * 1000)
+    elif val_str.endswith('m'):
+        return int(float(val_str[:-1]) * 1000000)
+    return int(val_str)
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER"
     )
 
     parser.add_argument(
-        "-o", "--output-file", type=pathlib.Path, required=False, default=None, help="Path to save the output"
-    )
-    parser.add_argument(
-        "-L", "--n-iters", type=int, default=5, help="Number of (outer) iterations (default: 5)"
+        "-o", dest="output_file", type=pathlib.Path, required=False, default=None, help="Path to save the output"
     )
     parser.add_argument(
         "-l",
-        "--increment-steps",
-        type=int,
+        dest="increment_steps",
+        type=int_or_abbrev,
         default=50,
         help="Increment for inner EM iterations (default: 50)",
-    )
-    parser.add_argument(
-        "-s",
-        "--step-size",
-        type=int,
-        default=None,
-        help="Optional step size to calculate and plot/output a histogram of flagged positions in non-overlapping steps.",
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
     hmm_group.add_argument(
-        "--emission-parameterization",
+        "-e",
+        dest="emission_parameterization",
         type=str.lower,
         default="attraction",
         choices=["free", "attraction", "anchor"],
@@ -295,7 +296,8 @@ def parse_arguments():
 
     discr_group = parser.add_argument_group("Transformation options")
     discr_group.add_argument(
-        "--ilr-transform",
+        "-i",
+        dest="ilr_transform",
         action="store_true",
         help="Apply isometric log-ratio transformation on CASTER score distributions",
     )
@@ -303,7 +305,7 @@ def parse_arguments():
     io_group = parser.add_argument_group("I/O options")
     io_group.add_argument(
         "-c",
-        "--caster-scores",
+        dest="caster_scores",
         type=pathlib.Path,
         required=True,
         help="Path to the CASTER scores TSV",

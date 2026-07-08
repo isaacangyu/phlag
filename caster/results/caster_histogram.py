@@ -26,7 +26,10 @@ class CasterPlotter:
         if self.df is not None:
             # 1. Run empirical histograms with optional parametric distribution overlay
             self.plot_caster_histograms()
-            # self.plot_dstar_histogram()
+            self.plot_dstar_histogram()
+            
+            # 2. Scatter plot three topology scores over the genome
+            self.plot_topology_scatter()
 
     def extract_filename_parameters(self):
         """Extracts genomic filename and normalization token from path."""
@@ -125,12 +128,24 @@ class CasterPlotter:
                 print(f"Could not load distribution module for '{self.distribution}': {e}")
 
         # Fit and plot theoretical distribution and expected value / std lines
+        import matplotlib.transforms as transforms
+        ax = plt.gca()
+        trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+        
         xmin, xmax = plt.xlim()
         x = np.linspace(xmin, xmax, 200)
 
         for i, col in enumerate(avg_cols):
             color = colors[i]
             mean_val = self.df[col].mean()
+            
+            # Stagger text heights by topology index to prevent overlapping labels
+            y_pos_mean = 0.90 - i * 0.15
+            y_pos_std = 0.85 - i * 0.15
+            
+            # Extract clean topology name
+            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+            topo_name = match.group(1).upper() if match else col.replace('avg*', '').replace('avg_', '')
             
             if overlay_dist:
                 # Fit the distribution to get parameters (e.g. loc and scale)
@@ -149,28 +164,50 @@ class CasterPlotter:
                     fit_std = self.params['scale']
                     
                     # Expected Value (E[X] or Mean) - Plot only one line!
-                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, 
-                                label=f"{col} E[X] ({fit_mean:.4f})")
+                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, label=None)
                     # +/- 1 Std bounds
-                    plt.axvline(x=fit_mean - fit_std, color=color, linestyle=':', linewidth=1.5, 
-                                label=f"{col} -1 Std ({fit_mean - fit_std:.4f})")
-                    plt.axvline(x=fit_mean + fit_std, color=color, linestyle=':', linewidth=1.5, 
-                                label=f"{col} +1 Std ({fit_mean + fit_std:.4f})")
+                    plt.axvline(x=fit_mean - fit_std, color=color, linestyle=':', linewidth=1.5, label=None)
+                    plt.axvline(x=fit_mean + fit_std, color=color, linestyle=':', linewidth=1.5, label=None)
+                    
+                    # Add inline labels with rounded values next to the lines
+                    plt.text(
+                        fit_mean, y_pos_mean, f"$\\mu_{{{topo_name}}} = {fit_mean:.4f}$", transform=trans, color=color,
+                        fontsize=8.0, ha='center', va='center', fontweight='bold',
+                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+                    )
+                    plt.text(
+                        fit_mean + fit_std, y_pos_std, f"$\\sigma_{{{topo_name}}} = {fit_std:.4f}$", transform=trans, color=color,
+                        fontsize=7.0, ha='center', va='center',
+                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+                    )
                 else:
                     # For other distributions, plot fitted expected value/mean if available
                     fit_mean = self.params.get('loc', mean_val)
-                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, 
-                                label=f"{col} Fitted E[X] ({fit_mean:.4f})")
+                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, label=None)
+                    plt.text(
+                        fit_mean, y_pos_mean, f"$\\mu_{{{topo_name}}} = {fit_mean:.4f}$", transform=trans, color=color,
+                        fontsize=8.0, ha='center', va='center', fontweight='bold',
+                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+                    )
             else:
                 # No distribution overlay requested, just plot the empirical mean line
-                plt.axvline(x=mean_val, color=color, linestyle='-', linewidth=2, 
-                            label=f"{col} Mean ({mean_val:.4f})")
+                plt.axvline(x=mean_val, color=color, linestyle='-', linewidth=2, label=None)
+                plt.text(
+                    mean_val, y_pos_mean, f"$\\mu_{{{topo_name}}} = {mean_val:.4f}$", transform=trans, color=color,
+                    fontsize=8.0, ha='center', va='center', fontweight='bold',
+                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+                )
                 
         title_suffix = f" & Fitted {dist_name.capitalize()} PDF" if overlay_dist else ""
         plt.title(f'Topology Average Scores{title_suffix}: {self.gene_name}', fontsize=13)
         plt.xlabel(f'{norm_label} Weight Value')
         plt.ylabel('Density')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Draw legend only if we have labeled handles
+        handles, labels = plt.gca().get_legend_handles_labels()
+        if handles:
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            
         plt.tight_layout()
         
         # Determine filename suffix dynamically based on plotted topologies
@@ -211,21 +248,43 @@ class CasterPlotter:
         std_val = self.df[self.dstar_col_name].std()
         
         # Guidelines markers
+        import matplotlib.transforms as transforms
+        ax = plt.gca()
+        trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+
         if not self.is_normalized_file:
             plt.axvline(x=0, color='black', linestyle='--', linewidth=1.5, label='Null ILS Expectation (0.0)')
-        plt.axvline(x=mean_val, color='darkred', linestyle='-', linewidth=2, 
-                    label=f"D* Mean ({mean_val:.4f})")
-        plt.axvline(x=median_val, color='blue', linestyle=':', linewidth=2, 
-                    label=f"D* Median ({median_val:.4f})")
-        plt.axvline(x=mean_val - std_val, color='purple', linestyle='-.', linewidth=1, 
-                    label=f"-1 Std ({mean_val - std_val:.4f})")
-        plt.axvline(x=mean_val + std_val, color='purple', linestyle='-.', linewidth=1, 
-                    label=f"+1 Std ({mean_val + std_val:.4f})")
+        
+        plt.axvline(x=mean_val, color='darkred', linestyle='-', linewidth=2, label=None)
+        plt.axvline(x=median_val, color='blue', linestyle=':', linewidth=2, label=None)
+        plt.axvline(x=mean_val - std_val, color='purple', linestyle='-.', linewidth=1, label=None)
+        plt.axvline(x=mean_val + std_val, color='purple', linestyle='-.', linewidth=1, label=None)
+
+        # Inline labels for D* parameters
+        plt.text(
+            mean_val, 0.90, f"$\\mu_{{D^*}} = {mean_val:.4f}$", transform=trans, color='darkred',
+            fontsize=8.0, ha='center', va='center', fontweight='bold',
+            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+        )
+        plt.text(
+            median_val, 0.83, f"$\\text{{median}}_{{D^*}} = {median_val:.4f}$", transform=trans, color='blue',
+            fontsize=8.0, ha='center', va='center', fontweight='bold',
+            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+        )
+        plt.text(
+            mean_val + std_val, 0.76, f"$\\sigma_{{D^*}} = {std_val:.4f}$", transform=trans, color='purple',
+            fontsize=7.0, ha='center', va='center',
+            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
+        )
         
         plt.title(f'Genomic $D^*$ Profile: {self.gene_name}', fontsize=13)
         plt.xlabel(f'{"Normalized " if self.is_normalized_file else ""} $D^*$ Value')
         plt.ylabel('Density')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        handles, labels = plt.gca().get_legend_handles_labels()
+        if handles:
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            
         plt.tight_layout()
         
         # Saved explicitly to caster/results
@@ -233,7 +292,46 @@ class CasterPlotter:
         save_path_dstar = os.path.join(output_dir, f'histogram_dstar_{self.gene_name}.png')
         plt.savefig(save_path_dstar, dpi=300)
         print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
-        plt.show()
+        plt.close()
+
+    def plot_topology_scatter(self):
+        """Generates a scatter plot of topology scores across genomic coordinates."""
+        avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        if self.topologies is not None:
+            filtered_cols = []
+            for col in avg_cols:
+                for t in self.topologies:
+                    if t.lower() in col.lower():
+                        filtered_cols.append(col)
+                        break
+            avg_cols = filtered_cols
+
+        if not avg_cols:
+            print("No matching topology columns found to scatter plot.")
+            return
+
+        plt.figure(figsize=(12, 6))
+        
+        # Melt the dataframe for seaborn plotting
+        melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
+                                 var_name='Topology', value_name='Score')
+        
+        # Create scatter plot with small points and transparency
+        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', alpha=0.6, s=12)
+        
+        # Format names for cleaner legend and title
+        plt.title(f'Genomic Topology Profile: {self.gene_name}', fontsize=13, fontweight='bold', pad=10)
+        plt.xlabel('Genomic Position (pos)', fontsize=11, labelpad=8)
+        plt.ylabel('Topology Score Value', fontsize=11, labelpad=8)
+        plt.legend(loc='upper right', framealpha=0.9)
+        plt.tight_layout()
+        
+        # Save output to caster/results
+        output_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path_scatter = os.path.join(output_dir, f'scatter_topologies_{self.gene_name}.png')
+        plt.savefig(save_path_scatter, dpi=300)
+        print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
+        plt.close()
 
 
 if __name__ == "__main__":
