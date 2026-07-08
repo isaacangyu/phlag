@@ -112,7 +112,7 @@ class Phlag:
         self.output_str += "\n" + "\n".join(headers)
         self.output_str += "\n" + ",".join(map(str, most_likely_states.astype(int).tolist()))
         
-        # Output histogram counting the number of ones in a given window size if parameter is passed
+        # Output histogram counting the number of flagged positions in a given window size if parameter is passed
         hist_str = self.generate_histogram(most_likely_states)
         if hist_str:
             self.output_str += hist_str
@@ -132,7 +132,7 @@ class Phlag:
         # 1. Text-based ASCII histogram
         lines = [
             "",
-            f"# Step-based counts of flagged positions (ones) (step size = {step_size}):",
+            f"# Step-based counts of flagged positions (step size = {step_size}):",
             "# Range       | Count | Bar",
         ]
         
@@ -158,11 +158,11 @@ class Phlag:
             steps = [f"{start}-{end}" for start, end, _ in step_counts]
             counts = [c for _, _, c in step_counts]
             
-            bars = ax.bar(steps, counts, color=sns.color_palette("viridis", len(counts)), edgecolor='none')
+            bars = ax.bar(steps, counts, color='#4c72b0', edgecolor='none')
             
             ax.set_title(f"Flagged Positions Count per Step (Size = {step_size})", fontsize=14, fontweight="bold", pad=15)
-            ax.set_xlabel("Genomic Step Range (bp)", fontsize=12, labelpad=10)
-            ax.set_ylabel("Count of Flagged (Anomalous) States (1s)", fontsize=12, labelpad=10)
+            ax.set_xlabel("Windows", fontsize=12, labelpad=10)
+            ax.set_ylabel("Count of Flagged (Anomalous) States", fontsize=12, labelpad=10)
             plt.xticks(rotation=45, ha='right', fontsize=9)
             
             for bar in bars:
@@ -281,7 +281,7 @@ def parse_arguments():
         "--step-size",
         type=int,
         default=None,
-        help="Optional step size to calculate and plot/output a histogram of flagged ones counts in non-overlapping steps.",
+        help="Optional step size to calculate and plot/output a histogram of flagged positions in non-overlapping steps.",
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
