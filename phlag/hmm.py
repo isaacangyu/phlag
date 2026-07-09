@@ -252,20 +252,13 @@ class ParamsGaussianHMMEmissions(NamedTuple):
     covariances: Union[Float[Array, "num_states emission_dim emission_dim"], ParameterProperties]
 
 
-class EmissionParam(Enum):
-    ANCHOR = "anchor"
-    REPULSION = "repulsion"
-    ATTRACTION = "attraction"
-    FREE = "free"
-
-
 class PhlagHMMEmissions(HMMEmissions):
     def __init__(
         self,
         num_states: int,
         emission_dim: int,
         penalty_lambda: float,
-        parameterization: Tuple[EmissionParam, ...],
+        parameterization: Tuple[str, ...],
         concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
     ):
         self.num_states = num_states
@@ -391,7 +384,7 @@ class PhlagHMMEmissions(HMMEmissions):
         for i in range(means.shape[0]):
             for j in range(i + 1, means.shape[0]):
                 # L2 distance between means
-                total_divergence += jnp.sqrt(jnp.sum((means[i] - means[j]) ** 2))
+                 total_divergence += jnp.sqrt(jnp.sum((means[i] - means[j]) ** 2))
         return total_divergence
 
 
@@ -407,7 +400,7 @@ class PhlagHMM(HMM):
         num_states: int = 2,
         emission_dim: int = 1,
         emission_lambda: Scalar = 1,
-        emission_parameterization: Tuple[EmissionParam, ...] = None,
+        emission_parameterization: Tuple[str, ...] = None,
         emission_concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
         initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]] = 1.1,
         transition_concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
@@ -420,7 +413,7 @@ class PhlagHMM(HMM):
         if emission_parameterization is not None:
             self.emission_parameterization = emission_parameterization
         else:
-            self.emission_parameterization = (EmissionParam.FREE,) * self.num_states
+            self.emission_parameterization = ("free",) * self.num_states
 
         self.emission_concentration = emission_concentration
         self.initial_probs_concentration = initial_probs_concentration

@@ -8,11 +8,12 @@ import seaborn as sns
 from scipy.stats import norm
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None):
+    def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None, plot_dstar=False, plot_scores=True, plot_dist=True):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir
         self.topologies = topologies
+        self.plot_dstar = plot_dstar
         
         # Keep data_dir path generation fallback strictly for file tracking input workflows
         os.makedirs(self.data_dir, exist_ok=True)
@@ -25,11 +26,14 @@ class CasterPlotter:
         
         if self.df is not None:
             # 1. Run empirical histograms with optional parametric distribution overlay
-            self.plot_caster_histograms()
-            self.plot_dstar_histogram()
+            if plot_dist:
+                self.plot_caster_histograms()
+                if self.plot_dstar:
+                    self.plot_dstar_histogram()
             
             # 2. Scatter plot three topology scores over the genome
-            self.plot_topology_scatter()
+            if plot_scores:
+                self.plot_topology_scatter()
 
     def extract_filename_parameters(self):
         """Extracts genomic filename and normalization token from path."""
@@ -228,7 +232,7 @@ class CasterPlotter:
 
         # Saved explicitly to caster/results
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_top = os.path.join(output_dir, f'histogram_{suffix}_{self.gene_name}.png')
+        save_path_top = os.path.join(output_dir, f'distributions_{suffix}_{self.gene_name}.png')
         plt.savefig(save_path_top, dpi=300)
         print(f"Saved empirical topology distribution chart to: {save_path_top}")
         plt.show()
@@ -289,7 +293,7 @@ class CasterPlotter:
         
         # Saved explicitly to caster/results
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_dstar = os.path.join(output_dir, f'histogram_dstar_{self.gene_name}.png')
+        save_path_dstar = os.path.join(output_dir, f'distributions_dstar_{self.gene_name}.png')
         plt.savefig(save_path_dstar, dpi=300)
         print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
         plt.close()
@@ -328,20 +332,37 @@ class CasterPlotter:
         
         # Save output to caster/results
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_scatter = os.path.join(output_dir, f'scatter_topologies_{self.gene_name}.png')
+        save_path_scatter = os.path.join(output_dir, f'scores_{self.gene_name}.png')
         plt.savefig(save_path_scatter, dpi=300)
         print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
-        plt.close()
+        plt.show()
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Empirical topology and parametric fit plotter.")
     parser.add_argument("scores_file", type=str, help="Path to CASTER scores TSV file.")
-    parser.add_argument("distribution", type=str, nargs="?", default="gaussian", help="Optional parametric distribution to fit (default: gaussian).")
-    parser.add_argument("-t", "--topologies", type=str, nargs="+", default=None, help="List of topologies to plot (default: all).")
+    parser.add_argument("-d", dest="distribution", type=str, default="gaussian", help="Optional parametric distribution to fit.")
+    parser.add_argument("-t", dest="topologies", type=str, nargs="+", default=None, help="List of topologies to plot.")
+    parser.add_argument("-s", dest="plot_dstar", action="store_true", help="Plot D* histogram.")
+    parser.add_argument(
+        "--plot",
+        nargs="*",
+        choices=["scores", "dist"],
+        default=["scores", "dist"],
+        help="List of plots to generate (choices: scores, dist. Default: both)",
+    )
     
     args = parser.parse_args()
     
-    # Executing the object-oriented analysis engine pipeline
-    plotter = CasterPlotter(scores_file=args.scores_file, distribution=args.distribution, topologies=args.topologies)
+    plot_scores = args.plot and "scores" in args.plot
+    plot_dist = args.plot and "dist" in args.plot
+    
+    CasterPlotter(
+        scores_file=args.scores_file,
+        distribution=args.distribution,
+        topologies=args.topologies,
+        plot_dstar=args.plot_dstar,
+        plot_scores=plot_scores,
+        plot_dist=plot_dist,
+    )

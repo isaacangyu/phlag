@@ -1,46 +1,43 @@
-#define DRIVER_VERSION "1_sliding_dynamic_flags_and_formatting"
+#define DRIVER_VERSION "1"
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <unordered_map>
-#include <cstdlib>
-#include <cstring>
-#include <vector>
-#include <array>
-#include <algorithm>
-#include <cmath>
+#include<iostream>
+#include<fstream>
+#include<sstream>
+#include<unordered_map>
+#include<cstdlib>
+#include<cstring>
+#include<vector>
+#include<array>
 
 using namespace std;
 
-struct DataType16 {
+struct DataType16{
     typedef unsigned short FreqType;
     typedef double EqFreqType;
     typedef double ScoreType;
     typedef long long CounterType;
 };
 
-template<typename DataType> 
-class DStarQuadrupartitionScorer {
+template<typename DataType> class DStarQuadrupartitionScorer{
 public:
     typedef typename DataType::FreqType FreqType;
     typedef typename DataType::EqFreqType EqFreqType;
     typedef typename DataType::ScoreType ScoreType;
     typedef typename DataType::CounterType CounterType;
 
-    struct Block {
+    struct Block{
         array<vector<FreqType>, 4> cnt0, cnt1, cnt2, cnt3;
         vector<array<EqFreqType, 4> > pi;
-        int windowSize;
+		int windowSize;
     };
     
 private:
-    inline static CounterType quadXXYY(CounterType x0, CounterType x1, CounterType x2, CounterType x3, CounterType y0, CounterType y1, CounterType y2, CounterType y3) {
-        return x0 * x1 * y2 * y3 + y0 * y1 * x2 * x3;
+    inline static CounterType quadXXYY(CounterType x0, CounterType x1, CounterType x2, CounterType x3, CounterType y0, CounterType y1, CounterType y2, CounterType y3){
+	    return x0 * x1 * y2 * y3 + y0 * y1 * x2 * x3;
     }
 
     static ScoreType scoreSite(int pos, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
-            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const array<EqFreqType, 4> &pi) {
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const array<EqFreqType, 4> &pi){
         const EqFreqType A = pi[0], C = pi[1], G = pi[2], T = pi[3];
         const EqFreqType R = A + G, Y = C + T, R2 = A * A + G * G, Y2 = C * C + T * T;
         const FreqType a0 = cnt0[0][pos], c0 = cnt0[1][pos], g0 = cnt0[2][pos], t0 = cnt0[3][pos], r0 = a0 + g0, y0 = c0 + t0;
@@ -66,80 +63,81 @@ private:
 
 public:
     static ScoreType scoreInterval(int start, int end, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
-            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const array<EqFreqType, 4> &pi) {
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const array<EqFreqType, 4> &pi){
         ScoreType res = 0;
         for (int i = start; i < end; i++) res += scoreSite(i, cnt0, cnt1, cnt2, cnt3, pi);
         return res;
     }
-    
-    static vector<ScoreType> dstar(int windowSize, int stepSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
-            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const vector<array<EqFreqType, 4> > &pi) {
+	
+    static vector<ScoreType> dstar(int windowSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const vector<array<EqFreqType, 4> > &pi){
         vector<ScoreType> res;
-        for (int i = 0; i < cnt0[0].size(); i += stepSize) { 
-            int j = (i + windowSize < cnt0[0].size()) ? i + windowSize : cnt0[0].size();
+        for (int i = 0; i < cnt0[0].size(); i += windowSize){
+			int j = (i + windowSize < cnt0[0].size()) ? i + windowSize : cnt0[0].size();
             res.push_back(scoreInterval(i, j, cnt0, cnt1, cnt2, cnt3, pi[i / windowSize]));
         }
         return res;
     }
-    
-    static CounterType quartetCnt(int start, int end, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
-            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3) {
-        CounterType res = 0;
-        for (int i = start; i < end; i++) {
-            CounterType s0 = cnt0[0][i] + cnt0[1][i] + cnt0[2][i] + cnt0[3][i];
-            CounterType s1 = cnt1[0][i] + cnt1[1][i] + cnt1[2][i] + cnt1[3][i];
-            CounterType s2 = cnt2[0][i] + cnt2[1][i] + cnt2[2][i] + cnt2[3][i];
-            CounterType s3 = cnt3[0][i] + cnt3[1][i] + cnt3[2][i] + cnt3[3][i];
-            res += s0 * s1 * s2 * s3;
-        }
+	
+	static CounterType quartetCnt(int start, int end, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3){
+		CounterType res = 0;
+        for (int i = start; i < end; i++){
+			CounterType s0 = cnt0[0][i] + cnt0[1][i] + cnt0[2][i] + cnt0[3][i];
+			CounterType s1 = cnt1[0][i] + cnt1[1][i] + cnt1[2][i] + cnt1[3][i];
+			CounterType s2 = cnt2[0][i] + cnt2[1][i] + cnt2[2][i] + cnt2[3][i];
+			CounterType s3 = cnt3[0][i] + cnt3[1][i] + cnt3[2][i] + cnt3[3][i];
+			res += s0 * s1 * s2 * s3;
+		}
         return res;
-    }
-    
-    static vector<CounterType> dstarQuartetCnt(int windowSize, int stepSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
-            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3) {
+	}
+	
+	static vector<CounterType> dstarQuartetCnt(int windowSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3){
         vector<CounterType> res;
-        for (int i = 0; i < cnt0[0].size(); i += stepSize) {
-            int j = (i + windowSize < cnt0[0].size()) ? i + windowSize : cnt0[0].size();
+        for (int i = 0; i < cnt0[0].size(); i += windowSize){
+			int j = (i + windowSize < cnt0[0].size()) ? i + windowSize : cnt0[0].size();
             res.push_back(quartetCnt(i, j, cnt0, cnt1, cnt2, cnt3));
         }
         return res;
     }
 
     static Block parseFreqs(const array<vector<FreqType>, 4> &f1, const array<vector<FreqType>, 4> &f2, 
-            const array<vector<FreqType>, 4> &f3, const array<vector<FreqType>, 4> &f4, int start, int end, int windowSize) {
+            const array<vector<FreqType>, 4> &f3, const array<vector<FreqType>, 4> &f4, int start, int end, int windowSize){
         Block res;
         res.windowSize = windowSize;
         res.pi.resize((end - start + windowSize - 1) / windowSize);
         array<const array<vector<FreqType>, 4>*, 4> lst = {&f1, &f2, &f3, &f4};
         array<array<vector<FreqType>, 4>*, 4> cntlst = {&res.cnt0, &res.cnt1, &res.cnt2, &res.cnt3};
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 4; i++){
             const array<vector<FreqType>, 4> &f = *(lst[i]);
             array<vector<FreqType>, 4> &cnt = *(cntlst[i]);
             for (int k = 0; k < 4; k++) {
-                for (int j = start; j < end; j++) {
+                for (int j = start; j < end; j++){
                     cnt[k].push_back(f[k][j]);
                     res.pi[(j - start) / windowSize][k] += f[k][j];
                 }
             }
         }
-        for (int i = 0; i < res.pi.size(); i++) {
+        for (int i = 0; i < res.pi.size(); i++){
             EqFreqType sum = res.pi[i][0] + res.pi[i][1] + res.pi[i][2] + res.pi[i][3];
             for (int k = 0; k < 4; k++) res.pi[i][k] = (sum == 0) ? 0.25 : res.pi[i][k] / sum;
         }
         return res;
     }
 
-    static string multiind(string input, string mapping, int windowSize, int stepSize, bool normalizeDStar, bool header = true) {
+    static string multiind(string input, string mapping = "", int intervalSize = 1000000, int windowSize = 10000, bool header = true)
+    {
         string name[4];
         unordered_map<string, int> name2id;
         unordered_map<string, int> partname2id;
-        if (mapping != "") {
+        if (mapping != ""){
             ifstream fmap(mapping);
             string idname, partname;
-            while(fmap >> idname) {
+            while(fmap >> idname){
                 fmap >> partname;
                 if (!partname2id.count(partname)) {
-                    if (partname != "-") {
+                    if (partname != "-"){
                         name[partname2id.size()] = partname;
                         partname2id[partname] = partname2id.size();
                     }
@@ -149,11 +147,12 @@ public:
             }
         }
         ifstream fin(input);
+        ostringstream fout;
         string line;
-        int id = -1, pos = 0;
+        int id, pos;
         array<array<vector<FreqType>, 4>, 4> freq;
-        while (getline(fin, line)) {
-            if (line[0] == '>') {
+        while (getline(fin, line)){
+            if (line[0] == '>'){
                 if (!name2id.count(line.substr(1))) {
                     name[partname2id.size()] = line.substr(1);
                     partname2id[line.substr(1)] = partname2id.size();
@@ -162,9 +161,9 @@ public:
                 id = name2id[line.substr(1)];
                 pos = 0;
             }
-            else if (id != -1) {
-                for (size_t j = 0; j < line.size(); j++) {
-                    for (int k = 0; k < 4; k++) {
+            else if (id != -1){
+                for (int j = 0; j < line.size(); j++){
+                    for (int k = 0; k < 4; k++){
                         if (pos + j >= freq[id][k].size()) freq[id][k].push_back(0); 
                     }
                     freq[id][0][pos + j] += (line[j] == 'A' || line[j] == 'a');
@@ -175,226 +174,79 @@ public:
                 pos += line.size();
             }
         }
+        if (header) fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
+        else cerr << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
         
-        // Isolate clean filename string from parent path
-        size_t last_slash = input.find_last_of("/\\");
-        string clean_filename = (last_slash == string::npos) ? input : input.substr(last_slash + 1);
-
-        // Truncate trailing .fa or .fasta extensions cleanly
-        size_t last_dot = clean_filename.find_last_of(".");
-        if (last_dot != string::npos) {
-            clean_filename = clean_filename.substr(0, last_dot);
-        }
-
-        ostringstream sliding_file_out;
-        if (header) {
-            sliding_file_out << "pos\tavg*ABBA\tavg*BABA\tavg*AABB\tsliding_D*\tQuartetCnt\n";
-        }
-        
-        vector<double> all_sliding_avgs1;
-        vector<double> all_sliding_avgs2;
-        vector<double> all_sliding_avgs3;
-        vector<double> all_sliding_dstar; 
-        vector<size_t> all_positions;
-        vector<double> all_qcnts;
-
-        double global_qcnt = 0;
-        int intervalSize = 1000000;
-
-        // Overlapping loop sequence step mapping (pos += stepSize)
-        for (size_t pos_idx = 0; pos_idx < freq[0][0].size(); pos_idx += stepSize) {
-            int end = (pos_idx + intervalSize < freq[0][0].size()) ? pos_idx + intervalSize : freq[0][0].size();
-            Block data = parseFreqs(freq[0], freq[1], freq[2], freq[3], pos_idx, end, windowSize);
-            vector<ScoreType> topology1 = dstar(windowSize, stepSize, data.cnt0, data.cnt3, data.cnt1, data.cnt2, data.pi);
-            vector<ScoreType> topology2 = dstar(windowSize, stepSize, data.cnt1, data.cnt3, data.cnt0, data.cnt2, data.pi);
-            vector<ScoreType> topology3 = dstar(windowSize, stepSize, data.cnt2, data.cnt3, data.cnt0, data.cnt1, data.pi);
-            vector<CounterType> quartetCnt = dstarQuartetCnt(windowSize, stepSize, data.cnt0, data.cnt1, data.cnt2, data.cnt3);
-            
+        double total1 = 0, total2 = 0, total3 = 0;
+        for (int pos = 0; pos < freq[0][0].size(); pos += intervalSize){
+            int end = (pos + intervalSize < freq[0][0].size()) ? pos + intervalSize : freq[0][0].size();
+            Block data = parseFreqs(freq[0], freq[1], freq[2], freq[3], pos, end, windowSize);
+            vector<ScoreType> topology1 = dstar(windowSize, data.cnt0, data.cnt3, data.cnt1, data.cnt2, data.pi);
+            vector<ScoreType> topology2 = dstar(windowSize, data.cnt1, data.cnt3, data.cnt0, data.cnt2, data.pi);
+            vector<ScoreType> topology3 = dstar(windowSize, data.cnt2, data.cnt3, data.cnt0, data.cnt1, data.pi);
+            vector<CounterType> quartetCnt = dstarQuartetCnt(windowSize, data.cnt0, data.cnt1, data.cnt2, data.cnt3);
             double sum1 = 0, sum2 = 0, sum3 = 0, qcnt = 0;
-            size_t n = topology1.size();
-
-            for (size_t i = 0; i < n; i++) {
+            for (int i = 0; i < topology1.size(); i++){
                 sum1 += topology1[i];
                 sum2 += topology2[i];
                 sum3 += topology3[i];
                 qcnt += quartetCnt[i];
             }
-            
-            double avg1 = (n > 0) ? sum1 / n : 0;
-            double avg2 = (n > 0) ? sum2 / n : 0;
-            double avg3 = (n > 0) ? sum3 / n : 0;
-            
-            double sliding_d = 0;
-            if ((sum1 + sum2 + sum3) != 0) {
-                sliding_d = (sum1 - sum2) / (sum1 + sum2 + sum3);
-            }
-            
-            all_sliding_avgs1.push_back(avg1);
-            all_sliding_avgs2.push_back(avg2);
-            all_sliding_avgs3.push_back(avg3);
-            all_sliding_dstar.push_back(sliding_d); 
-            all_positions.push_back(pos_idx);
-            all_qcnts.push_back(qcnt);
-
-            global_qcnt += qcnt;
-        }
-
-        // --- APPLY OPTIONAL MIN-MAX ZERO-ONE NORMALIZATION FOR D* SCORES ---
-        size_t total_intervals = all_sliding_avgs1.size();
-        if (normalizeDStar && total_intervals > 0) {
-            double min_d = all_sliding_dstar[0];
-            double max_d = all_sliding_dstar[0];
-            for (size_t i = 1; i < total_intervals; ++i) {
-                if (all_sliding_dstar[i] < min_d) min_d = all_sliding_dstar[i];
-                if (all_sliding_dstar[i] > max_d) max_d = all_sliding_dstar[i];
-            }
-            double range = max_d - min_d;
-            for (size_t i = 0; i < total_intervals; ++i) {
-                if (range != 0.0) {
-                    all_sliding_dstar[i] = (all_sliding_dstar[i] - min_d) / range;
-                } else {
-                    all_sliding_dstar[i] = 0.0; // Fallback boundary safeguard if completely flat
-                }
-            }
-        }
-
-        // Output processed logs matrix out to string stream
-        for (size_t i = 0; i < total_intervals; ++i) {
-            sliding_file_out << all_positions[i] << "\t" 
-                             << all_sliding_avgs1[i] << "\t" 
-                             << all_sliding_avgs2[i] << "\t" 
-                             << all_sliding_avgs3[i] << "\t" 
-                             << all_sliding_dstar[i] << "\t" 
-                             << all_qcnts[i] << "\n";
+            fout << input << "\t" << pos << "\t" << sum1 << "\t" << sum2 << "\t" << sum3 << "\t" << (sum1 - sum2) / (sum1 + sum2 + sum3) << "\t" << qcnt << endl;
+            total1 += sum1;
+            total2 += sum2;
+            total3 += sum3;
         }
         
-        // Dynamic name format modifier: Appends _n conditionally based on normalization status
-        string normalization_suffix = (normalizeDStar) ? "_n" : "";
-        string data_save_target = clean_filename + "_w" + to_string(windowSize) + "_s" + to_string(stepSize) + normalization_suffix + ".tsv";
+        cerr << "(((" << name[0] << "," << name[1] << ")," << name[2] << ")," << name[3] << ");\n"; 
+        cerr << "c*ABBA = " << total1 << " (" << name[1] << " and " << name[2] << ")\n";
+        cerr << "c*BABA = " << total2 << " (" << name[0] << " and " << name[2] << ")\n";
+        cerr << "c*AABB = " << total3 << " (" << name[0] << " and " << name[1] << ")\n";
+        cerr << "D* = (c*ABBA - c*BABA) / (c*ABBA + c*BABA + c*AABB) = " << (total1 - total2) / (total1 + total2 + total3) << "\n";
         
-        ofstream disk_output(data_save_target);
-        if (disk_output.is_open()) {
-            disk_output << sliding_file_out.str();
-            disk_output.close();
-            
-            // Success log tracking message including sliding mode specifications
-            cerr << "SUCCESS: Sliding window file generated [Window: " << windowSize 
-                 << ", Step: " << stepSize 
-                 << ", Normalized: " << (normalizeDStar ? "Yes" : "No") 
-                 << "] at: " << data_save_target << endl;
-        } else {
-            cerr << "ERROR: Failed to open disk handle for writing path: " << data_save_target << endl;
-        }
-
-        // --- COMPUTE MACRO GLOBAL STATISTICS FROM VECTORS ---
-        double global_avg1 = 0, global_avg2 = 0, global_avg3 = 0, dstar_avg = 0;
-        double global_med1 = 0, global_med2 = 0, global_med3 = 0, dstar_med = 0;
-        double global_std1 = 0, global_std2 = 0, global_std3 = 0, dstar_std = 0;
-
-        if (total_intervals > 0) {
-            double running_sum_avg1 = 0, running_sum_avg2 = 0, running_sum_avg3 = 0, dstar_sum = 0;
-            for(size_t i = 0; i < total_intervals; ++i) {
-                running_sum_avg1 += all_sliding_avgs1[i];
-                running_sum_avg2 += all_sliding_avgs2[i];
-                running_sum_avg3 += all_sliding_avgs3[i];
-                dstar_sum        += all_sliding_dstar[i];
-            }
-            global_avg1 = running_sum_avg1 / total_intervals;
-            global_avg2 = running_sum_avg2 / total_intervals;
-            global_avg3 = running_sum_avg3 / total_intervals;
-            dstar_avg   = dstar_sum / total_intervals;
-
-            std::sort(all_sliding_avgs1.begin(), all_sliding_avgs1.end());
-            std::sort(all_sliding_avgs2.begin(), all_sliding_avgs2.end());
-            std::sort(all_sliding_avgs3.begin(), all_sliding_avgs3.end());
-            std::sort(all_sliding_dstar.begin(), all_sliding_dstar.end());
-
-            if (total_intervals % 2 != 0) {
-                global_med1 = all_sliding_avgs1[total_intervals / 2];
-                global_med2 = all_sliding_avgs2[total_intervals / 2];
-                global_med3 = all_sliding_avgs3[total_intervals / 2];
-                dstar_med   = all_sliding_dstar[total_intervals / 2];
-            } else {
-                size_t mid = total_intervals / 2;
-                global_med1 = (all_sliding_avgs1[mid - 1] + all_sliding_avgs1[mid]) / 2.0;
-                global_med2 = (all_sliding_avgs2[mid - 1] + all_sliding_avgs2[mid]) / 2.0;
-                global_med3 = (all_sliding_avgs3[mid - 1] + all_sliding_avgs3[mid]) / 2.0;
-                dstar_med   = (all_sliding_dstar[mid - 1] + all_sliding_dstar[mid]) / 2.0;
-            }
-
-            double var1 = 0, var2 = 0, var3 = 0, dstar_var = 0;
-            for(size_t i = 0; i < total_intervals; ++i) {
-                var1 += pow(all_sliding_avgs1[i] - global_avg1, 2);
-                var2 += pow(all_sliding_avgs2[i] - global_avg2, 2);
-                var3 += pow(all_sliding_avgs3[i] - global_avg3, 2);
-                dstar_var += pow(all_sliding_dstar[i] - dstar_avg, 2);
-            }
-            double denom = (total_intervals > 1) ? total_intervals - 1 : 1;
-            global_std1 = sqrt(var1 / denom);
-            global_std2 = sqrt(var2 / denom);
-            global_std3 = sqrt(var3 / denom);
-            dstar_std   = sqrt(dstar_var / denom);
-        }
-
-        // Output formatting aligned securely with data metrics mapping layouts
-        ostringstream summary_out;
-        if (header) {
-            summary_out << "metric\tavg*ABBA\tavg*BABA\tavg*AABB\tD*\n";
-        }
-        summary_out << "MEAN\t" << global_avg1 << "\t" << global_avg2 << "\t" << global_avg3 << "\t" << dstar_avg << "\n";
-        summary_out << "MEDIAN\t" << global_med1 << "\t" << global_med2 << "\t" << global_med3 << "\t" << dstar_med << "\n";
-        summary_out << "STDDEV\t" << global_std1 << "\t" << global_std2 << "\t" << global_std3 << "\t" << dstar_std << "\n";
-        
-        return summary_out.str();    
+        return fout.str();
     }
 };
 
-const string HELP = R"V0G0N(D* Statistic Global Summary Tool
-Usage: dstar FASTA_FILE [ MAPPING_FILE ] [ Options ]
+const string HELP = R"V0G0N(D* Statistic Sliding Window Tool
+dstar FASTA_FILE [ MAPPING_FILE WINDOW_SIZE ]
 
-Arguments:
-  FASTA_FILE    Input multiple sequence alignment file path
-  MAPPING_FILE  Population/Clade structure definitions file (Default: -)
+FASTA_FILE: input file, currently only supporting FASTA format
+MAPPING_FILE: a file mapping input sequences into four clusters or - (see format below, default: -)
+WINDOW_SIZE: ideally a multiple of 10000 (default: 10000)
 
-Options:
-  -w [int]      Window Size base pair evaluation frame (Default: 10000)
-  -s [int]      Step Size/Stride interval translation step (Default: 10000)
-  -n            Apply min-max zero-one normalization conversion layout over sliding D* values
+example:
+dstar input.fasta - 1000000
+dstar input.fasta mapping.txt
+
+mapping file format (exactly four clusters):
+seq_name1	P1
+seq_name2	P2
+seq_name3	P3
+seq_name4	P3
+seq_name5	Po
+seq_name6	Po
+
+default mapping file format (-):
+seq_name1	P1
+seq_name2	P2
+seq_name3	P3
+seq_name4	Po
 )V0G0N";
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2 || argv[1][0] == '-') {
-        cerr << HELP;
-        return 0;
-    }
-    
-    string fasta = argv[1];
-    string mapping = (argc > 2) ? argv[2] : "-";
-    if (mapping == "-") mapping = "";
-    
-    int window_size = 10000;
-    int step_size = 10000;
-    bool normalize_dstar = false;
-
-    // Parsed flag elements matching dynamic token tracking configurations
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
-            window_size = stoi(argv[i + 1]);
-            i++; 
-        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-            step_size = stoi(argv[i + 1]);
-            i++;
-        } else if (strcmp(argv[i], "-n") == 0) {
-            normalize_dstar = true;
-        }
-    }
-    
-    // Evaluate and pull consolidated data vectors
-    string global_summary = DStarQuadrupartitionScorer<DataType16>::multiind(fasta, mapping, window_size, step_size, normalize_dstar);
-
-    // Prints the clean metrics text table out to console stdout
-    cout << global_summary;
-    
+	if (argc == 1 || argv[1][0] == '-'){
+		cerr << HELP;
+		return 0;
+	}
+	
+	string fasta = argv[1];
+	string mapping = (argc > 2) ? argv[2] : "-";
+	if (mapping == "-") mapping = "";
+	int size = (argc > 3) ? stoi(argv[3]) : 1000000;
+	int win_size = (argc > 4) ? stoi(argv[4]) : 10000;
+	
+    cout << DStarQuadrupartitionScorer<DataType16>::multiind(fasta, mapping, size, win_size);
     return 0;
 }
