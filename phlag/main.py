@@ -118,28 +118,150 @@ class Phlag:
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
+    def get_n_best_viterbi_paths(self, initial_probs, transition_matrix, log_likelihoods, n):
+        T, K = log_likelihoods.shape
+        log_V = np.full((T, K, n), -np.inf)
+        BP = np.zeros((T, K, n, 2), dtype=int)
+        
+        log_pi = np.log(initial_probs + 1e-12)
+        log_A = np.log(transition_matrix + 1e-12)
+        
+        for s in range(K):
+            log_V[0, s, 0] = log_pi[s] + log_likelihoods[0, s]
+            
+        for t in range(1, T):
+            for s in range(K):
+                candidates = []
+                for s_prev in range(K):
+                    for k_prev in range(n):
+                        score = log_V[t-1, s_prev, k_prev] + log_A[s_prev, s] + log_likelihoods[t, s]
+                        if score > -np.inf:
+                            candidates.append((score, s_prev, k_prev))
+                if not candidates:
+                    continue
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for i in range(min(n, len(candidates))):
+                    log_V[t, s, i] = candidates[i][0]
+                    BP[t, s, i] = [candidates[i][1], candidates[i][2]]
+                    
+        final_candidates = []
+        for s in range(K):
+            for k in range(n):
+                score = log_V[T-1, s, k]
+                if score > -np.inf:
+                    final_candidates.append((score, s, k))
+        final_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        paths = []
+        path_likelihoods = []
+        for rank in range(min(n, len(final_candidates))):
+            score, s_last, k_last = final_candidates[rank]
+            path = np.zeros(T, dtype=int)
+            path[T-1] = s_last
+            curr_k = k_last
+            likelihoods = np.zeros(T)
+            likelihoods[T-1] = score
+            for t in range(T-2, -1, -1):
+                s_next = path[t+1]
+                bp = BP[t+1, s_next, curr_k]
+                path[t] = bp[0]
+                curr_k = bp[1]
+                likelihoods[t] = log_V[t, path[t], curr_k]
+            paths.append(path)
+            path_likelihoods.append(likelihoods)
+        return paths, path_likelihoods
+
     def compute_output(self):
         divergence = self.hmm.state_emission_divergence(self.params)
         try:
             emission_divergence_str = ", ".join(map(str, divergence.tolist()))
         except TypeError:
             emission_divergence_str = str(float(divergence))
-        most_likely_states = self.hmm.most_likely_states(self.params, self.Y)
-        ps = self.hmm.smoother(self.params, self.Y).smoothed_probs[:, 1]
+            
+        # Get the emission distributions for each state to compute log likelihoods
+        log_likelihoods = []
+        for state in range(self.hmm.num_states):
+            dist = self.hmm.emission_component.distribution(self.params.emissions, state)
+            log_likelihoods.append(dist.log_prob(self.Y))
+        log_likelihoods = jnp.stack(log_likelihoods, axis=-1)
         
+        # Convert values to numpy arrays for Viterbi calculation
+        initial_probs_np = np.array(self.params.initial.probs)
+        transition_matrix_np = np.array(self.params.transitions.transition_matrix)
+        log_likelihoods_np = np.array(log_likelihoods)
+        
+        # Calculate n-best Viterbi paths
+        n_paths = getattr(self.args, "best_paths", 1)
+        paths, path_likelihoods = self.get_n_best_viterbi_paths(
+            initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
+        )
+        
+        # Build headers
         headers = []
         headers.append("# State divergence: " + emission_divergence_str)
         headers.append(f"# Outer EM iterations: {self.n_iters}")
         headers.append(f"# Inner EM iterations: {self.increment_steps}")
         headers.append(f"# ILR transform: {self.ilr_transform}")
-        
+        for idx, l in enumerate(path_likelihoods):
+            headers.append(f"# Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
+            
         self.output_str += "\n" + "\n".join(headers)
-        self.output_str += "\n" + ",".join(map(str, most_likely_states.astype(int).tolist()))
         
-        # Output histogram counting the number of flagged positions in a given window size if parameter is passed
-        hist_str = self.generate_histogram(most_likely_states)
-        if hist_str:
-            self.output_str += hist_str
+        # Add the state paths as comma-separated rows in the report
+        for path in paths:
+            self.output_str += "\n" + ",".join(map(str, path.tolist()))
+            
+        # Generate the visual plot if configured: states + log-likelihood
+        if self.args.plot and "states" in self.args.plot:
+            try:
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                sns.set_theme(style="white")
+                fig, ax1 = plt.subplots(figsize=(12, 6))
+                ax2 = ax1.twinx()
+                
+                input_path = pathlib.Path(self.args.caster_scores)
+                sorted_positions = sorted(self.pos_to_caster.keys())
+                positions_kb = np.array(sorted_positions) / 1000.0  # in kb
+                
+                colors = sns.color_palette("tab10", len(paths))
+                
+                for idx in range(len(paths)):
+                    path = paths[idx]
+                    likes = path_likelihoods[idx]
+                    color = colors[idx]
+                    line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
+                    
+                    # Plot states on left y-axis
+                    ax1.step(positions_kb, path, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
+                    
+                    # Plot Viterbi log-likelihood on right y-axis
+                    ax2.plot(positions_kb, likes, color=color, linestyle=line_style, linewidth=2.0, label=f"Likelihood {idx+1}")
+                
+                ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
+                ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
+                ax1.set_ylim(-0.05, 1.05)
+                ax1.set_yticks([0, 1])
+                ax1.grid(True, axis='x', linestyle=':', alpha=0.5)
+                
+                ax2.set_ylabel("Viterbi Log Likelihood", fontsize=12, labelpad=10)
+                
+                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths & Log Likelihoods\nLocus: {input_path.stem}", fontsize=14, fontweight="bold", pad=15)
+                
+                lines1, labels1 = ax1.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", framealpha=0.9)
+                
+                fig.tight_layout()
+                
+                output_path = pathlib.Path(self.output_file)
+                plot_path = output_path.with_name(f"states_{input_path.stem}.png")
+                plt.savefig(plot_path, dpi=300)
+                plt.close()
+                print(f"Saved visual HMM states and log-likelihood plot to: {plot_path}")
+            except Exception as e:
+                print(f"Warning: Could not generate visual states plot: {e}")
 
     def generate_histogram(self, most_likely_states):
         step_size = self.args.step_size
@@ -170,46 +292,6 @@ class Phlag:
             lines.append(f"# {range_str} | {count:<5} | {bar}")
             
         text_hist = "\n".join(lines) + "\n"
-
-        # 2. Matplotlib visual plot saving
-        if self.args.plot and "states" in self.args.plot:
-            try:
-                import matplotlib.pyplot as plt
-                import seaborn as sns
-                
-                sns.set_theme(style="whitegrid")
-                fig, ax = plt.subplots(figsize=(10, 6))
-                
-                steps = [f"{start}-{end}" for start, end, _ in step_counts]
-                counts = [c for _, _, c in step_counts]
-                
-                bars = ax.bar(steps, counts, color='#4c72b0', edgecolor='none')
-                
-                ax.set_title(f"Flagged Positions Count per Step (Size = {step_size})", fontsize=14, fontweight="bold", pad=15)
-                ax.set_xlabel("Windows", fontsize=12, labelpad=10)
-                ax.set_ylabel("Count of Flagged (Anomalous) States", fontsize=12, labelpad=10)
-                plt.xticks(rotation=45, ha='right', fontsize=9)
-                
-                for bar in bars:
-                    height = bar.get_height()
-                    if height > 0:
-                        ax.annotate(f'{height}',
-                                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                                    xytext=(0, 3),
-                                    textcoords="offset points",
-                                    ha='center', va='bottom', fontsize=9, fontweight="semibold")
-                                    
-                plt.tight_layout()
-                
-                output_path = pathlib.Path(self.output_file)
-                input_path = pathlib.Path(self.args.caster_scores)
-                plot_path = output_path.with_name(f"states_{input_path.stem}.png")
-                plt.savefig(plot_path, dpi=300)
-                plt.close()
-                print(f"Saved visual window states plot to: {plot_path}")
-                
-            except Exception as e:
-                print(f"Warning: Could not generate visual histogram plot: {e}")
 
         return text_hist
 
@@ -538,6 +620,13 @@ def parse_arguments():
         type=float,
         default=1.0,
         help="Emission penalty regularizer parameter lambda (default: 1.0)",
+    )
+    hmm_group.add_argument(
+        "--best-paths",
+        dest="best_paths",
+        type=int,
+        default=1,
+        help="Number of best Viterbi paths to calculate and plot (default: 1)",
     )
 
     discr_group = parser.add_argument_group("Transformation options")

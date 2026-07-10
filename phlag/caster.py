@@ -27,6 +27,18 @@ def int_or_abbrev(val_str):
         return int(float(val_str[:-1]) * 1000000)
     return int(val_str)
 
+def get_fasta_length(fasta_path):
+    length = 0
+    with open(fasta_path, "r") as f:
+        for line in f:
+            if line.startswith(">"):
+                break
+        for line in f:
+            if line.startswith(">"):
+                break
+            length += len(line.strip())
+    return length
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Caster: Compute D* statistic on a genomic range."
@@ -44,14 +56,15 @@ def parse_arguments():
         "-l",
         dest="left",
         type=int_or_abbrev,
-        required=True,
+        default=0,
         help="Left index of range (0-indexed, inclusive)"
     )
     parser.add_argument(
         "-r",
         dest="right",
         type=int_or_abbrev,
-        required=True,
+        required=False,
+        default=None,
         help="Right index of range (0-indexed, exclusive)"
     )
     
@@ -136,6 +149,13 @@ def main():
         sys.exit(f"Error: FASTA file not found at '{args.fasta_file}'")
     if args.left < 0:
         sys.exit(f"Error: Left index must be >= 0, got {args.left}")
+        
+    if args.right is None:
+        try:
+            args.right = get_fasta_length(args.fasta_file)
+        except Exception as e:
+            sys.exit(f"Error reading FASTA file to compute right endpoint: {e}")
+            
     if args.right <= args.left:
         sys.exit(f"Error: Right index must be greater than left index, got left={args.left}, right={args.right}")
         
@@ -191,10 +211,7 @@ def main():
         # Perform rolling window sum
         K = max(1, args.window_size // args.step_size)
         
-        output_lines = []
-        header = "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"
-        output_lines.append(header)
-        
+        results = []
         for i in range(len(raw_rows) - K + 1):
             window_rows = raw_rows[i : i + K]
             
@@ -211,7 +228,36 @@ def main():
             
             if args.left <= pos_val < args.right:
                 file_val = window_rows[0][0]
-                output_lines.append(f"{file_val}\t{pos_val}\t{sum_abba:.6g}\t{sum_baba:.6g}\t{sum_aabb:.6g}\t{dstar_val:.6g}\t{sum_qcnt:.0f}\n")
+                results.append({
+                    'file': file_val,
+                    'pos': pos_val,
+                    'abba': sum_abba,
+                    'baba': sum_baba,
+                    'aabb': sum_aabb,
+                    'dstar': dstar_val,
+                    'qcnt': sum_qcnt
+                })
+                
+        # If normalization is requested, apply min-max scaling to [0, 1] for each score column
+        if args.normalize and len(results) > 0:
+            for key in ['abba', 'baba', 'aabb', 'dstar']:
+                vals = [r[key] for r in results]
+                min_val = min(vals)
+                max_val = max(vals)
+                diff = max_val - min_val
+                if diff == 0:
+                    for r in results:
+                        r[key] = 0.0
+                else:
+                    for r in results:
+                        r[key] = (r[key] - min_val) / diff
+                        
+        output_lines = []
+        header = "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"
+        output_lines.append(header)
+        
+        for r in results:
+            output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
                     
         # 5. Write final TSV file to current directory
         # Output filename should not have C, and includes left and right indices (formatted)
