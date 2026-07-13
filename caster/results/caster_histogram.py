@@ -25,6 +25,21 @@ class CasterPlotter:
         self.load_data()
         
         if self.df is not None:
+            # Build color mapping for all topologies present in the dataframe
+            topo_colors = {
+                'ABBA': '#2B4C7E',    # Deep Steel Blue
+                'BABA': '#E05A47',    # Warm Coral
+                'AABB': '#47A063',    # Muted Green
+            }
+            self.color_mapping = {}
+            for col in self.df.columns:
+                match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+                if match:
+                    topo = match.group(1).upper()
+                    self.color_mapping[col] = topo_colors.get(topo, '#808080')
+                else:
+                    self.color_mapping[col] = '#808080'
+
             # 1. Run empirical histograms with optional parametric distribution overlay
             if plot_dist:
                 self.plot_caster_histograms()
@@ -112,9 +127,8 @@ class CasterPlotter:
         
         # Plot empirical histogram (no KDE spline, as requested: kde=False)
         sns.histplot(data=melted_df, x='Score', hue='Topology', element='step', 
-                     stat='density', common_norm=False, kde=False, alpha=0.3, bins=50)
-        
-        colors = sns.color_palette(n_colors=len(avg_cols))
+                     stat='density', common_norm=False, kde=False, alpha=0.3, bins=50,
+                     palette=self.color_mapping)
         
         # Determine if normal distribution overlay is requested
         overlay_dist = False
@@ -140,7 +154,7 @@ class CasterPlotter:
         x = np.linspace(xmin, xmax, 200)
 
         for i, col in enumerate(avg_cols):
-            color = colors[i]
+            color = self.color_mapping[col]
             mean_val = self.df[col].mean()
             
             # Stagger text heights by topology index to prevent overlapping labels
@@ -219,7 +233,7 @@ class CasterPlotter:
         is_all_topologies = (len(avg_cols) == len(all_avg_cols))
         
         if is_all_topologies:
-            suffix = "topologies"
+            suffix = "all"
         else:
             topo_names = []
             for col in avg_cols:
@@ -232,7 +246,7 @@ class CasterPlotter:
 
         # Saved explicitly to caster/results
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_top = os.path.join(output_dir, f'distributions_{suffix}_{self.gene_name}.png')
+        save_path_top = os.path.join(output_dir, f'{self.distribution}_{suffix}_{self.gene_name}.png')
         plt.savefig(save_path_top, dpi=300)
         print(f"Saved empirical topology distribution chart to: {save_path_top}")
         plt.show()
@@ -321,7 +335,7 @@ class CasterPlotter:
                                  var_name='Topology', value_name='Score')
         
         # Create scatter plot with small points and transparency
-        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', alpha=0.6, s=12)
+        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.color_mapping, alpha=0.6, s=12)
         
         # Format names for cleaner legend and title
         plt.title(f'Genomic Topology Profile: {self.gene_name}', fontsize=13, fontweight='bold', pad=10)

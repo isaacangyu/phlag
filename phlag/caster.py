@@ -103,6 +103,20 @@ def parse_arguments():
         default=["scores", "dist"],
         help="List of plots to generate (choices: scores, dist. Default: both)",
     )
+    parser.add_argument(
+        "-t",
+        "--topologies",
+        dest="topologies",
+        nargs="+",
+        default=None,
+        help="List of topologies to plot (default: all)"
+    )
+    parser.add_argument(
+        "--plot-dstar",
+        dest="plot_dstar",
+        action="store_true",
+        help="Plot D* distribution (default: False)"
+    )
     return parser.parse_args()
 
 def main():
@@ -288,7 +302,8 @@ def main():
                     scores_file=str(final_output_path.resolve()),
                     distribution="gaussian",
                     data_dir=str(final_output_path.parent.resolve()),
-                    plot_dstar=args.normalize,
+                    topologies=args.topologies,
+                    plot_dstar=args.plot_dstar,
                     plot_scores=plot_scores,
                     plot_dist=plot_dist,
                 )

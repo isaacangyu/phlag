@@ -36,6 +36,9 @@ class Phlag:
         if not hasattr(self.args, "step_size"):
             self.args.step_size = None
 
+        # Auto-extract emission_type from filename if not explicitly passed
+        self.extract_distribution_type_from_filename()
+
         self.validate_parameters()
         
         # Purely ingest CASTER scores instead of computing or reading QQS
@@ -45,6 +48,26 @@ class Phlag:
         self.compute_emissions()
         self.initialize_hmm()
         self.initialize_output()
+
+    def extract_distribution_type_from_filename(self):
+        # Check if the user specified emission_type explicitly on CLI
+        T_supplied = any(arg.startswith("-T") or arg.startswith("--emission-type") for arg in sys.argv)
+        if not T_supplied:
+            # Check input filename (caster_scores) and output filename
+            filenames_to_check = []
+            if hasattr(self.args, "caster_scores") and self.args.caster_scores:
+                filenames_to_check.append(str(self.args.caster_scores))
+            if hasattr(self.args, "output_file") and self.args.output_file:
+                filenames_to_check.append(str(self.args.output_file))
+                
+            for fname in filenames_to_check:
+                fname_lower = os.path.basename(fname).lower()
+                if "beta" in fname_lower:
+                    self.args.emission_type = "beta"
+                    break
+                elif "gaussian" in fname_lower:
+                    self.args.emission_type = "gaussian"
+                    break
 
     def validate_parameters(self):
         pass
@@ -100,8 +123,12 @@ class Phlag:
         sorted_positions = sorted(self.pos_to_caster.keys())
         raw_caster_matrix = jnp.stack([self.pos_to_caster[pos] for pos in sorted_positions], axis=0)
 
-        if self.ilr_transform:
-            self.Y = ilr(multi_replace(raw_caster_matrix, delta=1e-7))
+        if getattr(self.args, "emission_type", "gaussian") == "beta":
+            raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
+            self.Y = raw_clipped / raw_clipped.sum(axis=-1, keepdims=True)
+        elif self.ilr_transform:
+            raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
+            self.Y = ilr(multi_replace(raw_clipped, delta=1e-7))
         else:
             self.Y = raw_caster_matrix
 
@@ -114,7 +141,8 @@ class Phlag:
         else:
             test_dir = pathlib.Path.cwd() / "test"
             test_dir.mkdir(parents=True, exist_ok=True)
-            self.output_file = test_dir / f"report_{input_path.name}"
+            dist_type = getattr(self.args, "emission_type", "gaussian")
+            self.output_file = test_dir / f"report_{dist_type}_{input_path.name}"
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -256,7 +284,8 @@ class Phlag:
                 fig.tight_layout()
                 
                 output_path = pathlib.Path(self.output_file)
-                plot_path = output_path.with_name(f"states_{input_path.stem}.png")
+                dist_type = getattr(self.args, "emission_type", "gaussian")
+                plot_path = output_path.with_name(f"states_{dist_type}_{input_path.stem}.png")
                 plt.savefig(plot_path, dpi=300)
                 plt.close()
                 print(f"Saved visual HMM states and log-likelihood plot to: {plot_path}")
@@ -323,6 +352,7 @@ class Phlag:
             initial_probs_concentration=self.nu,
             transition_concentration=self.psi,
             occupancy_bias=self.occupancy_bias,
+            emission_type=self.args.emission_type,
         )
         
         # Compute empirical moments from CASTER data over genomic positions
@@ -332,8 +362,13 @@ class Phlag:
         # Implement symmetry breaking: Anchor state 0 to the baseline mean,
         # and seed state 1 slightly further along the alternative dimensions.
         # Initialize emissions using mean and variance for each state.
-        state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
-        state1_init = jnp.stack([data_mean + data_std, data_std ** 2], axis=-1)
+        if self.args.emission_type == "beta":
+            state1_mean = jnp.clip(data_mean + data_std, a_min=1e-4, a_max=0.95)
+            state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
+            state1_init = jnp.stack([state1_mean, data_std ** 2], axis=-1)
+        else:
+            state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
+            state1_init = jnp.stack([data_mean + data_std, data_std ** 2], axis=-1)
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
@@ -344,8 +379,12 @@ class Phlag:
             initial_probs=INITIAL_PROBS, emission_probs=init_emissions, transition_matrix=initial_transition_matrix
         )
         self.props.transitions.transition_matrix.trainable = True
-        self.props.emissions.means.trainable = True
-        self.props.emissions.covariances.trainable = True
+        if self.args.emission_type == "beta":
+            self.props.emissions.concentration1.trainable = True
+            self.props.emissions.concentration0.trainable = True
+        else:
+            self.props.emissions.means.trainable = True
+            self.props.emissions.covariances.trainable = True
         
         self.hmm.initialize_m_step_state(self.params, self.props)
         self.n_iters = self.args.n_iters
@@ -373,10 +412,9 @@ class PhlagPlotter:
     of standard multi-species coalescent (MSC) background (State 0, Null) vs.
     alternative/anomalous (State 1, Alternative) states before and after EM fitting.
     """
-    def __init__(self, phlag, initial_means, initial_covariances):
+    def __init__(self, phlag, initial_params):
         self.phlag = phlag
-        self.initial_means = initial_means
-        self.initial_covariances = initial_covariances
+        self.initial_params = initial_params
         
         # Ingest and configure metadata parameters
         self.extract_metadata()
@@ -433,20 +471,21 @@ class PhlagPlotter:
         for d in range(self.emission_dim):
             ymin, ymax = float(np.min(self.phlag.Y[:, d])), float(np.max(self.phlag.Y[:, d]))
             ypad = (ymax - ymin) * 0.20 or 0.1
-            ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
+            if self.phlag.args.emission_type == "beta":
+                ranges[d] = np.linspace(max(1e-5, ymin - ypad), min(1.0 - 1e-5, ymax + ypad), 300)
+            else:
+                ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
 
         # Plot Row 0: Before EM (Initial theoretical setup)
-        self._plot_row(axes[0], self.initial_means, self.initial_covariances, ranges, title_prefix="Before EM", plot_empirical=False)
+        self._plot_row(axes[0], self.initial_params, ranges, title_prefix="Before EM", plot_empirical=False)
         
         # Plot Row 1: After EM (Fitted theoretical setup and assigned empirical data)
-        final_means = np.array(self.phlag.params.emissions.means)
-        final_covariances = np.array(self.phlag.params.emissions.covariances)
-        self._plot_row(axes[1], final_means, final_covariances, ranges, title_prefix="After EM", plot_empirical=True)
+        self._plot_row(axes[1], self.phlag.params, ranges, title_prefix="After EM", plot_empirical=True)
         
         plt.tight_layout()
         self.save_plot()
 
-    def _plot_row(self, row_axes, means, covariances, ranges, title_prefix, plot_empirical=False):
+    def _plot_row(self, row_axes, params, ranges, title_prefix, plot_empirical=False):
         """Plots a single row (either Before EM or After EM) across all topologies."""
         if plot_empirical:
             most_likely_states = self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y)
@@ -475,16 +514,22 @@ class PhlagPlotter:
                         element="step", label=f"{self.colors[1]['label']} data"
                     )
             
-            # 2. Plot Gaussian PDF curves and Vertical Guideline Markers (Mean and +/- 1 Std)
+            # 2. Plot PDF curves and Vertical Guideline Markers (Mean and +/- 1 Std)
             for state in [0, 1]:
-                mu = means[state, d]
-                sigma = np.sqrt(np.clip(covariances[state, d, d], a_min=1e-6, a_max=None))
-                
-                pdf_vals = stats.norm.pdf(x_vals, mu, sigma)
-                
                 color_config = self.colors[state]
                 
-                # Plot theoretical normal curve
+                if self.phlag.args.emission_type == "beta":
+                    alpha = float(params.emissions.concentration1[state, d])
+                    beta = float(params.emissions.concentration0[state, d])
+                    pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
+                    mu = alpha / (alpha + beta)
+                    sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
+                else:
+                    mu = float(params.emissions.means[state, d])
+                    sigma = np.sqrt(np.clip(float(params.emissions.covariances[state, d, d]), a_min=1e-6, a_max=None))
+                    pdf_vals = stats.norm.pdf(x_vals, mu, sigma)
+                
+                # Plot theoretical curve
                 ax.plot(
                     x_vals, pdf_vals, color=color_config['line'], 
                     linewidth=2.2, label=f"{color_config['label']} PDF"
@@ -496,7 +541,7 @@ class PhlagPlotter:
                     color=color_config['fill']
                 )
                 
-                # Plot Central Tendency Guideline: Mean (E[X])
+                # Plot Central Tendency Guideline: Mean
                 ax.axvline(
                     x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8,
                     label=None
@@ -553,7 +598,8 @@ class PhlagPlotter:
             output_dir.mkdir(parents=True, exist_ok=True)
             
         suffix = "_ilr" if self.phlag.ilr_transform else ""
-        plot_file = output_dir / f"em_{self.input_path.stem}{suffix}.png"
+        dist_type = getattr(self.phlag.args, "emission_type", "gaussian")
+        plot_file = output_dir / f"em_{dist_type}_{self.input_path.stem}{suffix}.png"
         
         plt.savefig(plot_file, dpi=300, bbox_inches="tight")
         plt.close()
@@ -622,6 +668,14 @@ def parse_arguments():
         help="Emission penalty regularizer parameter lambda (default: 1.0)",
     )
     hmm_group.add_argument(
+        "-T",
+        dest="emission_type",
+        type=str.lower,
+        default="gaussian",
+        choices=["gaussian", "beta"],
+        help="Type of HMM emissions (gaussian or beta. Default: gaussian)",
+    )
+    hmm_group.add_argument(
         "--best-paths",
         dest="best_paths",
         type=int,
@@ -648,18 +702,18 @@ def parse_arguments():
 
 
 def main():
+    import copy
     args = parse_arguments()
     phlag = Phlag(args)
     
     # Ingest baseline setup properties before fitting
-    initial_means = np.array(phlag.params.emissions.means)
-    initial_covariances = np.array(phlag.params.emissions.covariances)
+    initial_params = copy.deepcopy(phlag.params)
     
     phlag.run()
     phlag.save_output()
     
     if args.plot and "em" in args.plot:
-        PhlagPlotter(phlag, initial_means, initial_covariances)
+        PhlagPlotter(phlag, initial_params)
 
 
 if __name__ == "__main__":

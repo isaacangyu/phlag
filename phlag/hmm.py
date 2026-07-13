@@ -176,6 +176,120 @@ def divergence_e(e_0: Float[Array, "num_classes"], e_1: Float[Array, "num_classe
     return hellinger2_distance(e_1, e_0)
 
 
+class ParamsBetaHMMEmissions(NamedTuple):
+    concentration1: Union[Float[Array, "num_states emission_dim"], ParameterProperties]
+    concentration0: Union[Float[Array, "num_states emission_dim"], ParameterProperties]
+
+
+class PhlagBetaHMMEmissions(HMMEmissions):
+    def __init__(
+        self,
+        num_states: int,
+        emission_dim: int,
+        parameterization: Tuple[str, ...],
+    ):
+        self.num_states = num_states
+        self.emission_dim = emission_dim
+        self.parameterization = parameterization
+
+    @property
+    def emission_shape(self) -> Tuple[int]:
+        return (self.emission_dim,)
+
+    def distribution(
+        self, params: ParamsBetaHMMEmissions, state: IntScalar, inputs=None
+    ) -> tfd.Distribution:
+        c1 = jnp.clip(params.concentration1[state], a_min=1e-5)
+        c0 = jnp.clip(params.concentration0[state], a_min=1e-5)
+        return tfd.Independent(
+            tfd.Beta(concentration1=c1, concentration0=c0),
+            reinterpreted_batch_ndims=1
+        )
+
+    def log_prior(self, params: ParamsBetaHMMEmissions) -> Scalar:
+        return 0.0
+
+    def initialize(
+        self,
+        key: PRNGKeyT = jr.PRNGKey(0),
+        method: str = "prior",
+        emission_probs: Optional[Float[Array, "num_states emission_dim 2"]] = None,
+    ) -> Tuple[ParamsBetaHMMEmissions, ParamsBetaHMMEmissions]:
+        if emission_probs is not None:
+            means = jnp.clip(emission_probs[..., 0], a_min=1e-5, a_max=1.0 - 1e-5)
+            variances = jnp.clip(emission_probs[..., 1], a_min=1e-5)
+            v = means * (1.0 - means) / variances - 1.0
+            v = jnp.clip(v, a_min=1e-2)
+            c1 = means * v
+            c0 = (1.0 - means) * v
+        else:
+            c1 = 2.0 * jnp.ones((self.num_states, self.emission_dim))
+            c0 = 2.0 * jnp.ones((self.num_states, self.emission_dim))
+
+        params = ParamsBetaHMMEmissions(concentration1=c1, concentration0=c0)
+        props = ParamsBetaHMMEmissions(
+            concentration1=ParameterProperties(constrainer=tfb.Softplus()),
+            concentration0=ParameterProperties(constrainer=tfb.Softplus())
+        )
+        return params, props
+
+    def collect_suff_stats(
+        self, params: ParamsBetaHMMEmissions, posterior: HMMPosterior, emissions: Array, inputs=None
+    ) -> dict:
+        y = jnp.clip(emissions, a_min=1e-7, a_max=1.0 - 1e-7)
+        sum_weights = jnp.sum(posterior.smoothed_probs, axis=0)
+        sum_y = jnp.einsum("tk,td->kd", posterior.smoothed_probs, y)
+        sum_y_sq = jnp.einsum("tk,td->kd", posterior.smoothed_probs, y ** 2)
+        return dict(sum_weights=sum_weights, sum_y=sum_y, sum_y_sq=sum_y_sq)
+
+    def initialize_m_step_state(
+        self, params: ParamsBetaHMMEmissions, props: ParamsBetaHMMEmissions
+    ) -> Any:
+        return None
+
+    def update_m_step_state(
+        self, params: ParamsBetaHMMEmissions, props: ParamsBetaHMMEmissions
+    ) -> Any:
+        return None
+
+    def state_divergence(self, params: ParamsBetaHMMEmissions) -> Float:
+        c1 = jnp.clip(params.concentration1, a_min=1e-5)
+        c0 = jnp.clip(params.concentration0, a_min=1e-5)
+        means = c1 / (c1 + c0)
+        total_divergence = 0.0
+        for i in range(self.num_states):
+            for j in range(i + 1, self.num_states):
+                total_divergence += jnp.sqrt(jnp.sum((means[i] - means[j]) ** 2))
+        return total_divergence
+
+    def m_step(
+        self,
+        params: ParamsBetaHMMEmissions,
+        props: ParamsBetaHMMEmissions,
+        batch_stats: dict,
+        m_step_state: Any,
+    ) -> Tuple[ParamsBetaHMMEmissions, Any]:
+        stats = pytree_sum(batch_stats, axis=0)
+        sum_weights = jnp.clip(stats["sum_weights"][:, None], a_min=1e-6)
+        sum_y = stats["sum_y"]
+        sum_y_sq = stats["sum_y_sq"]
+
+        means = jnp.clip(sum_y / sum_weights, a_min=1e-4, a_max=1.0 - 1e-4)
+        variances = jnp.clip((sum_y_sq / sum_weights) - means ** 2, a_min=1e-6)
+
+        max_var = 0.99 * means * (1.0 - means)
+        variances = jnp.clip(variances, a_max=max_var)
+
+        v = means * (1.0 - means) / variances - 1.0
+        v = jnp.clip(v, a_min=1e-2, a_max=1000.0)
+
+        c1 = jnp.clip(means * v, a_min=1e-2, a_max=1000.0)
+        c0 = jnp.clip((1.0 - means) * v, a_min=1e-2, a_max=1000.0)
+
+        params = params._replace(concentration1=c1, concentration0=c0)
+        return params, m_step_state
+
+
 class PhlagHMMTransitions(HMMTransitions):
     def __init__(
         self,
@@ -391,7 +505,7 @@ class PhlagHMMEmissions(HMMEmissions):
 class ParamsPhlagHMM(NamedTuple):
     initial: ParamsStandardHMMInitialState
     transitions: ParamsStandardHMMTransitions
-    emissions: ParamsGaussianHMMEmissions
+    emissions: Any
 
 
 class PhlagHMM(HMM):
@@ -405,6 +519,7 @@ class PhlagHMM(HMM):
         initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]] = 1.1,
         transition_concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
         occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
+        emission_type: str = "gaussian",
         **kwargs,
     ):
         self.num_states = num_states
@@ -430,13 +545,20 @@ class PhlagHMM(HMM):
         self.transition_component = PhlagHMMTransitions(
             num_states=self.num_states, concentration=self.transition_concentration
         )
-        self.emission_component = PhlagHMMEmissions(
-            self.num_states,
-            self.emission_dim,
-            penalty_lambda=self.emission_lambda,
-            concentration=self.emission_concentration,
-            parameterization=self.emission_parameterization,
-        )
+        if emission_type == "beta":
+            self.emission_component = PhlagBetaHMMEmissions(
+                self.num_states,
+                self.emission_dim,
+                parameterization=self.emission_parameterization,
+            )
+        else:
+            self.emission_component = PhlagHMMEmissions(
+                self.num_states,
+                self.emission_dim,
+                penalty_lambda=self.emission_lambda,
+                concentration=self.emission_concentration,
+                parameterization=self.emission_parameterization,
+            )
         super().__init__(
             num_states=self.num_states,
             initial_component=self.initial_component,
