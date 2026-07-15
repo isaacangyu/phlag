@@ -46,6 +46,8 @@ class Phlag:
         
         self.configure_emissions()
         self.compute_emissions()
+        if getattr(self.args, "emission_type", "gaussian") == "gmm":
+            self.determine_optimal_mixtures()
         self.initialize_hmm()
         self.initialize_output()
 
@@ -64,6 +66,9 @@ class Phlag:
                 fname_lower = os.path.basename(fname).lower()
                 if "beta" in fname_lower:
                     self.args.emission_type = "beta"
+                    break
+                elif "gmm" in fname_lower:
+                    self.args.emission_type = "gmm"
                     break
                 elif "gaussian" in fname_lower:
                     self.args.emission_type = "gaussian"
@@ -131,6 +136,91 @@ class Phlag:
             self.Y = ilr(multi_replace(raw_clipped, delta=1e-7))
         else:
             self.Y = raw_caster_matrix
+
+    def determine_optimal_mixtures(self):
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+        
+        # Get output directory for diagnostic plots
+        output_dir = pathlib.Path("test")
+        if self.args.output_file:
+            output_dir = pathlib.Path(self.args.output_file).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        sorted_positions = sorted(self.pos_to_caster.keys())
+        positions_kb = np.array(sorted_positions) / 1000.0
+        
+        num_mixtures_per_dim = []
+        
+        print("\n=== K-means Clustering & Silhouette Scores ===")
+        
+        topology_names = ["ABBA", "BABA", "AABB"] if (self.Y.shape[-1] == 3 and not self.ilr_transform) else [f"Coord {i+1}" for i in range(self.Y.shape[-1])]
+        
+        for d in range(self.Y.shape[-1]):
+            y_d = np.array(self.Y[:, [d]])
+            
+            k_values = list(range(2, 11))
+            scores = {}
+            k_opt = 2
+            max_score = -2.0
+            
+            for k in k_values:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+                labels = kmeans.fit_predict(y_d)
+                score = silhouette_score(y_d, labels)
+                scores[k] = score
+                if score > max_score:
+                    max_score = score
+                    k_opt = k
+                    
+            s_2 = scores[2]
+            
+            # Print table
+            print(f"\nTopology / Dimension: {topology_names[d]}")
+            print(f"{'k':<5} | {'Silhouette Score':<20}")
+            print("-" * 30)
+            for k in k_values:
+                marker = " *" if k == k_opt else ""
+                print(f"{k:<5} | {scores[k]:<20.6f}{marker}")
+            print(f"Optimal k* = {k_opt} (Score: {max_score:.6f})")
+            print(f"k=2 Score = {s_2:.6f}")
+            
+            threshold = self.args.silhouette_threshold
+            if s_2 < threshold:
+                m_d = k_opt
+                decision = f"s_2 ({s_2:.4f}) < threshold ({threshold:.4f}) -> Use k* = {k_opt}"
+            else:
+                m_d = max(1, int(round(k_opt / 2.0)))
+                decision = f"s_2 ({s_2:.4f}) >= threshold ({threshold:.4f}) -> Use k*/2 = {m_d}"
+            print(f"Decision: {decision}")
+            num_mixtures_per_dim.append(m_d)
+            
+            for is_opt, k_plot in [(False, 2), (True, k_opt)]:
+                kmeans_plot = KMeans(n_clusters=k_plot, random_state=42, n_init="auto")
+                labels_plot = kmeans_plot.fit_predict(y_d)
+                
+                plt.figure(figsize=(10, 5))
+                sns.set_theme(style="whitegrid")
+                sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
+                plt.title(f"{topology_names[d]} | {k_plot}-means Clustering", fontsize=12, fontweight='bold')
+                plt.xlabel("Position (kb)", fontsize=10)
+                plt.ylabel("Normalized score", fontsize=10)
+                plt.legend(title="Cluster")
+                plt.tight_layout()
+                
+                plot_name = f"kmeans_optimal_topology_{d}.png" if is_opt else f"kmeans_2_topology_{d}.png"
+                plot_path = output_dir / plot_name
+                plt.savefig(plot_path, dpi=150)
+                plt.close()
+                print(f"Saved diagnostic clustering plot to: {plot_path}")
+                
+        self.num_mixtures = max(num_mixtures_per_dim)
+        self.mixture_masks = np.zeros((self.Y.shape[-1], self.num_mixtures), dtype=np.float32)
+        for d, m_d in enumerate(num_mixtures_per_dim):
+            self.mixture_masks[d, :m_d] = 1.0
+        self.mixture_masks = jnp.array(self.mixture_masks)
+        
+        print(f"\nFinal configuration: num_mixtures = {self.num_mixtures}, mixture_masks = \n{self.mixture_masks}\n")
 
     def initialize_output(self):
         input_path = pathlib.Path(self.args.caster_scores)
@@ -353,7 +443,10 @@ class Phlag:
             transition_concentration=self.psi,
             occupancy_bias=self.occupancy_bias,
             emission_type=self.args.emission_type,
+            num_mixtures=getattr(self, "num_mixtures", 2),
         )
+        if self.args.emission_type == "gmm":
+            self.hmm.emission_component.mixture_masks = self.mixture_masks
         
         # Compute empirical moments from CASTER data over genomic positions
         data_mean = jnp.mean(self.Y, axis=0)
@@ -382,6 +475,10 @@ class Phlag:
         if self.args.emission_type == "beta":
             self.props.emissions.concentration1.trainable = True
             self.props.emissions.concentration0.trainable = True
+        elif self.args.emission_type == "gmm":
+            self.props.emissions.mixture_weights.trainable = True
+            self.props.emissions.means.trainable = True
+            self.props.emissions.stds.trainable = True
         else:
             self.props.emissions.means.trainable = True
             self.props.emissions.covariances.trainable = True
@@ -524,6 +621,16 @@ class PhlagPlotter:
                     pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
                     mu = alpha / (alpha + beta)
                     sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
+                elif self.phlag.args.emission_type == "gmm":
+                    w = np.array(params.emissions.mixture_weights[state, d])
+                    m_means = np.array(params.emissions.means[state, d])
+                    m_stds = np.array(params.emissions.stds[state, d])
+                    pdf_vals = np.zeros_like(x_vals)
+                    for m in range(len(w)):
+                        pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
+                    mu = float(np.sum(w * m_means))
+                    var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
+                    sigma = np.sqrt(max(1e-6, var))
                 else:
                     mu = float(params.emissions.means[state, d])
                     sigma = np.sqrt(np.clip(float(params.emissions.covariances[state, d, d]), a_min=1e-6, a_max=None))
@@ -672,8 +779,15 @@ def parse_arguments():
         dest="emission_type",
         type=str.lower,
         default="gaussian",
-        choices=["gaussian", "beta"],
-        help="Type of HMM emissions (gaussian or beta. Default: gaussian)",
+        choices=["gaussian", "beta", "gmm"],
+        help="Type of HMM emissions (gaussian, beta, or gmm. Default: gaussian)",
+    )
+    hmm_group.add_argument(
+        "--silhouette-threshold",
+        dest="silhouette_threshold",
+        type=float,
+        default=0.5,
+        help="Silhouette score threshold to determine optimal GMM mixture counts (default: 0.5)",
     )
     hmm_group.add_argument(
         "--best-paths",

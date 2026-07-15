@@ -290,6 +290,166 @@ class PhlagBetaHMMEmissions(HMMEmissions):
         return params, m_step_state
 
 
+class ParamsGMMHMMEmissions(NamedTuple):
+    mixture_weights: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
+    means: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
+    stds: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
+
+
+class PhlagGMMHMMEmissions(HMMEmissions):
+    def __init__(
+        self,
+        num_states: int,
+        emission_dim: int,
+        num_mixtures: int,
+        parameterization: Tuple[str, ...],
+    ):
+        self.num_states = num_states
+        self.emission_dim = emission_dim
+        self.num_mixtures = num_mixtures
+        self.parameterization = parameterization
+
+    @property
+    def emission_shape(self) -> Tuple[int]:
+        return (self.emission_dim,)
+
+    def distribution(
+        self, params: ParamsGMMHMMEmissions, state: IntScalar, inputs=None
+    ) -> tfd.Distribution:
+        weights = jnp.clip(params.mixture_weights[state], a_min=1e-6)
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+        means = params.means[state]
+        stds = jnp.clip(params.stds[state], a_min=1e-5)
+        
+        mix = tfd.Categorical(probs=weights)
+        comp = tfd.Normal(loc=means, scale=stds)
+        
+        return tfd.Independent(
+            tfd.MixtureSameFamily(mixture_distribution=mix, components_distribution=comp),
+            reinterpreted_batch_ndims=1
+        )
+
+    def log_prior(self, params: ParamsGMMHMMEmissions) -> Scalar:
+        return 0.0
+
+    def initialize(
+        self,
+        key: PRNGKeyT = jr.PRNGKey(0),
+        method: str = "prior",
+        emission_probs: Optional[Float[Array, "num_states emission_dim 2"]] = None,
+    ) -> Tuple[ParamsGMMHMMEmissions, ParamsGMMHMMEmissions]:
+        S = self.num_states
+        D = self.emission_dim
+        M = self.num_mixtures
+        
+        if emission_probs is not None:
+            state_means = emission_probs[..., 0]
+            state_vars = emission_probs[..., 1]
+            state_stds = jnp.sqrt(jnp.clip(state_vars, a_min=1e-5))
+        else:
+            state_means = jnp.zeros((S, D))
+            state_stds = jnp.ones((S, D))
+            
+        if M == 1:
+            offsets = jnp.array([0.0])
+        else:
+            offsets = jnp.linspace(-1.0, 1.0, M)
+            
+        means = state_means[:, :, None] + offsets[None, None, :] * state_stds[:, :, None] * 0.5
+        stds = jnp.stack([state_stds for _ in range(M)], axis=-1)
+        mixture_weights = jnp.ones((S, D, M)) / M
+        
+        params = ParamsGMMHMMEmissions(mixture_weights=mixture_weights, means=means, stds=stds)
+        props = ParamsGMMHMMEmissions(
+            mixture_weights=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
+            means=ParameterProperties(),
+            stds=ParameterProperties(constrainer=tfb.Softplus())
+        )
+        return params, props
+
+    def collect_suff_stats(
+        self, params: ParamsGMMHMMEmissions, posterior: HMMPosterior, emissions: Array, inputs=None
+    ) -> dict:
+        T, D = emissions.shape
+        M = self.num_mixtures
+        
+        sum_weights_list = []
+        sum_y_list = []
+        sum_y_sq_list = []
+        
+        for s in range(self.num_states):
+            means = params.means[s]
+            stds = jnp.clip(params.stds[s], a_min=1e-5)
+            log_weights = jnp.log(jnp.clip(params.mixture_weights[s], a_min=1e-12))
+            
+            log_lik_comp = tfd.Normal(loc=means, scale=stds).log_prob(emissions[:, :, None])
+            joint_log_lik = log_lik_comp + log_weights[None, :, :]
+            
+            comp_resp = jnp.exp(joint_log_lik - jax.scipy.special.logsumexp(joint_log_lik, axis=-1, keepdims=True))
+            w_state = posterior.smoothed_probs[:, s]
+            joint_weights = comp_resp * w_state[:, None, None]
+            
+            sum_weights_list.append(jnp.sum(joint_weights, axis=0))
+            sum_y_list.append(jnp.sum(joint_weights * emissions[:, :, None], axis=0))
+            sum_y_sq_list.append(jnp.sum(joint_weights * (emissions[:, :, None] ** 2), axis=0))
+            
+        return dict(
+            sum_weights=jnp.stack(sum_weights_list, axis=0),
+            sum_y=jnp.stack(sum_y_list, axis=0),
+            sum_y_sq=jnp.stack(sum_y_sq_list, axis=0)
+        )
+
+    def initialize_m_step_state(
+        self, params: ParamsGMMHMMEmissions, props: ParamsGMMHMMEmissions
+    ) -> Any:
+        return None
+
+    def update_m_step_state(
+        self, params: ParamsGMMHMMEmissions, props: ParamsGMMHMMEmissions
+    ) -> Any:
+        return None
+
+    def state_divergence(self, params: ParamsGMMHMMEmissions) -> Float:
+        overall_means = jnp.sum(params.mixture_weights * params.means, axis=-1)
+        total_divergence = 0.0
+        for i in range(self.num_states):
+            for j in range(i + 1, self.num_states):
+                total_divergence += jnp.sqrt(jnp.sum((overall_means[i] - overall_means[j]) ** 2))
+        return total_divergence
+
+    def m_step(
+        self,
+        params: ParamsGMMHMMEmissions,
+        props: ParamsGMMHMMEmissions,
+        batch_stats: dict,
+        m_step_state: Any,
+    ) -> Tuple[ParamsGMMHMMEmissions, Any]:
+        stats = pytree_sum(batch_stats, axis=0)
+        sum_weights = stats["sum_weights"]
+        sum_y = stats["sum_y"]
+        sum_y_sq = stats["sum_y_sq"]
+        
+        total_weights = jnp.clip(sum_weights.sum(axis=-1, keepdims=True), a_min=1e-12)
+        mixture_weights = sum_weights / total_weights
+        
+        denom = jnp.clip(sum_weights, a_min=1e-8)
+        means = sum_y / denom
+        
+        variances = jnp.clip((sum_y_sq / denom) - means ** 2, a_min=1e-6)
+        stds = jnp.sqrt(variances)
+        
+        if hasattr(self, "mixture_masks"):
+            mixture_weights = mixture_weights * self.mixture_masks[None, :, :]
+            mixture_weights = mixture_weights / jnp.clip(mixture_weights.sum(axis=-1, keepdims=True), a_min=1e-12)
+            
+        params = params._replace(
+            mixture_weights=mixture_weights,
+            means=means,
+            stds=stds
+        )
+        return params, m_step_state
+
+
 class PhlagHMMTransitions(HMMTransitions):
     def __init__(
         self,
@@ -549,6 +709,14 @@ class PhlagHMM(HMM):
             self.emission_component = PhlagBetaHMMEmissions(
                 self.num_states,
                 self.emission_dim,
+                parameterization=self.emission_parameterization,
+            )
+        elif emission_type == "gmm":
+            num_mixtures = kwargs.get("num_mixtures", 2)
+            self.emission_component = PhlagGMMHMMEmissions(
+                self.num_states,
+                self.emission_dim,
+                num_mixtures=num_mixtures,
                 parameterization=self.emission_parameterization,
             )
         else:
