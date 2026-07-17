@@ -138,86 +138,34 @@ class Phlag:
             self.Y = raw_caster_matrix
 
     def determine_optimal_mixtures(self):
-        from sklearn.cluster import KMeans
-        from sklearn.metrics import silhouette_score
+        import sys
+        repo_root = pathlib.Path(__file__).parent.parent
+        caster_results_dir = repo_root / "caster" / "results"
+        if str(caster_results_dir) not in sys.path:
+            sys.path.append(str(caster_results_dir))
+            
+        import caster_plot
         
-        # Get output directory for diagnostic plots
         output_dir = pathlib.Path("test")
         if self.args.output_file:
             output_dir = pathlib.Path(self.args.output_file).parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        sorted_positions = sorted(self.pos_to_caster.keys())
-        positions_kb = np.array(sorted_positions) / 1000.0
-        
-        num_mixtures_per_dim = []
-        
-        print("\n=== K-means Clustering & Silhouette Scores ===")
-        
-        topology_names = ["ABBA", "BABA", "AABB"] if (self.Y.shape[-1] == 3 and not self.ilr_transform) else [f"Coord {i+1}" for i in range(self.Y.shape[-1])]
-        
-        for d in range(self.Y.shape[-1]):
-            y_d = np.array(self.Y[:, [d]])
             
-            k_values = list(range(2, 11))
-            scores = {}
-            k_opt = 2
-            max_score = -2.0
-            
-            for k in k_values:
-                kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
-                labels = kmeans.fit_predict(y_d)
-                score = silhouette_score(y_d, labels)
-                scores[k] = score
-                if score > max_score:
-                    max_score = score
-                    k_opt = k
-                    
-            s_2 = scores[2]
-            
-            # Print table
-            print(f"\nTopology / Dimension: {topology_names[d]}")
-            print(f"{'k':<5} | {'Silhouette Score':<20}")
-            print("-" * 30)
-            for k in k_values:
-                marker = " *" if k == k_opt else ""
-                print(f"{k:<5} | {scores[k]:<20.6f}{marker}")
-            print(f"Optimal k* = {k_opt} (Score: {max_score:.6f})")
-            print(f"k=2 Score = {s_2:.6f}")
-            
-            threshold = self.args.silhouette_threshold
-            if s_2 < threshold:
-                m_d = k_opt
-                decision = f"s_2 ({s_2:.4f}) < threshold ({threshold:.4f}) -> Use k* = {k_opt}"
-            else:
-                m_d = max(1, int(round(k_opt / 2.0)))
-                decision = f"s_2 ({s_2:.4f}) >= threshold ({threshold:.4f}) -> Use k*/2 = {m_d}"
-            print(f"Decision: {decision}")
-            num_mixtures_per_dim.append(m_d)
-            
-            for is_opt, k_plot in [(False, 2), (True, k_opt)]:
-                kmeans_plot = KMeans(n_clusters=k_plot, random_state=42, n_init="auto")
-                labels_plot = kmeans_plot.fit_predict(y_d)
+        num_mixtures_matrix = caster_plot.determine_optimal_mixtures(
+            self.args.caster_scores,
+            self.Y,
+            self.pos_to_caster,
+            self.args.silhouette_threshold,
+            output_dir,
+            ilr_transform=self.ilr_transform
+        )
+        
+        self.num_mixtures = int(np.max(num_mixtures_matrix))
+        self.mixture_masks = np.zeros((NUM_STATES, self.Y.shape[-1], self.num_mixtures), dtype=np.float32)
+        for s in range(NUM_STATES):
+            for d in range(self.Y.shape[-1]):
+                m_count = num_mixtures_matrix[s, d]
+                self.mixture_masks[s, d, :m_count] = 1.0
                 
-                plt.figure(figsize=(10, 5))
-                sns.set_theme(style="whitegrid")
-                sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
-                plt.title(f"{topology_names[d]} | {k_plot}-means Clustering", fontsize=12, fontweight='bold')
-                plt.xlabel("Position (kb)", fontsize=10)
-                plt.ylabel("Normalized score", fontsize=10)
-                plt.legend(title="Cluster")
-                plt.tight_layout()
-                
-                plot_name = f"kmeans_optimal_topology_{d}.png" if is_opt else f"kmeans_2_topology_{d}.png"
-                plot_path = output_dir / plot_name
-                plt.savefig(plot_path, dpi=150)
-                plt.close()
-                print(f"Saved diagnostic clustering plot to: {plot_path}")
-                
-        self.num_mixtures = max(num_mixtures_per_dim)
-        self.mixture_masks = np.zeros((self.Y.shape[-1], self.num_mixtures), dtype=np.float32)
-        for d, m_d in enumerate(num_mixtures_per_dim):
-            self.mixture_masks[d, :m_d] = 1.0
         self.mixture_masks = jnp.array(self.mixture_masks)
         
         print(f"\nFinal configuration: num_mixtures = {self.num_mixtures}, mixture_masks = \n{self.mixture_masks}\n")

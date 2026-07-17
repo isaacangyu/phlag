@@ -1,4 +1,4 @@
-# C:\Users\isaac\AppData\Roaming\mamba\envs\phlag\Scripts\phlag caster/data/ape_0_300k_w50k_s1k.tsv -o test/report_gmm.tsv -T gmm -s 1k --plot em states
+# C:\Users\isaac\AppData\Roaming\mamba\envs\phlag\Scripts\phlag caster/data/ape_0_300k_w50k_s1k.tsv -o test/report_gmm.tsv -T gmm -s 1k --silhouette-threshold 0.2 --plot em states
 # State divergence: 12.355934143066406
 # Outer EM iterations: 5
 # Inner EM iterations: 50

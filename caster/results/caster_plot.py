@@ -1,11 +1,14 @@
 import os
 import sys
 import re
+import pathlib
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import norm
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 class CasterPlotter:
     def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None, plot_dstar=False, plot_scores=True, plot_dist=True):
@@ -157,7 +160,7 @@ class CasterPlotter:
             color = self.color_mapping[col]
             mean_val = self.df[col].mean()
             
-            # Stagger text heights by topology index to prevent overlapping labels
+            # Stagger text heights by topology index to prevent overlapping guidelines labels
             y_pos_mean = 0.90 - i * 0.15
             y_pos_std = 0.85 - i * 0.15
             
@@ -244,9 +247,10 @@ class CasterPlotter:
                     topo_names.append(col.replace('avg*', '').replace('avg_', ''))
             suffix = "_".join(topo_names)
 
-        # Saved explicitly to caster/results
+        # Saved explicitly to caster/results with _n suffix if normalized
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_top = os.path.join(output_dir, f'{self.distribution}_{suffix}_{self.gene_name}.png')
+        suffix_norm = "_n" if self.is_normalized_file else ""
+        save_path_top = os.path.join(output_dir, f'{self.distribution}_{suffix}_{self.gene_name}{suffix_norm}.png')
         plt.savefig(save_path_top, dpi=300)
         print(f"Saved empirical topology distribution chart to: {save_path_top}")
         plt.show()
@@ -305,9 +309,10 @@ class CasterPlotter:
             
         plt.tight_layout()
         
-        # Saved explicitly to caster/results
+        # Saved explicitly to caster/results with _n suffix if normalized
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_dstar = os.path.join(output_dir, f'distributions_dstar_{self.gene_name}.png')
+        suffix_norm = "_n" if self.is_normalized_file else ""
+        save_path_dstar = os.path.join(output_dir, f'distributions_dstar_{self.gene_name}{suffix_norm}.png')
         plt.savefig(save_path_dstar, dpi=300)
         print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
         plt.close()
@@ -344,13 +349,245 @@ class CasterPlotter:
         plt.legend(loc='upper right', framealpha=0.9)
         plt.tight_layout()
         
-        # Save output to caster/results
+        # Save output to caster/results with _n suffix if normalized
         output_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path_scatter = os.path.join(output_dir, f'scores_{self.gene_name}.png')
+        suffix_norm = "_n" if self.is_normalized_file else ""
+        save_path_scatter = os.path.join(output_dir, f'scores_{self.gene_name}{suffix_norm}.png')
         plt.savefig(save_path_scatter, dpi=300)
         print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
         plt.show()
 
+def read_caster_scores(path):
+    pos_to_caster = {}
+    with open(path, "r") as f:
+        header = f.readline()
+        if not header:
+            return pos_to_caster
+        header_parts = header.strip().split("\t") if "\t" in header else header.strip().split()
+        if header_parts and header_parts[0].lower() == "file":
+            pos_idx = 1
+            score_indices = [2, 3, 4]
+        else:
+            pos_idx = 0
+            score_indices = [1, 2, 3]
+
+        for line in f:
+            if not line.strip():
+                continue
+            values = line.strip().split("\t") if "\t" in line else line.strip().split()
+            try:
+                pos_key = int(values[pos_idx])
+                scores = np.array([
+                    float(values[score_indices[0]]), 
+                    float(values[score_indices[1]]), 
+                    float(values[score_indices[2]])
+                ], dtype=np.float32)
+                pos_to_caster[pos_key] = scores
+            except (ValueError, IndexError):
+                continue
+    return pos_to_caster
+
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, ilr_transform=False):
+    NUM_STATES = 2
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    sorted_positions = sorted(pos_to_caster.keys())
+    positions_kb = np.array(sorted_positions) / 1000.0
+    
+    num_mixtures_matrix = np.zeros((NUM_STATES, Y.shape[-1]), dtype=int)
+    
+    print("\n=== K-means Clustering & Silhouette Scores ===")
+    
+    topology_names = ["ABBA", "BABA", "AABB"] if (Y.shape[-1] == 3 and not ilr_transform) else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
+    
+    for d in range(Y.shape[-1]):
+        y_d = np.array(Y[:, [d]])
+        topo_name = topology_names[d]
+        
+        k_values = list(range(2, 11))
+        scores = {}
+        k_opt = 2
+        max_score = -2.0
+        
+        for k in k_values:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = kmeans.fit_predict(y_d)
+            score = silhouette_score(y_d, labels)
+            scores[k] = score
+            if score > max_score:
+                max_score = score
+                k_opt = k
+                
+        s_2 = scores[2]
+        
+        # Print global table
+        print(f"\nTopology / Dimension: {topo_name}")
+        print(f"{'k':<5} | {'Global Silhouette Score':<25}")
+        print("-" * 35)
+        for k in k_values:
+            marker = " *" if k == k_opt else ""
+            print(f"{k:<5} | {scores[k]:<25.6f}{marker}")
+        print(f"Global Optimal k* = {k_opt} (Score: {max_score:.6f})")
+        print(f"Global k=2 Score = {s_2:.6f}")
+        
+        if s_2 > silhouette_threshold:
+            print(f"s_2 ({s_2:.4f}) > threshold ({silhouette_threshold:.4f}) -> Partitioning into Null and Alternative clusters:")
+            
+            # Fit 2-means to partition the data
+            kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
+            labels_2 = kmeans_2.fit_predict(y_d)
+            
+            # Assign cluster labels to Null vs Alternative based on mean topology score
+            mean_c0 = np.mean(y_d[labels_2 == 0])
+            mean_c1 = np.mean(y_d[labels_2 == 1])
+            if mean_c0 < mean_c1:
+                null_lbl, alt_lbl = 0, 1
+            else:
+                null_lbl, alt_lbl = 1, 0
+                
+            y_sub_N = y_d[labels_2 == null_lbl]
+            pos_sub_N = positions_kb[labels_2 == null_lbl]
+            y_sub_A = y_d[labels_2 == alt_lbl]
+            pos_sub_A = positions_kb[labels_2 == alt_lbl]
+            
+            n_N = len(y_sub_N)
+            n_A = len(y_sub_A)
+            
+            # Save global 2-means plot (kmeans_2_{topo_name}.png)
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | Global 2-means Partitioning (0=Null, 1=Alternative)", fontsize=12, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.tight_layout()
+            plot_path_2 = output_dir / f"kmeans_2_{topo_name}.png"
+            plt.savefig(plot_path_2, dpi=150)
+            plt.close()
+            print(f"Saved diagnostic global partitioning plot to: {plot_path_2}")
+            
+            # Search for best split kn + ka = k_opt minimizing total within-cluster sum of squares (inertia)
+            best_kn = 1
+            best_ka = k_opt - 1
+            min_inertia = float('inf')
+            
+            print(f"\nEvaluating partitions (kn + ka = k* = {k_opt}):")
+            print(f"{'Split':<12} | {'Null Inertia':<15} | {'Alt Inertia':<15} | {'Total Inertia':<15}")
+            print("-" * 65)
+            
+            for kn in range(1, k_opt):
+                ka = k_opt - kn
+                if kn > n_N or ka > n_A:
+                    continue
+                    
+                if kn == 1:
+                    w_n = float(np.sum((y_sub_N - np.mean(y_sub_N)) ** 2))
+                else:
+                    km_n = KMeans(n_clusters=kn, random_state=42, n_init="auto")
+                    km_n.fit(y_sub_N)
+                    w_n = float(km_n.inertia_)
+                    
+                if ka == 1:
+                    w_a = float(np.sum((y_sub_A - np.mean(y_sub_A)) ** 2))
+                else:
+                    km_a = KMeans(n_clusters=ka, random_state=42, n_init="auto")
+                    km_a.fit(y_sub_A)
+                    w_a = float(km_a.inertia_)
+                    
+                total_w = w_n + w_a
+                marker = ""
+                if total_w < min_inertia:
+                    min_inertia = total_w
+                    best_kn = kn
+                    best_ka = ka
+                    marker = " *"
+                    
+                print(f"{kn:<2} + {ka:<2} = {k_opt:<2}  | {w_n:<15.6f} | {w_a:<15.6f} | {total_w:<15.6f}{marker}")
+                
+            print(f"Optimal split: Null count = {best_kn}, Alternative count = {best_ka} (Inertia: {min_inertia:.6f})")
+            
+            num_mixtures_matrix[0, d] = best_kn
+            num_mixtures_matrix[1, d] = best_ka
+            
+            # Save Null sub-cluster plot if kn >= 1
+            if best_kn >= 1:
+                if best_kn > 1:
+                    sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+                    sub_labels = sub_kmeans.fit_predict(y_sub_N)
+                else:
+                    sub_labels = np.zeros(len(y_sub_N), dtype=int)
+                
+                plt.figure(figsize=(10, 5))
+                sns.set_theme(style="whitegrid")
+                sns.scatterplot(x=pos_sub_N, y=y_sub_N.ravel(), hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                plt.title(f"{topo_name} | Null Sub-cluster {best_kn}-means Clustering", fontsize=12, fontweight='bold')
+                plt.xlabel("Position (kb)", fontsize=10)
+                plt.ylabel("Normalized score", fontsize=10)
+                plt.tight_layout()
+                plot_path_sub_N = output_dir / f"kmeans_kstar_{topo_name}_null.png"
+                plt.savefig(plot_path_sub_N, dpi=150)
+                plt.close()
+                print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
+                
+            # Save Alternative sub-cluster plot if ka >= 1
+            if best_ka >= 1:
+                if best_ka > 1:
+                    sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+                    sub_labels = sub_kmeans.fit_predict(y_sub_A)
+                else:
+                    sub_labels = np.zeros(len(y_sub_A), dtype=int)
+                
+                plt.figure(figsize=(10, 5))
+                sns.set_theme(style="whitegrid")
+                sns.scatterplot(x=pos_sub_A, y=y_sub_A.ravel(), hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                plt.title(f"{topo_name} | Alternative Sub-cluster {best_ka}-means Clustering", fontsize=12, fontweight='bold')
+                plt.xlabel("Position (kb)", fontsize=10)
+                plt.ylabel("Normalized score", fontsize=10)
+                plt.tight_layout()
+                plot_path_sub_A = output_dir / f"kmeans_kstar_{topo_name}_alternative.png"
+                plt.savefig(plot_path_sub_A, dpi=150)
+                plt.close()
+                print(f"Saved Alternative sub-cluster optimal plot to: {plot_path_sub_A}")
+                
+            # Save combined optimal plot (kmeans_kstar_{topo_name}.png)
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | Optimal GMM Mixture Partitions (Null count={best_kn}, Alt count={best_ka})", fontsize=11, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.tight_layout()
+            plot_path_opt = output_dir / f"kmeans_kstar_{topo_name}.png"
+            plt.savefig(plot_path_opt, dpi=150)
+            plt.close()
+            print(f"Saved combined optimal plot to: {plot_path_opt}")
+            
+        else:
+            m_val = max(1, int(round(k_opt / 2.0)))
+            print(f"s_2 ({s_2:.4f}) <= threshold ({silhouette_threshold:.4f}) -> Use k*/2 = {m_val} mixtures for both states.")
+            num_mixtures_matrix[0, d] = m_val
+            num_mixtures_matrix[1, d] = m_val
+            
+            # Save ONLY 2-means plot, NOT kmeans_kstar plot!
+            kmeans_plot = KMeans(n_clusters=2, random_state=42, n_init="auto")
+            labels_plot = kmeans_plot.fit_predict(y_d)
+            
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | 2-means Clustering", fontsize=12, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.legend(title="Cluster")
+            plt.tight_layout()
+            
+            plot_path = output_dir / f"kmeans_2_{topo_name}.png"
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+            print(f"Saved diagnostic clustering plot to: {plot_path}")
+                
+    return num_mixtures_matrix
 
 if __name__ == "__main__":
     import argparse
@@ -366,17 +603,31 @@ if __name__ == "__main__":
         default=["scores", "dist"],
         help="List of plots to generate (choices: scores, dist. Default: both)",
     )
+    # GMM clustering arguments
+    parser.add_argument("--silhouette-threshold", type=float, default=0.5, help="Silhouette threshold (default: 0.5).")
+    parser.add_argument("-o", "--output-dir", type=str, default="test", help="Output directory for GMM plots (default: test).")
     
     args = parser.parse_args()
     
-    plot_scores = args.plot and "scores" in args.plot
-    plot_dist = args.plot and "dist" in args.plot
-    
-    CasterPlotter(
-        scores_file=args.scores_file,
-        distribution=args.distribution,
-        topologies=args.topologies,
-        plot_dstar=args.plot_dstar,
-        plot_scores=plot_scores,
-        plot_dist=plot_dist,
-    )
+    if args.distribution == "gmm":
+        pos_to_caster = read_caster_scores(args.scores_file)
+        if not pos_to_caster:
+            print(f"Error: could not read any valid scores from {args.scores_file}")
+            sys.exit(1)
+            
+        sorted_positions = sorted(pos_to_caster.keys())
+        raw_caster_matrix = np.stack([pos_to_caster[pos] for pos in sorted_positions], axis=0)
+        
+        determine_optimal_mixtures(args.scores_file, raw_caster_matrix, pos_to_caster, args.silhouette_threshold, args.output_dir)
+    else:
+        plot_scores = args.plot and "scores" in args.plot
+        plot_dist = args.plot and "dist" in args.plot
+        
+        CasterPlotter(
+            scores_file=args.scores_file,
+            distribution=args.distribution,
+            topologies=args.topologies,
+            plot_dstar=args.plot_dstar,
+            plot_scores=plot_scores,
+            plot_dist=plot_dist,
+        )

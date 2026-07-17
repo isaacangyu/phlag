@@ -439,7 +439,7 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         stds = jnp.sqrt(variances)
         
         if hasattr(self, "mixture_masks"):
-            mixture_weights = mixture_weights * self.mixture_masks[None, :, :]
+            mixture_weights = mixture_weights * self.mixture_masks
             mixture_weights = mixture_weights / jnp.clip(mixture_weights.sum(axis=-1, keepdims=True), a_min=1e-12)
             
         params = params._replace(
