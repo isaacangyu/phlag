@@ -85,6 +85,32 @@ class Phlag:
         Preserves the partial-based defaultdict structure for JAX consistency.
         Raises FileNotFoundError if the file path does not exist.
         """
+        path_obj = pathlib.Path(path)
+        if not path_obj.exists():
+            from .utils import get_data_dir
+            data_dir = get_data_dir()
+            
+            # Check if it exists under data_dir/scores
+            fallback = data_dir / "scores" / path_obj.name
+            if fallback.exists():
+                path_obj = fallback
+            else:
+                # Check if it exists directly under data_dir
+                fallback = data_dir / path_obj.name
+                if fallback.exists():
+                    path_obj = fallback
+                else:
+                    # Also try if the original path contains 'caster/data' and we can replace it with data_dir
+                    path_str = str(path).replace('\\', '/')
+                    if 'caster/data/' in path_str:
+                        replaced_path = pathlib.Path(path_str.replace('caster/data', str(data_dir)))
+                        if replaced_path.exists():
+                            path_obj = replaced_path
+
+        path = str(path_obj)
+        if hasattr(self, "args") and self.args:
+            self.args.caster_scores = path_obj
+
         if not os.path.exists(path):
             raise FileNotFoundError(f"CASTER scores file not found at: {path}")
 

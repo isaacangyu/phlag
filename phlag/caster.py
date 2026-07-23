@@ -127,16 +127,22 @@ def main():
         args.step_size = args.window_size
         
     repo_root = pathlib.Path(__file__).parent.parent.resolve()
+    from .utils import get_data_dir
+    data_dir = get_data_dir()
     
     # Resolve FASTA file fallback if not found
     if not args.fasta_file.exists():
-        fallback_fasta = repo_root / "caster" / "data" / args.fasta_file.name
+        fallback_fasta = data_dir / "msa" / args.fasta_file.name
         if fallback_fasta.exists():
             args.fasta_file = fallback_fasta
         else:
-            fallback_fasta2 = repo_root / args.fasta_file
+            fallback_fasta2 = repo_root / "caster" / "data" / "msa" / args.fasta_file.name
             if fallback_fasta2.exists():
                 args.fasta_file = fallback_fasta2
+            else:
+                fallback_fasta3 = repo_root / args.fasta_file
+                if fallback_fasta3.exists():
+                    args.fasta_file = fallback_fasta3
                 
     if args.mapping is None:
         # Auto-detect mapping file in same directory as fasta_file
@@ -150,13 +156,17 @@ def main():
     else:
         # Resolve Mapping file fallback if not found
         if not args.mapping.exists():
-            fallback_map = repo_root / "caster" / "data" / args.mapping.name
+            fallback_map = data_dir / "mapping" / args.mapping.name
             if fallback_map.exists():
                 args.mapping = fallback_map
             else:
-                fallback_map2 = repo_root / args.mapping
+                fallback_map2 = repo_root / "caster" / "data" / "mapping" / args.mapping.name
                 if fallback_map2.exists():
                     args.mapping = fallback_map2
+                else:
+                    fallback_map3 = repo_root / args.mapping
+                    if fallback_map3.exists():
+                        args.mapping = fallback_map3
     
     # 1. Validation
     if not args.fasta_file.exists():
@@ -179,7 +189,9 @@ def main():
         # 2. Locate dstar binary
         # Script is in phlag/caster.py, repo root is one level up
         binary_name = "dstar.exe" if sys.platform == "win32" else "dstar"
-        binary_path = repo_root / "caster" / "data" / "bin" / binary_name
+        binary_path = data_dir / "bin" / binary_name
+        if not binary_path.exists():
+            binary_path = repo_root / "caster" / "data" / "bin" / binary_name
             
         if not binary_path.exists():
             sys.exit(f"Error: Could not locate compiled 'dstar' binary at '{binary_path}'")
@@ -282,7 +294,8 @@ def main():
         step_str = format_val(args.step_size)
         
         final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-        final_output_path = repo_root / "caster" / "data" / final_output_name
+        final_output_path = data_dir / "scores" / final_output_name
+        os.makedirs(final_output_path.parent, exist_ok=True)
         
         with open(final_output_path, "w") as f:
             f.writelines(output_lines)

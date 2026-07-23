@@ -73,3 +73,39 @@ def timeit(func):
         return result
 
     return wrapper
+
+
+def get_data_dir():
+    """
+    Resolves the data directory to use. Looks up the PHLAG_DIR environment variable
+    or reads it from a .env file. Defaults to repo_root / "caster" / "data" if not found.
+    """
+    import os
+    import pathlib
+    phlag_dir = os.environ.get("PHLAG_DIR")
+    if not phlag_dir:
+        # Search for .env file at repo root
+        repo_root = pathlib.Path(__file__).parent.parent.resolve()
+        # Also try current directory just in case
+        for base_dir in [repo_root, pathlib.Path.cwd()]:
+            env_path = base_dir / ".env"
+            if env_path.exists():
+                try:
+                    with open(env_path, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#") and "=" in line:
+                                key, val = line.split("=", 1)
+                                if key.strip() == "PHLAG_DIR":
+                                    phlag_dir = val.strip().strip("'").strip('"')
+                                    break
+                except Exception:
+                    pass
+            if phlag_dir:
+                break
+    if phlag_dir:
+        return pathlib.Path(phlag_dir)
+    else:
+        repo_root = pathlib.Path(__file__).parent.parent.resolve()
+        return repo_root / "caster" / "data"
+
