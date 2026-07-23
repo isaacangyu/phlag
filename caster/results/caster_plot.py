@@ -128,6 +128,10 @@ class CasterPlotter:
         melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
                                  var_name='Topology', value_name='Score')
         
+        if len(melted_df) == 0:
+            print("No data windows found to plot histogram.")
+            return
+
         # Plot empirical histogram (no KDE spline, as requested: kde=False)
         sns.histplot(data=melted_df, x='Score', hue='Topology', element='step', 
                      stat='density', common_norm=False, kde=False, alpha=0.3, bins=50,

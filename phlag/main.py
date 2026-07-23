@@ -165,7 +165,8 @@ class Phlag:
 
     def determine_optimal_mixtures(self):
         import sys
-        repo_root = pathlib.Path(__file__).parent.parent
+        from .utils import get_repo_root
+        repo_root = get_repo_root()
         caster_results_dir = repo_root / "caster" / "results"
         if str(caster_results_dir) not in sys.path:
             sys.path.append(str(caster_results_dir))
@@ -713,8 +714,8 @@ def parse_arguments():
         "--plot",
         nargs="*",
         choices=["em", "states"],
-        default=["em"],
-        help="List of plots to generate (choices: em, states. Default: em)",
+        default=["em", "states"],
+        help="List of plots to generate (choices: em, states. Default: both em and states)",
     )
     parser.add_argument(
         "-l",

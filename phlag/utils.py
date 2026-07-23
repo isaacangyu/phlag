@@ -75,6 +75,32 @@ def timeit(func):
     return wrapper
 
 
+def get_repo_root():
+    """
+    Resolves the repository root directory.
+    Checks:
+    1. PHLAG_REPO_ROOT environment variable
+    2. ~/phlag (pathlib.Path.home() / "phlag") if it exists
+    3. pathlib.Path.cwd() if it contains a 'caster' or 'phlag' directory
+    4. Fallback to pathlib.Path(__file__).parent.parent.resolve()
+    """
+    import os
+    import pathlib
+    env_root = os.environ.get("PHLAG_REPO_ROOT")
+    if env_root:
+        return pathlib.Path(env_root).resolve()
+        
+    home_phlag = pathlib.Path.home() / "phlag"
+    if home_phlag.exists():
+        return home_phlag.resolve()
+        
+    cwd = pathlib.Path.cwd()
+    if (cwd / "caster").exists() or (cwd / "phlag").exists():
+        return cwd.resolve()
+        
+    return pathlib.Path(__file__).parent.parent.resolve()
+
+
 def get_data_dir():
     """
     Resolves the data directory to use. Looks up the PHLAG_DIR environment variable
@@ -84,9 +110,8 @@ def get_data_dir():
     import pathlib
     phlag_dir = os.environ.get("PHLAG_DIR")
     if not phlag_dir:
+        repo_root = get_repo_root()
         # Search for .env file at repo root
-        repo_root = pathlib.Path(__file__).parent.parent.resolve()
-        # Also try current directory just in case
         for base_dir in [repo_root, pathlib.Path.cwd()]:
             env_path = base_dir / ".env"
             if env_path.exists():
@@ -106,6 +131,6 @@ def get_data_dir():
     if phlag_dir:
         return pathlib.Path(phlag_dir)
     else:
-        repo_root = pathlib.Path(__file__).parent.parent.resolve()
+        repo_root = get_repo_root()
         return repo_root / "caster" / "data"
 

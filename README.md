@@ -38,7 +38,7 @@ The `caster` command-line utility calculates CASTER scores, support for each of 
 ### Usage
 
 ```shell
-caster caster/data/ape.fa -l 0 -r 200000 -w 1000 -s 100 -n -m caster/data/ape_mapping.tsv
+caster caster/data/ape.fa -l 0 -r 200000 -w 1000 -s 100 -n -m mapping/ape_mapping.tsv
 ```
 
 ### Arguments

@@ -106,7 +106,7 @@ public:
             const array<vector<FreqType>, 4> &f3, const array<vector<FreqType>, 4> &f4, int start, int end, int windowSize){
         Block res;
         res.windowSize = windowSize;
-        res.pi.resize((end - start + windowSize - 1) / windowSize);
+        res.pi.assign((end - start + windowSize - 1) / windowSize, {0.0, 0.0, 0.0, 0.0});
         array<const array<vector<FreqType>, 4>*, 4> lst = {&f1, &f2, &f3, &f4};
         array<array<vector<FreqType>, 4>*, 4> cntlst = {&res.cnt0, &res.cnt1, &res.cnt2, &res.cnt3};
         for (int i = 0; i < 4; i++){
