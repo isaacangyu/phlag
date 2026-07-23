@@ -18,6 +18,17 @@ cd phlag
 pip install .
 ```
 
+### Environment Configuration
+
+Set up environment variables in your `.env` file:
+
+* **`INPUT_DIR`**: Should be set to the output directory of `phlag-avian-simulations`.
+
+Example `.env`:
+```env
+INPUT_DIR=/path/to/phlag-avian-simulations/output
+```
+
 ---
 
 ## 1. Caster CLI Utility
