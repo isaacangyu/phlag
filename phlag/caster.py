@@ -146,21 +146,35 @@ def main():
                 
     if args.mapping is None:
         # Auto-detect mapping file in repo root mapping directory or fasta_file parent
-        repo_map = repo_root / "mapping" / f"{args.fasta_file.stem}_mapping.tsv"
+        stem = args.fasta_file.stem
+        # 1. Exact match
+        repo_map = repo_root / "mapping" / f"{stem}_mapping.tsv"
+        default_map = args.fasta_file.parent / f"{stem}_mapping.tsv"
+        
+        # 2. Check clade name extraction if stem contains clade substring
+        clade_map = None
+        mapping_dir = repo_root / "mapping"
+        if mapping_dir.exists():
+            for mfile in mapping_dir.glob("*_mapping.tsv"):
+                clade = mfile.stem.replace("_mapping", "").split("_")[-1]
+                if clade and clade in stem:
+                    clade_map = mfile
+                    break
+        
         if repo_map.exists():
             args.mapping = repo_map
+        elif default_map.exists():
+            args.mapping = default_map
+        elif clade_map and clade_map.exists():
+            args.mapping = clade_map
         else:
-            default_map = args.fasta_file.parent / f"{args.fasta_file.stem}_mapping.tsv"
-            if default_map.exists():
-                args.mapping = default_map
+            repo_ape_map = repo_root / "mapping" / "ape_mapping.tsv"
+            if repo_ape_map.exists():
+                args.mapping = repo_ape_map
             else:
-                repo_ape_map = repo_root / "mapping" / "ape_mapping.tsv"
-                if repo_ape_map.exists():
-                    args.mapping = repo_ape_map
-                else:
-                    fallback_map = args.fasta_file.parent / "ape_mapping.tsv"
-                    if fallback_map.exists():
-                        args.mapping = fallback_map
+                fallback_map = args.fasta_file.parent / "ape_mapping.tsv"
+                if fallback_map.exists():
+                    args.mapping = fallback_map
     else:
         # Resolve Mapping file fallback if not found
         if not args.mapping.exists():

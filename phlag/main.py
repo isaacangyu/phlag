@@ -146,6 +146,9 @@ class Phlag:
                 except (ValueError, IndexError):
                     continue
 
+        if len(self.pos_to_caster) == 0:
+            sys.exit(f"Error: No valid window scores parsed from CASTER score file '{path}'. Please check that sequence headers in the FASTA match the species in the mapping file.")
+
     def configure_emissions(self):
         self.ilr_transform = self.args.ilr_transform
 
@@ -289,12 +292,78 @@ class Phlag:
             initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
         )
         
+        # Extract ground truth pattern indices from input filename if present
+        # Format example: ...a1n5a2a3n8n1...
+        # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
+        # 'a1n5a2a3n8n1' -> block lengths: a(1*500k), n(5*500k), a(2*500k), a(3*500k), n(8*500k), n(1*500k)...
+        import re
+        input_stem = pathlib.Path(self.args.caster_scores).stem
+        
+        sorted_positions = sorted(self.pos_to_caster.keys())
+        y_true = np.zeros(len(sorted_positions), dtype=int)
+        has_ground_truth = False
+        
+        pattern_str_match = re.search(r'((?:[an]\d+)+)', input_stem)
+        if pattern_str_match:
+            pattern_str = pattern_str_match.group(1)
+            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            if blocks:
+                has_ground_truth = True
+                block_size_bp = 500000  # Each locus block is 500Kb
+                
+                curr_pos_bp = 0
+                anomaly_intervals = []
+                for b_type, b_count in blocks:
+                    length_bp = int(b_count) * block_size_bp
+                    if b_type == 'a':
+                        anomaly_intervals.append((curr_pos_bp, curr_pos_bp + length_bp))
+                    curr_pos_bp += length_bp
+                    
+                for idx, pos in enumerate(sorted_positions):
+                    for start_bp, end_bp in anomaly_intervals:
+                        if start_bp <= pos < end_bp:
+                            y_true[idx] = 1
+                            break
+
+        # Calculate metrics for primary Viterbi path (Path 1)
+        y_pred = np.array(paths[0])
+        
+        # Ensure state labeling matches ground truth (state 1 = anomalous state with higher emission divergence/mean)
+        # If State 0 happens to be assigned to the anomalous profile, flip labels for evaluation
+        if has_ground_truth:
+            # Check mean score of predicted state 1 vs state 0 on raw data to verify orientation
+            mean_state1_score = np.mean(self.Y[y_pred == 1]) if np.any(y_pred == 1) else 0.0
+            mean_state0_score = np.mean(self.Y[y_pred == 0]) if np.any(y_pred == 0) else 0.0
+            
+            # If the ground truth anomaly overlaps predominantly with one state label:
+            true_anom_mask = (y_true == 1)
+            if np.any(true_anom_mask):
+                state1_overlap = np.sum(y_pred[true_anom_mask] == 1)
+                state0_overlap = np.sum(y_pred[true_anom_mask] == 0)
+                if state0_overlap > state1_overlap:
+                    y_pred = 1 - y_pred
+            
+            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+            
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
+            
+            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f} (TP={tp}, FP={fp}, FN={fn}, TN={tn})"
+            print(f"\n[Evaluation Metrics] {metrics_str}\n")
+
         # Build headers
         headers = []
         headers.append("# State divergence: " + emission_divergence_str)
         headers.append(f"# Outer EM iterations: {self.n_iters}")
         headers.append(f"# Inner EM iterations: {self.increment_steps}")
         headers.append(f"# ILR transform: {self.ilr_transform}")
+        if has_ground_truth:
+            headers.append(f"# Performance Metrics (Path 1 vs Pattern Indices Ground Truth): {metrics_str}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"# Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
             

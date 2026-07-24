@@ -138,8 +138,12 @@ public:
                 fmap >> partname;
                 if (!partname2id.count(partname)) {
                     if (partname != "-"){
-                        name[partname2id.size()] = partname;
-                        partname2id[partname] = partname2id.size();
+                        if (partname2id.size() < 4) {
+                            name[partname2id.size()] = partname;
+                            partname2id[partname] = partname2id.size();
+                        } else {
+                            partname2id[partname] = -1;
+                        }
                     }
                     else partname2id[partname] = -1;
                 }
@@ -149,20 +153,45 @@ public:
         ifstream fin(input);
         ostringstream fout;
         string line;
-        int id, pos;
+        int id = -1, pos = 0;
         array<array<vector<FreqType>, 4>, 4> freq;
         while (getline(fin, line)){
+            if (line.empty()) continue;
             if (line[0] == '>'){
-                if (!name2id.count(line.substr(1))) {
-                    name[partname2id.size()] = line.substr(1);
-                    partname2id[line.substr(1)] = partname2id.size();
-                    name2id[line.substr(1)] = partname2id[line.substr(1)];
+                string seq_header = line.substr(1);
+                // remove trailing whitespace/carriage returns if present
+                while(!seq_header.empty() && (seq_header.back() == '\r' || seq_header.back() == '\n' || seq_header.back() == ' ' || seq_header.back() == '\t')) {
+                    seq_header.pop_back();
                 }
-                id = name2id[line.substr(1)];
+                // extract first word of fasta header
+                string first_word = seq_header;
+                size_t sp = seq_header.find_first_of(" \t");
+                if (sp != string::npos) first_word = seq_header.substr(0, sp);
+
+                if (mapping == "") {
+                    if (!name2id.count(first_word)) {
+                        if (partname2id.size() < 4) {
+                            name[partname2id.size()] = first_word;
+                            partname2id[first_word] = partname2id.size();
+                            name2id[first_word] = partname2id[first_word];
+                        } else {
+                            name2id[first_word] = -1;
+                        }
+                    }
+                    id = name2id[first_word];
+                } else {
+                    if (name2id.count(first_word)) {
+                        id = name2id[first_word];
+                    } else if (name2id.count(seq_header)) {
+                        id = name2id[seq_header];
+                    } else {
+                        id = -1;
+                    }
+                }
                 pos = 0;
             }
-            else if (id != -1){
-                for (int j = 0; j < line.size(); j++){
+            else if (id >= 0 && id < 4){
+                for (size_t j = 0; j < line.size(); j++){
                     for (int k = 0; k < 4; k++){
                         if (pos + j >= freq[id][k].size()) freq[id][k].push_back(0); 
                     }
@@ -178,15 +207,19 @@ public:
         else cerr << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
         
         double total1 = 0, total2 = 0, total3 = 0;
-        for (int pos = 0; pos < freq[0][0].size(); pos += intervalSize){
-            int end = (pos + intervalSize < freq[0][0].size()) ? pos + intervalSize : freq[0][0].size();
+        size_t min_len = freq[0][0].size();
+        for (int p = 1; p < 4; ++p) {
+            if (freq[p][0].size() < min_len) min_len = freq[p][0].size();
+        }
+        for (size_t pos = 0; pos < min_len; pos += intervalSize){
+            size_t end = (pos + intervalSize < min_len) ? pos + intervalSize : min_len;
             Block data = parseFreqs(freq[0], freq[1], freq[2], freq[3], pos, end, windowSize);
             vector<ScoreType> topology1 = dstar(windowSize, data.cnt0, data.cnt3, data.cnt1, data.cnt2, data.pi);
             vector<ScoreType> topology2 = dstar(windowSize, data.cnt1, data.cnt3, data.cnt0, data.cnt2, data.pi);
             vector<ScoreType> topology3 = dstar(windowSize, data.cnt2, data.cnt3, data.cnt0, data.cnt1, data.pi);
             vector<CounterType> quartetCnt = dstarQuartetCnt(windowSize, data.cnt0, data.cnt1, data.cnt2, data.cnt3);
             double sum1 = 0, sum2 = 0, sum3 = 0, qcnt = 0;
-            for (int i = 0; i < topology1.size(); i++){
+            for (size_t i = 0; i < topology1.size(); i++){
                 sum1 += topology1[i];
                 sum2 += topology2[i];
                 sum3 += topology3[i];
@@ -209,29 +242,12 @@ public:
 };
 
 const string HELP = R"V0G0N(D* Statistic Sliding Window Tool
-dstar FASTA_FILE [ MAPPING_FILE WINDOW_SIZE ]
+dstar FASTA_FILE [ MAPPING_FILE STEP_SIZE [ WINDOW_SIZE ] ]
 
 FASTA_FILE: input file, currently only supporting FASTA format
 MAPPING_FILE: a file mapping input sequences into four clusters or - (see format below, default: -)
-WINDOW_SIZE: ideally a multiple of 10000 (default: 10000)
-
-example:
-dstar input.fasta - 1000000
-dstar input.fasta mapping.txt
-
-mapping file format (exactly four clusters):
-seq_name1	P1
-seq_name2	P2
-seq_name3	P3
-seq_name4	P3
-seq_name5	Po
-seq_name6	Po
-
-default mapping file format (-):
-seq_name1	P1
-seq_name2	P2
-seq_name3	P3
-seq_name4	Po
+STEP_SIZE: sliding step size (default: 1000000)
+WINDOW_SIZE: block window size (default: 10000)
 )V0G0N";
 
 int main(int argc, char *argv[])
