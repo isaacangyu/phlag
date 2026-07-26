@@ -863,18 +863,20 @@ class PhlagHMM(HMM):
         log_probs = []
         m_step_state = self.initialize_m_step_state(params, props)
         
-        # Print initial transition matrix
-        tm_init = params.transitions.transition_matrix
-        tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
-        print(f"Initial Transition matrix: {tm_init_str}")
+        if verbose:
+            # Print initial transition matrix
+            tm_init = params.transitions.transition_matrix
+            tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
+            print(f"Initial Transition matrix: {tm_init_str}")
         
         for step in range(num_iters):
             params, m_step_state, marginal_loglik = em_step(params, m_step_state)
             log_probs.append(marginal_loglik)
             
-            # Print transition probabilities at each iteration
-            tm = params.transitions.transition_matrix
-            tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
-            print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")
+            if verbose:
+                # Print transition probabilities at each iteration
+                tm = params.transitions.transition_matrix
+                tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
+                print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")
             
         return params, jnp.array(log_probs)

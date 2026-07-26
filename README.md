@@ -66,13 +66,12 @@ The `phlag` utility fits a Gaussian HMM to the CASTER topology scores to flag an
 ### Usage
 
 ```shell
-phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 1 -s 100
+phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 10 -s 100
 ```
 ### Required Arguments
 
 * **`-c, --caster-scores`**: Path to TSV containing the CASTER scores.
-* **`-L, --n-iters`** (default: `5`): Number of outer EM iterations.
-* **`-l, --increment-steps`** (default: `50`): Number of inner EM iterations per outer iteration.
+* **`-L, --n-iters`** (default: `10`): Number of outer EM iterations.
 * **`-s, --step-size`**: Genomic step size (in rows/positions) to compute a text-based ASCII histogram and save a visual bar chart plot.
 * **`-o, --output-file`** (optional): Custom path to save the output report (automatically defaults to saving in the `test/` directory).
 * **`--ilr-transform`**: Apply isometric log-ratio transformation to CASTER scores.

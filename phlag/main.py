@@ -31,8 +31,9 @@ INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
 class Phlag:
     def __init__(self, args):
         self.args = args
-        # Inject defaults for removed CLI flags
-        self.args.n_iters = 5
+        if not hasattr(self.args, "n_iters"):
+            self.args.n_iters = 10
+        self.args.increment_steps = 50
         if not hasattr(self.args, "step_size"):
             self.args.step_size = None
 
@@ -295,7 +296,7 @@ class Phlag:
         # Extract ground truth pattern indices from input filename if present
         # Format example: ...a1n5a2a3n8n1...
         # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
-        # 'a1n5a2a3n8n1' -> block lengths: a(1*500k), n(5*500k), a(2*500k), a(3*500k), n(8*500k), n(1*500k)...
+        # Each token (e.g., 'n1', 'n8', 'a1', 'n5') represents one 500Kb locus block.
         import re
         input_stem = pathlib.Path(self.args.caster_scores).stem
         
@@ -313,8 +314,8 @@ class Phlag:
                 
                 curr_pos_bp = 0
                 anomaly_intervals = []
-                for b_type, b_count in blocks:
-                    length_bp = int(b_count) * block_size_bp
+                for b_type, b_id in blocks:
+                    length_bp = block_size_bp
                     if b_type == 'a':
                         anomaly_intervals.append((curr_pos_bp, curr_pos_bp + length_bp))
                     curr_pos_bp += length_bp
@@ -401,6 +402,23 @@ class Phlag:
                     # Plot Viterbi log-likelihood on right y-axis
                     ax2.plot(positions_kb, likes, color=color, linestyle=line_style, linewidth=2.0, label=f"Likelihood {idx+1}")
                 
+                # Draw square wave for ground truth null/alt if available
+                pattern_str_match = re.search(r'((?:[an]\d+)+)', input_path.stem)
+                if pattern_str_match:
+                    pattern_str = pattern_str_match.group(1)
+                    blocks = re.findall(r'([an])(\d+)', pattern_str)
+                    if blocks:
+                        block_size_kb = 500.0  # 500Kb
+                        gt_x = []
+                        gt_y = []
+                        curr_pos_kb = 0.0
+                        for b_type, b_id in blocks:
+                            val = 1 if b_type == 'a' else 0
+                            gt_x.extend([curr_pos_kb, curr_pos_kb + block_size_kb])
+                            gt_y.extend([val, val])
+                            curr_pos_kb += block_size_kb
+                        ax1.plot(gt_x, gt_y, color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+
                 ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
                 ax1.set_ylim(-0.05, 1.05)
@@ -532,14 +550,22 @@ class Phlag:
         self.increment_steps = self.args.increment_steps
         
     def run(self):
+        tm_init = self.params.transitions.transition_matrix
+        tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
+        tqdm.write(f"Initial Transition matrix: {tm_init_str}")
+
         for i in tqdm(range(self.n_iters)):
+            num_inner = (i + 1) * self.increment_steps
             self.params, log_probs = self.hmm.fit_em(
                 self.params,
                 self.props,
                 self.Y,
-                num_iters=(i + 1) * self.increment_steps + 1,
+                num_iters=num_inner,
                 verbose=False,
             )
+            tm = self.params.transitions.transition_matrix
+            tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
+            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str}")
         self.compute_output()
 
     def save_output(self):
@@ -787,11 +813,12 @@ def parse_arguments():
         help="List of plots to generate (choices: em, states. Default: both em and states)",
     )
     parser.add_argument(
-        "-l",
-        dest="increment_steps",
+        "-L",
+        "--n-iters",
+        dest="n_iters",
         type=int_or_abbrev,
-        default=50,
-        help="Increment for inner EM iterations (default: 50)",
+        default=10,
+        help="Number of outer EM iterations (default: 10)",
     )
     parser.add_argument(
         "-s",
@@ -812,7 +839,7 @@ def parse_arguments():
         help="Parameterization of the emission probabilities of the default state (default: attraction)",
     )
     hmm_group.add_argument(
-        "-L",
+        "--emission-lambda",
         dest="emission_lambda",
         type=float,
         default=1.0,
