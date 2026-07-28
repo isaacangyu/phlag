@@ -28,18 +28,20 @@ class CasterPlotter:
         self.load_data()
         
         if self.df is not None:
-            # Build color mapping for all topologies present in the dataframe
-            topo_colors = {
-                'ABBA': '#2B4C7E',    # Deep Steel Blue
-                'BABA': '#E05A47',    # Warm Coral
-                'AABB': '#47A063',    # Muted Green
+            # High-contrast, vibrant, and highly distinguishable color palette for the 3 topologies
+            self.topo_colors = {
+                'ABBA': '#1F77B4',    # Bold Royal Blue
+                'BABA': '#D62728',    # Vivid Crimson Red
+                'AABB': '#2CA02C',    # Vibrant Forest Green
             }
             self.color_mapping = {}
             for col in self.df.columns:
                 match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
                 if match:
                     topo = match.group(1).upper()
-                    self.color_mapping[col] = topo_colors.get(topo, '#808080')
+                    self.color_mapping[col] = self.topo_colors.get(topo, '#808080')
+                    # Also map cleaned topology name for melted dataframes
+                    self.color_mapping[topo] = self.topo_colors.get(topo, '#808080')
                 else:
                     self.color_mapping[col] = '#808080'
 
@@ -106,7 +108,7 @@ class CasterPlotter:
         return self.params
 
     def plot_caster_histograms(self):
-        """Generates empirical histograms with central tendency vertical guidelines and optional parametric distribution overlay."""
+        """Generates 3 subplots (1 row x 3 columns) for ABBA, BABA, AABB, fitting Gaussian to null and alt ground truth separately."""
         norm_label = 'Normalized (Min-Max)' if self.is_normalized_file else 'Raw'
 
         # Determine topology columns to plot
@@ -124,121 +126,104 @@ class CasterPlotter:
             print("No matching topology columns found to plot.")
             return
 
-        plt.figure(figsize=(12, 7))
-        melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
-                                 var_name='Topology', value_name='Score')
+        # Check for ground truth locus pattern in filename (e.g., ...n1n8a1n5...)
+        base_name = os.path.basename(self.scores_file)
+        pattern_str_match = re.search(r'((?:[an]\d+)+)', base_name)
         
-        if len(melted_df) == 0:
-            print("No data windows found to plot histogram.")
-            return
-
-        # Plot empirical histogram (no KDE spline, as requested: kde=False)
-        sns.histplot(data=melted_df, x='Score', hue='Topology', element='step', 
-                     stat='density', common_norm=False, kde=False, alpha=0.3, bins=50,
-                     palette=self.color_mapping)
+        has_ground_truth = False
+        y_true = np.zeros(len(self.df), dtype=int)
         
-        # Determine if normal distribution overlay is requested
-        overlay_dist = False
-        dist_class = None
-        dist_name = ""
-        if self.distribution:
-            dist_name = self.distribution.lower()
-            if dist_name in ['gaussian', 'normal']:
-                dist_name = 'norm'
-            try:
-                import scipy.stats as stats_module
-                dist_class = getattr(stats_module, dist_name)
-                overlay_dist = True
-            except Exception as e:
-                print(f"Could not load distribution module for '{self.distribution}': {e}")
+        if pattern_str_match:
+            pattern_str = pattern_str_match.group(1)
+            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            if blocks:
+                has_ground_truth = True
+                max_pos = self.df['pos'].max() if 'pos' in self.df.columns else 0
+                step_size = self.df['pos'].diff().median() if ('pos' in self.df.columns and len(self.df) > 1) else 1000
+                if np.isnan(step_size) or step_size <= 0:
+                    step_size = 1000
+                total_span = max_pos + step_size
+                block_size_bp = total_span / len(blocks) if len(blocks) > 0 else 500000
+                
+                curr_pos_bp = 0
+                anomaly_intervals = []
+                for b_type, b_id in blocks:
+                    length_bp = block_size_bp
+                    if b_type == 'a':
+                        anomaly_intervals.append((curr_pos_bp, curr_pos_bp + length_bp))
+                    curr_pos_bp += length_bp
+                    
+                if 'pos' in self.df.columns:
+                    positions = self.df['pos'].values
+                    for idx, pos in enumerate(positions):
+                        for start_bp, end_bp in anomaly_intervals:
+                            if start_bp <= pos < end_bp:
+                                y_true[idx] = 1
+                                break
 
-        # Fit and plot theoretical distribution and expected value / std lines
+        num_plots = len(avg_cols)
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5), squeeze=False)
+        axes = axes[0]
+
         import matplotlib.transforms as transforms
-        ax = plt.gca()
-        trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
-        
-        xmin, xmax = plt.xlim()
-        x = np.linspace(xmin, xmax, 200)
+        from scipy.stats import norm
 
         for i, col in enumerate(avg_cols):
-            color = self.color_mapping[col]
-            mean_val = self.df[col].mean()
-            
-            # Stagger text heights by topology index to prevent overlapping guidelines labels
-            y_pos_mean = 0.90 - i * 0.15
-            y_pos_std = 0.85 - i * 0.15
-            
-            # Extract clean topology name
+            ax = axes[i]
             match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
-            topo_name = match.group(1).upper() if match else col.replace('avg*', '').replace('avg_', '')
-            
-            if overlay_dist:
-                # Fit the distribution to get parameters (e.g. loc and scale)
-                self.calculate_summary_statistics(self.df[col])
-                dist = dist_class(**self.params)
-                p = dist.pdf(x)
-                
-                # Plot the theoretical PDF curve overlay
-                param_str = ", ".join([f"{k}={v:.3f}" for k, v in self.params.items()])
-                pdf_label = f'Fitted {col} {dist_name.capitalize()} PDF\n({param_str})'
-                plt.plot(x, p, color=color, linewidth=2.5, label=pdf_label)
-                
-                # If normal distribution, use the fitted loc and scale for expected value and std lines
-                if dist_name == 'norm':
-                    fit_mean = self.params['loc']
-                    fit_std = self.params['scale']
-                    
-                    # Expected Value (E[X] or Mean) - Plot only one line!
-                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, label=None)
-                    # +/- 1 Std bounds
-                    plt.axvline(x=fit_mean - fit_std, color=color, linestyle=':', linewidth=1.5, label=None)
-                    plt.axvline(x=fit_mean + fit_std, color=color, linestyle=':', linewidth=1.5, label=None)
-                    
-                    # Add inline labels with rounded values next to the lines
-                    plt.text(
-                        fit_mean, y_pos_mean, f"$\\mu_{{{topo_name}}} = {fit_mean:.4f}$", transform=trans, color=color,
-                        fontsize=8.0, ha='center', va='center', fontweight='bold',
-                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                    )
-                    plt.text(
-                        fit_mean + fit_std, y_pos_std, f"$\\sigma_{{{topo_name}}} = {fit_std:.4f}$", transform=trans, color=color,
-                        fontsize=7.0, ha='center', va='center',
-                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                    )
-                else:
-                    # For other distributions, plot fitted expected value/mean if available
-                    fit_mean = self.params.get('loc', mean_val)
-                    plt.axvline(x=fit_mean, color=color, linestyle='--', linewidth=2, label=None)
-                    plt.text(
-                        fit_mean, y_pos_mean, f"$\\mu_{{{topo_name}}} = {fit_mean:.4f}$", transform=trans, color=color,
-                        fontsize=8.0, ha='center', va='center', fontweight='bold',
-                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                    )
+            topo_name = match.group(1).upper() if match else col.replace('avg*', '').replace('c*', '')
+
+            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+            vals = self.df[col].values
+            xmin, xmax = vals.min(), vals.max()
+            margin = (xmax - xmin) * 0.15 if xmax > xmin else 1.0
+            x_grid = np.linspace(xmin - margin, xmax + margin, 200)
+
+            if has_ground_truth:
+                df_null = self.df[y_true == 0]
+                df_alt = self.df[y_true == 1]
+
+                if len(df_null) > 0:
+                    sns.histplot(df_null[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#2B4C7E', label='Null GT (Observed)', bins=30)
+                if len(df_alt) > 0:
+                    sns.histplot(df_alt[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt GT (Observed)', bins=30)
+
+                if len(df_null) > 1:
+                    mu_null, std_null = norm.fit(df_null[col])
+                    pdf_null = norm.pdf(x_grid, mu_null, std_null)
+                    ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label=f'Null Fit ($\mu={mu_null:.2f}, \sigma={std_null:.2f}$)')
+                    ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
+                    ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+                if len(df_alt) > 1:
+                    mu_alt, std_alt = norm.fit(df_alt[col])
+                    pdf_alt = norm.pdf(x_grid, mu_alt, std_alt)
+                    ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit ($\mu={mu_alt:.2f}, \sigma={std_alt:.2f}$)')
+                    ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                    ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
             else:
-                # No distribution overlay requested, just plot the empirical mean line
-                plt.axvline(x=mean_val, color=color, linestyle='-', linewidth=2, label=None)
-                plt.text(
-                    mean_val, y_pos_mean, f"$\\mu_{{{topo_name}}} = {mean_val:.4f}$", transform=trans, color=color,
-                    fontsize=8.0, ha='center', va='center', fontweight='bold',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                )
-                
-        title_suffix = f" & Fitted {dist_name.capitalize()} PDF" if overlay_dist else ""
-        plt.title(f'Topology Average Scores{title_suffix}: {self.gene_name}', fontsize=13)
-        plt.xlabel(f'{norm_label} Weight Value')
-        plt.ylabel('Density')
-        
-        # Draw legend only if we have labeled handles
-        handles, labels = plt.gca().get_legend_handles_labels()
-        if handles:
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-        plt.tight_layout()
-        
-        # Determine filename suffix dynamically based on plotted topologies
+                color = self.color_mapping.get(col, '#2B4C7E')
+                sns.histplot(self.df[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=color, label='Observed Data', bins=30)
+
+                mu_tot, std_tot = norm.fit(self.df[col])
+                pdf_tot = norm.pdf(x_grid, mu_tot, std_tot)
+                ax.plot(x_grid, pdf_tot, color=color, linewidth=2.2, label=f'Gaussian Fit ($\mu={mu_tot:.2f}, \sigma={std_tot:.2f}$)')
+                ax.axvline(mu_tot, color=color, linestyle='--', linewidth=1.5)
+                ax.text(mu_tot, 0.90, f"$\\mu={mu_tot:.2f}$", transform=trans, color=color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            ax.set_title(f'Topology: {topo_name}', fontsize=12, fontweight='bold')
+            ax.set_xlabel(f'{norm_label} Score')
+            if i == 0:
+                ax.set_ylabel('Density')
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+            ax.grid(True, linestyle=':', alpha=0.5)
+
+        fig.suptitle(f'Topology Distribution & Gaussian Fits: {self.gene_name}', fontsize=13, fontweight='bold')
+        fig.tight_layout()
+
         all_avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
         is_all_topologies = (len(avg_cols) == len(all_avg_cols))
-        
+
         if is_all_topologies:
             suffix = "all"
         else:
@@ -246,18 +231,17 @@ class CasterPlotter:
             for col in avg_cols:
                 match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
                 if match:
-                    topo_names.append(match.group(1).upper())
+                    topo_names.append(match.group(1).lower())
                 else:
-                    topo_names.append(col.replace('avg*', '').replace('avg_', ''))
+                    topo_names.append(col.replace('avg*', '').replace('c*', ''))
             suffix = "_".join(topo_names)
 
-        # Saved explicitly to caster/results with _n suffix if normalized
         output_dir = os.path.dirname(os.path.abspath(__file__))
         suffix_norm = "_n" if self.is_normalized_file else ""
         save_path_top = os.path.join(output_dir, f'{self.distribution}_{suffix}_{self.gene_name}{suffix_norm}.png')
-        plt.savefig(save_path_top, dpi=300)
+        plt.savefig(save_path_top, dpi=300, bbox_inches='tight')
         print(f"Saved empirical topology distribution chart to: {save_path_top}")
-        plt.show()
+        plt.close()
 
     def plot_dstar_histogram(self):
         """Generates empirical histogram for the D* statistic distribution."""
@@ -339,13 +323,52 @@ class CasterPlotter:
 
         plt.figure(figsize=(12, 6))
         
+        # Rename columns to standard topology names (ABBA, BABA, AABB) for clean palette hue mapping
+        rename_map = {}
+        for col in avg_cols:
+            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+            if match:
+                rename_map[col] = match.group(1).upper()
+            else:
+                rename_map[col] = col
+
+        renamed_df = self.df.rename(columns=rename_map)
+        clean_cols = [rename_map.get(c, c) for c in avg_cols]
+
         # Melt the dataframe for seaborn plotting
-        melted_df = self.df.melt(id_vars=['pos'], value_vars=avg_cols, 
+        melted_df = renamed_df.melt(id_vars=['pos'], value_vars=clean_cols, 
                                  var_name='Topology', value_name='Score')
         
         # Create scatter plot with small points and transparency
-        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.color_mapping, alpha=0.6, s=12)
+        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
         
+        # Draw vertical split lines and null/alt annotations if filename contains ground truth pattern
+        pattern_str_match = re.search(r'((?:[an]\d+)+)', self.gene_name)
+        if pattern_str_match:
+            pattern_str = pattern_str_match.group(1)
+            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            if blocks:
+                block_size_bp = 500000
+                curr_pos_bp = 0
+                for idx, (b_type, b_id) in enumerate(blocks):
+                    start_pos = curr_pos_bp
+                    end_pos = curr_pos_bp + block_size_bp
+                    mid_pos = (start_pos + end_pos) / 2.0
+                    label_text = "null" if b_type == 'n' else "alt"
+                    
+                    # Draw vertical boundary line at start of block (except 0)
+                    if start_pos > 0:
+                        plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+                    
+                    # Label null/alt above x-axis at bottom of plot
+                    plt.text(mid_pos, 0.02, label_text, transform=plt.gca().get_xaxis_transform(),
+                             ha='center', va='bottom', fontsize=10, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='none'))
+                    
+                    curr_pos_bp = end_pos
+                # Vertical line at end of last block
+                plt.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+
         # Format names for cleaner legend and title
         plt.title(f'Genomic Topology Profile: {self.gene_name}', fontsize=13, fontweight='bold', pad=10)
         plt.xlabel('Genomic Position (pos)', fontsize=11, labelpad=8)
@@ -391,7 +414,7 @@ def read_caster_scores(path):
                 continue
     return pos_to_caster
 
-def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, ilr_transform=False):
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir):
     NUM_STATES = 2
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +426,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
     
     print("\n=== K-means Clustering & Silhouette Scores ===")
     
-    topology_names = ["ABBA", "BABA", "AABB"] if (Y.shape[-1] == 3 and not ilr_transform) else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
+    topology_names = ["ABBA", "BABA", "AABB"] if Y.shape[-1] == 3 else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
     
     for d in range(Y.shape[-1]):
         y_d = np.array(Y[:, [d]])

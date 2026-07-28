@@ -73,8 +73,10 @@ phlag -c caster/data/ape_0_200k_w1k_s100_n.tsv -L 10 -s 100
 * **`-c, --caster-scores`**: Path to TSV containing the CASTER scores.
 * **`-L, --n-iters`** (default: `10`): Number of outer EM iterations.
 * **`-s, --step-size`**: Genomic step size (in rows/positions) to compute a text-based ASCII histogram and save a visual bar chart plot.
+* **`-t, --silhouette-threshold`** (default: `0.5`): Silhouette score threshold to determine optimal GMM mixture counts.
+* **`-p, --best-paths`** (default: `1`): Number of best Viterbi paths to calculate and plot.
+* **`--correct-transition`**: Set final transition matrix to ground truth automatically or via custom values (`p0,p1`).
 * **`-o, --output-file`** (optional): Custom path to save the output report (automatically defaults to saving in the `test/` directory).
-* **`--ilr-transform`**: Apply isometric log-ratio transformation to CASTER scores.
 * **`--emission-parameterization`** (default: `attraction`): Parameterization of emission probabilities (`free`, `attraction`, or `anchor`).
 
 ### Output

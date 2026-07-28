@@ -12,7 +12,6 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
-from skbio.stats.composition import ilr, multi_replace
 import scipy.stats as stats
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -45,7 +44,6 @@ class Phlag:
         # Purely ingest CASTER scores instead of computing or reading QQS
         self.read_caster_scores(self.args.caster_scores)
         
-        self.configure_emissions()
         self.compute_emissions()
         if getattr(self.args, "emission_type", "gaussian") == "gmm":
             self.determine_optimal_mixtures()
@@ -54,7 +52,7 @@ class Phlag:
 
     def extract_distribution_type_from_filename(self):
         # Check if the user specified emission_type explicitly on CLI
-        T_supplied = any(arg.startswith("-T") or arg.startswith("--emission-type") for arg in sys.argv)
+        T_supplied = any(arg.startswith("-d") or arg.startswith("--emission-type") for arg in sys.argv)
         if not T_supplied:
             # Check input filename (caster_scores) and output filename
             filenames_to_check = []
@@ -86,27 +84,11 @@ class Phlag:
         Preserves the partial-based defaultdict structure for JAX consistency.
         Raises FileNotFoundError if the file path does not exist.
         """
+        from .utils import resolve_input_file
         path_obj = pathlib.Path(path)
-        if not path_obj.exists():
-            from .utils import get_data_dir
-            data_dir = get_data_dir()
-            
-            # Check if it exists under data_dir/scores
-            fallback = data_dir / "scores" / path_obj.name
-            if fallback.exists():
-                path_obj = fallback
-            else:
-                # Check if it exists directly under data_dir
-                fallback = data_dir / path_obj.name
-                if fallback.exists():
-                    path_obj = fallback
-                else:
-                    # Also try if the original path contains 'caster/data' and we can replace it with data_dir
-                    path_str = str(path).replace('\\', '/')
-                    if 'caster/data/' in path_str:
-                        replaced_path = pathlib.Path(path_str.replace('caster/data', str(data_dir)))
-                        if replaced_path.exists():
-                            path_obj = replaced_path
+        resolved = resolve_input_file(path_obj, default_subdirs=["scores", "msa"], default_exts=[".tsv", ".txt"])
+        if resolved and resolved.exists():
+            path_obj = resolved
 
         path = str(path_obj)
         if hasattr(self, "args") and self.args:
@@ -150,9 +132,6 @@ class Phlag:
         if len(self.pos_to_caster) == 0:
             sys.exit(f"Error: No valid window scores parsed from CASTER score file '{path}'. Please check that sequence headers in the FASTA match the species in the mapping file.")
 
-    def configure_emissions(self):
-        self.ilr_transform = self.args.ilr_transform
-
     def compute_emissions(self):
         # Convert CASTER scores dictionary values into sequential matrix positions
         sorted_positions = sorted(self.pos_to_caster.keys())
@@ -161,9 +140,6 @@ class Phlag:
         if getattr(self.args, "emission_type", "gaussian") == "beta":
             raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
             self.Y = raw_clipped / raw_clipped.sum(axis=-1, keepdims=True)
-        elif self.ilr_transform:
-            raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
-            self.Y = ilr(multi_replace(raw_clipped, delta=1e-7))
         else:
             self.Y = raw_caster_matrix
 
@@ -177,9 +153,10 @@ class Phlag:
             
         import caster_plot
         
-        output_dir = pathlib.Path("test")
+        output_dir = pathlib.Path.cwd() / "test" / pathlib.Path(self.args.caster_scores).stem
         if self.args.output_file:
             output_dir = pathlib.Path(self.args.output_file).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
             
         num_mixtures_matrix = caster_plot.determine_optimal_mixtures(
             self.args.caster_scores,
@@ -187,7 +164,6 @@ class Phlag:
             self.pos_to_caster,
             self.args.silhouette_threshold,
             output_dir,
-            ilr_transform=self.ilr_transform
         )
         
         self.num_mixtures = int(np.max(num_mixtures_matrix))
@@ -208,10 +184,10 @@ class Phlag:
             # Ensure the output directory exists
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
         else:
-            test_dir = pathlib.Path.cwd() / "test"
+            test_dir = pathlib.Path.cwd() / "test" / input_path.stem
             test_dir.mkdir(parents=True, exist_ok=True)
             dist_type = getattr(self.args, "emission_type", "gaussian")
-            self.output_file = test_dir / f"report_{dist_type}_{input_path.name}"
+            self.output_file = test_dir / f"report_{dist_type}.tsv"
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -287,12 +263,6 @@ class Phlag:
         transition_matrix_np = np.array(self.params.transitions.transition_matrix)
         log_likelihoods_np = np.array(log_likelihoods)
         
-        # Calculate n-best Viterbi paths
-        n_paths = getattr(self.args, "best_paths", 1)
-        paths, path_likelihoods = self.get_n_best_viterbi_paths(
-            initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
-        )
-        
         # Extract ground truth pattern indices from input filename if present
         # Format example: ...a1n5a2a3n8n1...
         # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
@@ -326,6 +296,55 @@ class Phlag:
                             y_true[idx] = 1
                             break
 
+        # Check if --correct-transition was requested to manually/automatically set ground truth transition matrix
+        correct_trans_arg = getattr(self.args, "correct_transition", None)
+        if correct_trans_arg is not None:
+            transition_corrected = False
+            gt_tm = None
+            if isinstance(correct_trans_arg, str) and correct_trans_arg.lower() != "auto":
+                nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", correct_trans_arg)]
+                if len(nums) == 2:
+                    p0, p1 = nums[0], nums[1]
+                    gt_tm = np.array([[p0, 1.0 - p0], [1.0 - p1, p1]], dtype=np.float32)
+                    transition_corrected = True
+                elif len(nums) == 4:
+                    gt_tm = np.array([[nums[0], nums[1]], [nums[2], nums[3]]], dtype=np.float32)
+                    transition_corrected = True
+                else:
+                    print(f"Warning: Could not parse transition values from '{correct_trans_arg}'. Using auto ground-truth estimation.")
+                    correct_trans_arg = "auto"
+            
+            if correct_trans_arg == "auto" or (isinstance(correct_trans_arg, str) and correct_trans_arg.lower() == "auto"):
+                if has_ground_truth:
+                    N_00 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 0))
+                    N_01 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 1))
+                    N_10 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 0))
+                    N_11 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 1))
+
+                    A00 = float(N_00 / (N_00 + N_01)) if (N_00 + N_01) > 0 else 0.5
+                    A01 = 1.0 - A00
+                    A10 = float(N_10 / (N_10 + N_11)) if (N_10 + N_11) > 0 else 0.5
+                    A11 = 1.0 - A10
+
+                    gt_tm = np.array([[A00, A01], [A10, A11]], dtype=np.float32)
+                    transition_corrected = True
+                else:
+                    print("Warning: --correct-transition auto requested, but ground truth locus pattern not found in filename.")
+
+            if transition_corrected and gt_tm is not None:
+                from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
+                transition_matrix_np = gt_tm
+                self.params = self.params._replace(
+                    transitions=ParamsStandardHMMTransitions(transition_matrix=jnp.array(gt_tm, dtype=jnp.float32))
+                )
+                print(f"\n[Ground Truth Transition Matrix Override] Applied: {gt_tm.tolist()}\n")
+
+        # Calculate n-best Viterbi paths
+        n_paths = getattr(self.args, "best_paths", 1)
+        paths, path_likelihoods = self.get_n_best_viterbi_paths(
+            initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
+        )
+
         # Calculate metrics for primary Viterbi path (Path 1)
         y_pred = np.array(paths[0])
         
@@ -354,7 +373,7 @@ class Phlag:
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
             
-            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f} (TP={tp}, FP={fp}, FN={fn}, TN={tn})"
+            metrics_str = f"TPR (Recall/Sensitivity): {tpr:.4f}, FPR: {fpr:.4f}, F1 (Avg of TPR and TNR): {f1:.4f} (TP={tp}, FP={fp}, FN={fn}, TN={tn})"
             print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -362,7 +381,13 @@ class Phlag:
         headers.append("# State divergence: " + emission_divergence_str)
         headers.append(f"# Outer EM iterations: {self.n_iters}")
         headers.append(f"# Inner EM iterations: {self.increment_steps}")
-        headers.append(f"# ILR transform: {self.ilr_transform}")
+        if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
+            tm_before_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in self.initial_transition_matrix.tolist())
+            headers.append(f"# Initial transition matrix (before EM): [{tm_before_str}]")
+        tm_after_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in transition_matrix_np.tolist())
+        headers.append(f"# Final transition matrix (after EM): [{tm_after_str}]")
+        if correct_trans_arg is not None:
+            headers.append("# Corrected transition matrix applied: True")
         if has_ground_truth:
             headers.append(f"# Performance Metrics (Path 1 vs Pattern Indices Ground Truth): {metrics_str}")
         for idx, l in enumerate(path_likelihoods):
@@ -437,7 +462,7 @@ class Phlag:
                 
                 output_path = pathlib.Path(self.output_file)
                 dist_type = getattr(self.args, "emission_type", "gaussian")
-                plot_path = output_path.with_name(f"states_{dist_type}_{input_path.stem}.png")
+                plot_path = output_path.with_name(f"states_{dist_type}.png")
                 plt.savefig(plot_path, dpi=300)
                 plt.close()
                 print(f"Saved visual HMM states and log-likelihood plot to: {plot_path}")
@@ -527,12 +552,13 @@ class Phlag:
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
-        p0, p1 = 0.2, 0.2
+        p0, p1 = 0.6, 0.6
         initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
         
         self.params, self.props = self.hmm.initialize(
             initial_probs=INITIAL_PROBS, emission_probs=init_emissions, transition_matrix=initial_transition_matrix
         )
+        self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
         if self.args.emission_type == "beta":
             self.props.emissions.concentration1.trainable = True
@@ -595,13 +621,10 @@ class PhlagPlotter:
         self.emission_dim = self.phlag.Y.shape[-1]
         
         # Map coordinates to topology names if we have the standard 3 topologies
-        if not self.phlag.ilr_transform and self.emission_dim == 3:
+        if self.emission_dim == 3:
             self.topology_names = ["ABBA", "BABA", "AABB"]
         else:
-            self.topology_names = [
-                f"ILR Coord {i+1}" if self.phlag.ilr_transform else f"Coord {i+1}" 
-                for i in range(self.emission_dim)
-            ]
+            self.topology_names = [f"Coord {i+1}" for i in range(self.emission_dim)]
 
         # Define premium color palette and labels
         self.colors = {
@@ -771,12 +794,11 @@ class PhlagPlotter:
         if self.phlag.args.output_file:
             output_dir = pathlib.Path(self.phlag.args.output_file).parent
         else:
-            output_dir = pathlib.Path.cwd() / "test"
+            output_dir = pathlib.Path.cwd() / "test" / self.input_path.stem
             output_dir.mkdir(parents=True, exist_ok=True)
             
-        suffix = "_ilr" if self.phlag.ilr_transform else ""
         dist_type = getattr(self.phlag.args, "emission_type", "gaussian")
-        plot_file = output_dir / f"em_{dist_type}_{self.input_path.stem}{suffix}.png"
+        plot_file = output_dir / f"em_{dist_type}.png"
         
         plt.savefig(plot_file, dpi=300, bbox_inches="tight")
         plt.close()
@@ -798,8 +820,17 @@ def parse_arguments():
 
     parser.add_argument(
         "caster_scores",
+        nargs="?",
         type=pathlib.Path,
+        default=None,
         help="Path to the CASTER scores TSV"
+    )
+    parser.add_argument(
+        "-r",
+        "--recent",
+        dest="recent",
+        action="store_true",
+        help="Use the most recently created score file in store/scores"
     )
 
     parser.add_argument(
@@ -822,6 +853,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "-s",
+        "--step-size",
         dest="step_size",
         type=int_or_abbrev,
         required=False,
@@ -846,7 +878,7 @@ def parse_arguments():
         help="Emission penalty regularizer parameter lambda (default: 1.0)",
     )
     hmm_group.add_argument(
-        "-T",
+        "-d",
         dest="emission_type",
         type=str.lower,
         default="gaussian",
@@ -854,6 +886,7 @@ def parse_arguments():
         help="Type of HMM emissions (gaussian, beta, or gmm. Default: gaussian)",
     )
     hmm_group.add_argument(
+        "-t",
         "--silhouette-threshold",
         dest="silhouette_threshold",
         type=float,
@@ -861,22 +894,37 @@ def parse_arguments():
         help="Silhouette score threshold to determine optimal GMM mixture counts (default: 0.5)",
     )
     hmm_group.add_argument(
+        "-p",
         "--best-paths",
         dest="best_paths",
         type=int,
         default=1,
         help="Number of best Viterbi paths to calculate and plot (default: 1)",
     )
-
-    discr_group = parser.add_argument_group("Transformation options")
-    discr_group.add_argument(
-        "-i",
-        dest="ilr_transform",
-        action="store_true",
-        help="Apply isometric log-ratio transformation on CASTER score distributions",
+    hmm_group.add_argument(
+        "--correct-transition",
+        dest="correct_transition",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
     )
 
     args = parser.parse_args()
+
+    from .utils import resolve_input_file, get_most_recent_file
+    if args.recent or args.caster_scores == pathlib.Path("-r") or args.caster_scores is None:
+        recent_file = get_most_recent_file(
+            default_subdirs=["store/scores", "scores"],
+            default_exts=[".tsv", ".txt"],
+            exclude_prefixes=["report_", "gaussian_", "scores_", "em_", "walkthrough", "implementation_plan"]
+        )
+        if recent_file is None or not recent_file.exists():
+            sys.exit("Error: No score file found in store/scores or candidate data directories.")
+        print(f"Using most recent score file: {recent_file}")
+        args.caster_scores = recent_file
+    else:
+        args.caster_scores = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa"], default_exts=[".tsv", ".txt"])
 
     # Check if --plot is supplied
     plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in sys.argv)
@@ -886,8 +934,39 @@ def parse_arguments():
     return args
 
 
+def organize_existing_test_files():
+    import pathlib
+    import shutil
+    test_dir = pathlib.Path.cwd() / "test"
+    if not test_dir.exists():
+        return
+    for item in list(test_dir.iterdir()):
+        if not item.is_file() or item.name == "check_output.py":
+            continue
+        fname = item.name
+        stem = None
+        if fname.startswith("report_") or fname.startswith("em_") or fname.startswith("states_"):
+            parts = fname.split("_", 2)
+            if len(parts) >= 3:
+                stem = pathlib.Path(parts[2]).stem
+        elif fname.startswith("kmeans_"):
+            stem = "null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k"
+        
+        if stem:
+            target_dir = test_dir / stem
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(item), str(target_dir / fname))
+            except Exception:
+                pass
+
+
+organize_existing_test_files()
+
+
 def main():
     import copy
+    organize_existing_test_files()
     args = parse_arguments()
     phlag = Phlag(args)
     

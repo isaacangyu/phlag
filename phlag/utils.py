@@ -103,15 +103,15 @@ def get_repo_root():
 
 def get_data_dir():
     """
-    Resolves the data directory to use. Looks up the PHLAG_DIR environment variable
+    Resolves the data directory to use. Looks up the PHLAG_DIR or INPUT_DIR environment variable
     or reads it from a .env file. Defaults to repo_root / "caster" / "data" if not found.
     """
     import os
     import pathlib
-    phlag_dir = os.environ.get("PHLAG_DIR")
-    if not phlag_dir:
+    target_dir = os.environ.get("PHLAG_DIR") or os.environ.get("INPUT_DIR")
+    if not target_dir:
         repo_root = get_repo_root()
-        # Search for .env file at repo root
+        # Search for .env file at repo root or cwd
         for base_dir in [repo_root, pathlib.Path.cwd()]:
             env_path = base_dir / ".env"
             if env_path.exists():
@@ -121,16 +121,178 @@ def get_data_dir():
                             line = line.strip()
                             if line and not line.startswith("#") and "=" in line:
                                 key, val = line.split("=", 1)
-                                if key.strip() == "PHLAG_DIR":
-                                    phlag_dir = val.strip().strip("'").strip('"')
+                                key_str = key.strip()
+                                if key_str in ("PHLAG_DIR", "INPUT_DIR"):
+                                    target_dir = val.strip().strip("'").strip('"')
                                     break
                 except Exception:
                     pass
-            if phlag_dir:
+            if target_dir:
                 break
-    if phlag_dir:
-        return pathlib.Path(phlag_dir)
+    if target_dir:
+        return pathlib.Path(target_dir)
     else:
         repo_root = get_repo_root()
         return repo_root / "caster" / "data"
+
+
+def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
+    """
+    Resolves an input path that may be a full path, relative path, filename with extension,
+    or base filename without path or extension.
+    """
+    import os
+    import pathlib
+
+    if path_input is None:
+        return None
+
+    path_obj = pathlib.Path(path_input)
+
+    # 1. Direct check
+    if path_obj.exists():
+        return path_obj.resolve()
+
+    if default_exts is None:
+        default_exts = [".fa", ".fasta", ".tsv", ".txt", ".fa.gz"]
+
+    if default_subdirs is None:
+        default_subdirs = [
+            "msa/concat", "msa", "concat", 
+            "store/msa/concat", "store/msa", "store", 
+            "scores", "mapping"
+        ]
+    else:
+        expanded = []
+        for s in default_subdirs:
+            expanded.append(s)
+            if "msa" in s:
+                expanded.extend(["msa/concat", "concat", "store/msa/concat", "store/msa", "store"])
+        default_subdirs = expanded
+
+    # Generate extensions to try
+    exts_to_try = [""]
+    if not path_obj.suffix:
+        exts_to_try.extend(default_exts)
+
+    candidates = []
+    for ext in exts_to_try:
+        if ext:
+            candidates.append(path_obj.with_suffix(ext))
+        else:
+            candidates.append(path_obj)
+
+    # 2. Check candidates directly
+    for cand in candidates:
+        if cand.exists():
+            return cand.resolve()
+
+    # 3. Search in candidate directories
+    repo_root = get_repo_root()
+    data_dir = get_data_dir()
+
+    search_bases = [
+        pathlib.Path.cwd(),
+        data_dir,
+        repo_root,
+        repo_root / "store",
+        repo_root / "test",
+        pathlib.Path.cwd() / "test",
+        pathlib.Path("/drive2/iang"),
+    ]
+
+    search_dirs = []
+    for base in search_bases:
+        if base.exists():
+            search_dirs.append(base)
+            for s in default_subdirs:
+                sub_path = base / s
+                if sub_path.exists():
+                    search_dirs.append(sub_path)
+
+    # Deduplicate search_dirs
+    seen_dirs = set()
+    unique_dirs = []
+    for d in search_dirs:
+        try:
+            resolved_d = d.resolve()
+            if resolved_d not in seen_dirs:
+                seen_dirs.add(resolved_d)
+                unique_dirs.append(d)
+        except Exception:
+            pass
+
+    for cand in candidates:
+        cand_name = cand.name
+        for sdir in unique_dirs:
+            check_path = sdir / cand_name
+            if check_path.exists():
+                return check_path.resolve()
+
+    # 4. Fuzzy match by stem in search directories
+    stem = path_obj.stem
+    for sdir in unique_dirs:
+        if sdir.exists():
+            try:
+                for f in sdir.iterdir():
+                    if f.is_file() and f.stem == stem:
+                        return f.resolve()
+            except Exception:
+                pass
+
+    return path_obj
+
+
+def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefixes=None):
+    """
+    Finds the most recently created or modified file in store/scores, store/msa/concat,
+    or specified subdirectories, ignoring report output files.
+    """
+    import os
+    import pathlib
+
+    repo_root = get_repo_root()
+    data_dir = get_data_dir()
+
+    if exclude_prefixes is None:
+        exclude_prefixes = ["report_", "gaussian_", "scores_", "em_", "walkthrough", "implementation_plan"]
+
+    if default_subdirs is None:
+        default_subdirs = ["store/scores", "scores", "store/msa/concat", "msa/concat"]
+
+    search_dirs = []
+    for s in default_subdirs:
+        for base in [repo_root, pathlib.Path.cwd(), data_dir, pathlib.Path("/drive2/iang")]:
+            sp = base / s
+            if sp.exists():
+                search_dirs.append(sp)
+
+    seen_dirs = set()
+    newest_file = None
+    newest_mtime = -1.0
+
+    for d in search_dirs:
+        try:
+            resolved_d = d.resolve()
+            if resolved_d in seen_dirs:
+                continue
+            seen_dirs.add(resolved_d)
+
+            for item in d.iterdir():
+                if item.is_file():
+                    fname = item.name
+                    if exclude_prefixes and any(fname.startswith(p) for p in exclude_prefixes):
+                        continue
+                    if default_exts and not any(fname.endswith(ext) for ext in default_exts):
+                        continue
+                    mtime = item.stat().st_mtime
+                    if mtime > newest_mtime:
+                        newest_mtime = mtime
+                        newest_file = item.resolve()
+        except Exception:
+            pass
+
+    return newest_file
+
+
 

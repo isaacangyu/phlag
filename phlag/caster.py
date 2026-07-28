@@ -47,11 +47,20 @@ def parse_arguments():
     # Input FASTA file
     parser.add_argument(
         "fasta_file",
+        nargs="?",
         type=pathlib.Path,
+        default=None,
         help="Input FASTA file path"
     )
     
-    # Left and Right indices
+    # Recent flag & Left/Right indices
+    parser.add_argument(
+        "-r",
+        "--recent",
+        dest="recent",
+        action="store_true",
+        help="Use the most recently created FASTA file in store/msa/concat"
+    )
     parser.add_argument(
         "-l",
         dest="left",
@@ -60,7 +69,8 @@ def parse_arguments():
         help="Left index of range (0-indexed, inclusive)"
     )
     parser.add_argument(
-        "-r",
+        "-R",
+        "--right",
         dest="right",
         type=int_or_abbrev,
         required=False,
@@ -126,23 +136,22 @@ def main():
     if args.step_size is None:
         args.step_size = args.window_size
         
-    from .utils import get_data_dir, get_repo_root
+    from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
     data_dir = get_data_dir()
     
-    # Resolve FASTA file fallback if not found
-    if not args.fasta_file.exists():
-        fallback_fasta = data_dir / "msa" / args.fasta_file.name
-        if fallback_fasta.exists():
-            args.fasta_file = fallback_fasta
-        else:
-            fallback_fasta2 = repo_root / "caster" / "data" / "msa" / args.fasta_file.name
-            if fallback_fasta2.exists():
-                args.fasta_file = fallback_fasta2
-            else:
-                fallback_fasta3 = repo_root / args.fasta_file
-                if fallback_fasta3.exists():
-                    args.fasta_file = fallback_fasta3
+    # Resolve FASTA file fallback if not found or recent flag requested
+    if args.recent or args.fasta_file == pathlib.Path("-r") or args.fasta_file is None:
+        recent_fasta = get_most_recent_file(
+            default_subdirs=["store/msa/concat", "msa/concat", "concat", "store/msa", "msa"],
+            default_exts=[".fa", ".fasta", ".fa.gz"]
+        )
+        if recent_fasta is None or not recent_fasta.exists():
+            sys.exit("Error: No FASTA file found in store/msa/concat or candidate MSA directories.")
+        print(f"Using most recent FASTA file: {recent_fasta}")
+        args.fasta_file = recent_fasta
+    else:
+        args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat"], default_exts=[".fa", ".fasta", ".fa.gz"])
                 
     if args.mapping is None:
         # Auto-detect mapping file in repo root mapping directory or fasta_file parent
@@ -168,31 +177,13 @@ def main():
         elif clade_map and clade_map.exists():
             args.mapping = clade_map
         else:
-            repo_ape_map = repo_root / "mapping" / "ape_mapping.tsv"
-            if repo_ape_map.exists():
-                args.mapping = repo_ape_map
-            else:
-                fallback_map = args.fasta_file.parent / "ape_mapping.tsv"
-                if fallback_map.exists():
-                    args.mapping = fallback_map
+            sys.exit(f"Error: No mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
     else:
         # Resolve Mapping file fallback if not found
-        if not args.mapping.exists():
-            fallback_map = repo_root / "mapping" / args.mapping.name
-            if fallback_map.exists():
-                args.mapping = fallback_map
-            else:
-                fallback_map2 = data_dir / "mapping" / args.mapping.name
-                if fallback_map2.exists():
-                    args.mapping = fallback_map2
-                else:
-                    fallback_map3 = repo_root / "caster" / "data" / "mapping" / args.mapping.name
-                    if fallback_map3.exists():
-                        args.mapping = fallback_map3
-                    else:
-                        fallback_map4 = repo_root / args.mapping
-                        if fallback_map4.exists():
-                            args.mapping = fallback_map4
+        args.mapping = resolve_input_file(args.mapping, default_subdirs=["mapping"], default_exts=[".tsv", "_mapping.tsv", ".txt"])
+
+    if not args.mapping or not args.mapping.exists():
+        sys.exit(f"Error: No valid mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
     
     # 1. Validation
     if not args.fasta_file.exists():
@@ -292,6 +283,9 @@ def main():
             if len(parts) >= 7:
                 raw_rows.append(parts)
                 
+        if not raw_rows:
+            sys.exit(f"Error: No window scores calculated for '{args.fasta_file.name}' using mapping '{args.mapping.name}'. Please check that sequence headers in the FASTA match species in the mapping file.")
+                
         # Perform rolling window sum
         K = max(1, args.window_size // args.step_size)
         
@@ -345,7 +339,7 @@ def main():
                     
         # 5. Write final TSV file to current directory
         # Output filename should not have C, and includes left and right indices (formatted)
-        clean_stem = args.fasta_file.stem.replace("C", "")
+        clean_stem = args.fasta_file.stem
         left_str = format_val(args.left)
         right_str = format_val(args.right)
         window_str = format_val(args.window_size)
