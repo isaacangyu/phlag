@@ -179,15 +179,25 @@ class Phlag:
 
     def initialize_output(self):
         input_path = pathlib.Path(self.args.caster_scores)
-        if self.args.output_file:
-            self.output_file = self.args.output_file
-            # Ensure the output directory exists
+        if getattr(self.args, "output_file", None):
+            self.output_file = pathlib.Path(self.args.output_file)
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
         else:
-            test_dir = pathlib.Path.cwd() / "test" / input_path.stem
-            test_dir.mkdir(parents=True, exist_ok=True)
             dist_type = getattr(self.args, "emission_type", "gaussian")
-            self.output_file = test_dir / f"report_{dist_type}.tsv"
+            from .utils import parse_filename_to_dir_structure, get_data_dir
+            parsed = parse_filename_to_dir_structure(input_path.stem)
+            
+            if parsed:
+                rel_dir = parsed["relative_dir"]
+                data_dir = get_data_dir()
+                out_dir = data_dir / "phlag" / dist_type / rel_dir / "phlag"
+            else:
+                data_dir = get_data_dir()
+                out_dir = data_dir / "phlag" / input_path.stem
+            
+            out_dir.mkdir(parents=True, exist_ok=True)
+            self.output_file = out_dir / "report.tsv"
+            
         headers = [f"# {' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -274,9 +284,23 @@ class Phlag:
         y_true = np.zeros(len(sorted_positions), dtype=int)
         has_ground_truth = False
         
+        pattern_str = None
         pattern_str_match = re.search(r'((?:[an]\d+)+)', input_stem)
         if pattern_str_match:
             pattern_str = pattern_str_match.group(1)
+        else:
+            # Look for pattern.txt in the directory of the scores file
+            pattern_file = pathlib.Path(self.args.caster_scores).parent / "pattern.txt"
+            if pattern_file.exists():
+                try:
+                    content = pattern_file.read_text().strip()
+                    p_match = re.search(r'((?:[an]\d+)+)', content)
+                    if p_match:
+                        pattern_str = p_match.group(1)
+                except Exception:
+                    pass
+
+        if pattern_str:
             blocks = re.findall(r'([an])(\d+)', pattern_str)
             if blocks:
                 has_ground_truth = True
@@ -329,7 +353,7 @@ class Phlag:
                     gt_tm = np.array([[A00, A01], [A10, A11]], dtype=np.float32)
                     transition_corrected = True
                 else:
-                    print("Warning: --correct-transition auto requested, but ground truth locus pattern not found in filename.")
+                    print("Warning: --correct-transition auto requested, but ground truth locus pattern not found in filename or pattern.txt.")
 
             if transition_corrected and gt_tm is not None:
                 from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
@@ -347,6 +371,7 @@ class Phlag:
 
         # Calculate metrics for primary Viterbi path (Path 1)
         y_pred = np.array(paths[0])
+        flipped_for_eval = False
         
         # Ensure state labeling matches ground truth (state 1 = anomalous state with higher emission divergence/mean)
         # If State 0 happens to be assigned to the anomalous profile, flip labels for evaluation
@@ -362,6 +387,7 @@ class Phlag:
                 state0_overlap = np.sum(y_pred[true_anom_mask] == 0)
                 if state0_overlap > state1_overlap:
                     y_pred = 1 - y_pred
+                    flipped_for_eval = True
             
             tp = int(np.sum((y_true == 1) & (y_pred == 1)))
             fp = int(np.sum((y_true == 0) & (y_pred == 1)))
@@ -397,9 +423,10 @@ class Phlag:
         
         # Add the state paths as comma-separated rows in the report
         for path in paths:
-            self.output_str += "\n" + ",".join(map(str, path.tolist()))
+            effective_path = (1 - path) if flipped_for_eval else path
+            self.output_str += "\n" + ",".join(map(str, effective_path.tolist()))
             
-        # Generate the visual plot if configured: states + log-likelihood
+        # Generate the visual plot if configured: states
         if self.args.plot and "states" in self.args.plot:
             try:
                 import matplotlib.pyplot as plt
@@ -407,7 +434,6 @@ class Phlag:
                 
                 sns.set_theme(style="white")
                 fig, ax1 = plt.subplots(figsize=(12, 6))
-                ax2 = ax1.twinx()
                 
                 input_path = pathlib.Path(self.args.caster_scores)
                 sorted_positions = sorted(self.pos_to_caster.keys())
@@ -417,20 +443,28 @@ class Phlag:
                 
                 for idx in range(len(paths)):
                     path = paths[idx]
-                    likes = path_likelihoods[idx]
+                    plot_path_data = (1 - path) if flipped_for_eval else path
                     color = colors[idx]
                     line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
-                    
-                    # Plot states on left y-axis
-                    ax1.step(positions_kb, path, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
-                    
-                    # Plot Viterbi log-likelihood on right y-axis
-                    ax2.plot(positions_kb, likes, color=color, linestyle=line_style, linewidth=2.0, label=f"Likelihood {idx+1}")
+                    ax1.step(positions_kb, plot_path_data, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
                 
                 # Draw square wave for ground truth null/alt if available
+                pattern_str = None
                 pattern_str_match = re.search(r'((?:[an]\d+)+)', input_path.stem)
                 if pattern_str_match:
                     pattern_str = pattern_str_match.group(1)
+                else:
+                    pattern_file = input_path.parent / "pattern.txt"
+                    if pattern_file.exists():
+                        try:
+                            content = pattern_file.read_text().strip()
+                            p_match = re.search(r'((?:[an]\d+)+)', content)
+                            if p_match:
+                                pattern_str = p_match.group(1)
+                        except Exception:
+                            pass
+
+                if pattern_str:
                     blocks = re.findall(r'([an])(\d+)', pattern_str)
                     if blocks:
                         block_size_kb = 500.0  # 500Kb
@@ -442,7 +476,9 @@ class Phlag:
                             gt_x.extend([curr_pos_kb, curr_pos_kb + block_size_kb])
                             gt_y.extend([val, val])
                             curr_pos_kb += block_size_kb
-                        ax1.plot(gt_x, gt_y, color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+                        
+                        gt_y_np = np.array(gt_y)
+                        ax1.plot(gt_x, gt_y_np, color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
 
                 ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
@@ -450,22 +486,18 @@ class Phlag:
                 ax1.set_yticks([0, 1])
                 ax1.grid(True, axis='x', linestyle=':', alpha=0.5)
                 
-                ax2.set_ylabel("Viterbi Log Likelihood", fontsize=12, labelpad=10)
-                
-                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths & Log Likelihoods\nLocus: {input_path.stem}", fontsize=14, fontweight="bold", pad=15)
+                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths\nLocus: {input_path.stem}", fontsize=14, fontweight="bold", pad=15)
                 
                 lines1, labels1 = ax1.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", framealpha=0.9)
+                ax1.legend(lines1, labels1, loc="upper left", framealpha=0.9)
                 
                 fig.tight_layout()
                 
                 output_path = pathlib.Path(self.output_file)
-                dist_type = getattr(self.args, "emission_type", "gaussian")
-                plot_path = output_path.with_name(f"states_{dist_type}.png")
+                plot_path = output_path.with_name("states.png")
                 plt.savefig(plot_path, dpi=300)
                 plt.close()
-                print(f"Saved visual HMM states and log-likelihood plot to: {plot_path}")
+                print(f"Saved visual HMM states plot to: {plot_path}")
             except Exception as e:
                 print(f"Warning: Could not generate visual states plot: {e}")
 
@@ -791,18 +823,21 @@ class PhlagPlotter:
 
     def save_plot(self):
         """Saves generated plot as PNG."""
-        if self.phlag.args.output_file:
-            output_dir = pathlib.Path(self.phlag.args.output_file).parent
+        output_dir = getattr(self.phlag, "output_file", None)
+        if output_dir:
+            output_dir = output_dir.parent
         else:
-            output_dir = pathlib.Path.cwd() / "test" / self.input_path.stem
-            output_dir.mkdir(parents=True, exist_ok=True)
+            if self.phlag.args.output_file:
+                output_dir = pathlib.Path(self.phlag.args.output_file).parent
+            else:
+                output_dir = pathlib.Path.cwd() / "test" / self.input_path.stem
+                output_dir.mkdir(parents=True, exist_ok=True)
             
-        dist_type = getattr(self.phlag.args, "emission_type", "gaussian")
-        plot_file = output_dir / f"em_{dist_type}.png"
+        plot_file = output_dir / "em.png"
         
         plt.savefig(plot_file, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"Saved visual distributions plot to: {plot_file}")
+        print(f"Saved EM distributions plot to: {plot_file}")
 
 
 def int_or_abbrev(val_str):

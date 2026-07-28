@@ -127,6 +127,14 @@ def parse_arguments():
         action="store_true",
         help="Plot D* distribution (default: False)"
     )
+    parser.add_argument(
+        "-d",
+        "--dist-type",
+        dest="dist_type",
+        default="gaussian",
+        choices=["gaussian", "gmm"],
+        help="Distribution type for output directory structure (default: gaussian)"
+    )
     return parser.parse_args()
 
 def main():
@@ -160,13 +168,14 @@ def main():
         repo_map = repo_root / "mapping" / f"{stem}_mapping.tsv"
         default_map = args.fasta_file.parent / f"{stem}_mapping.tsv"
         
-        # 2. Check clade name extraction if stem contains clade substring
+        # 2. Check clade name extraction if full path contains clade substring
         clade_map = None
         mapping_dir = repo_root / "mapping"
         if mapping_dir.exists():
+            full_path_str = str(args.fasta_file.resolve())
             for mfile in mapping_dir.glob("*_mapping.tsv"):
                 clade = mfile.stem.replace("_mapping", "").split("_")[-1]
-                if clade and clade in stem:
+                if clade and clade in full_path_str:
                     clade_map = mfile
                     break
         
@@ -337,22 +346,39 @@ def main():
         for r in results:
             output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
                     
-        # 5. Write final TSV file to current directory
-        # Output filename should not have C, and includes left and right indices (formatted)
+        # 5. Write final TSV file to parsed directory structure
         clean_stem = args.fasta_file.stem
-        left_str = format_val(args.left)
-        right_str = format_val(args.right)
-        window_str = format_val(args.window_size)
-        step_str = format_val(args.step_size)
         
-        final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-        final_output_path = data_dir / "scores" / final_output_name
+        from .utils import parse_filename_to_dir_structure
+        parsed = parse_filename_to_dir_structure(clean_stem)
+        
+        if parsed:
+            rel_dir = parsed["relative_dir"]
+            final_output_path = data_dir / "phlag" / args.dist_type / rel_dir / "caster" / "scores.tsv"
+        else:
+            left_str = format_val(args.left)
+            right_str = format_val(args.right)
+            window_str = format_val(args.window_size)
+            step_str = format_val(args.step_size)
+            
+            parts = args.fasta_file.parts
+            is_sim = False
+            if "simulations" in parts and "concat" in parts:
+                sim_idx = parts.index("simulations")
+                if sim_idx + 1 < len(parts):
+                    sim_name = parts[sim_idx + 1]
+                    final_output_path = data_dir / "phlag" / args.dist_type / sim_name / f"w{window_str}_s{step_str}" / clean_stem / "caster" / "scores.tsv"
+                    is_sim = True
+            
+            if not is_sim:
+                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
+                final_output_path = data_dir / "scores" / final_output_name
+            
         os.makedirs(final_output_path.parent, exist_ok=True)
         
         with open(final_output_path, "w") as f:
             f.writelines(output_lines)
         print(f"Success: TSV output file generated at: {final_output_path}")
-        print(result.stdout)
         
         # Inline plotting support
         if args.plot:

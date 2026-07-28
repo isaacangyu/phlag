@@ -12,6 +12,34 @@ def count_lines(filepath):
         print(f"An error occurred: {e}")
         raise e
 
+def parse_filename_to_dir_structure(filename):
+    """
+    Parses a filename like 'null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k'
+    Returns a dict with 'null', 'alt', 'pattern', 'locus', 'window_step'.
+    """
+    import re
+    # Fallback structure
+    m = re.search(r'null-(.*?)_alt-(.*?)_((?:[an]\d+)+)_(\d+_\d+m)_(w\w+_s\w+)', filename)
+    if m:
+        return {
+            "null": m.group(1),
+            "alt": m.group(2),
+            "pattern": m.group(3),
+            "locus": m.group(4),
+            "window_step": m.group(5),
+            "relative_dir": f"{m.group(5)}/{m.group(3)}/{m.group(2)}"
+        }
+    # Attempt parsing without locus chunk
+    m2 = re.search(r'null-(.*?)_alt-(.*?)_((?:[an]\d+)+)_(w\w+_s\w+)', filename)
+    if m2:
+        return {
+            "null": m2.group(1),
+            "alt": m2.group(2),
+            "pattern": m2.group(3),
+            "window_step": m2.group(4),
+            "relative_dir": f"{m2.group(4)}/{m2.group(3)}/{m2.group(2)}"
+        }
+    return None
 
 def integer_pair(arg_str):
     try:
@@ -103,12 +131,12 @@ def get_repo_root():
 
 def get_data_dir():
     """
-    Resolves the data directory to use. Looks up the PHLAG_DIR or INPUT_DIR environment variable
+    Resolves the data directory to use. Looks up the PHLAG_DIR or LARGE_DIR environment variable
     or reads it from a .env file. Defaults to repo_root / "caster" / "data" if not found.
     """
     import os
     import pathlib
-    target_dir = os.environ.get("PHLAG_DIR") or os.environ.get("INPUT_DIR")
+    target_dir = os.environ.get("PHLAG_DIR") or os.environ.get("LARGE_DIR")
     if not target_dir:
         repo_root = get_repo_root()
         # Search for .env file at repo root or cwd
@@ -122,7 +150,7 @@ def get_data_dir():
                             if line and not line.startswith("#") and "=" in line:
                                 key, val = line.split("=", 1)
                                 key_str = key.strip()
-                                if key_str in ("PHLAG_DIR", "INPUT_DIR"):
+                                if key_str in ("PHLAG_DIR", "LARGE_DIR"):
                                     target_dir = val.strip().strip("'").strip('"')
                                     break
                 except Exception:
@@ -266,6 +294,15 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
             sp = base / s
             if sp.exists():
                 search_dirs.append(sp)
+
+    # Add simulations/*/concat from data_dir (LARGE_DIR)
+    if data_dir and data_dir.exists():
+        try:
+            for concat_dir in data_dir.glob("simulations/*/concat"):
+                if concat_dir.is_dir():
+                    search_dirs.append(concat_dir)
+        except Exception:
+            pass
 
     seen_dirs = set()
     newest_file = None

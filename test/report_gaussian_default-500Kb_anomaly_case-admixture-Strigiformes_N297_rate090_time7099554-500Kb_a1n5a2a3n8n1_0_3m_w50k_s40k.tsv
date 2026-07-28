@@ -1,8 +1,0 @@
-# /home/iang/.local/share/mamba/envs/phlag/bin/phlag caster/data/scores/default-500Kb_anomaly_case-admixture-Strigiformes_N297_rate090_time7099554-500Kb_a1n5a2a3n8n1_0_3m_w50k_s40k.tsv
-# State divergence: 145184.5
-# Outer EM iterations: 5
-# Inner EM iterations: 50
-# ILR transform: False
-# Performance Metrics (Path 1 vs Pattern Indices Ground Truth): TPR: 1.0000, FPR: 0.4032, F1: 0.5098 (TP=13, FP=25, FN=0, TN=37)
-# Path 1 final joint log-likelihood: -2564.401120
-0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1

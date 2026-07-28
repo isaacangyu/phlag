@@ -30,6 +30,8 @@ dependencies = [
     "scipy==1.13.1",
     "tensorflow-probability==0.25.0",
     "tqdm==4.66.5",
+    "matplotlib==3.9.4",
+    "seaborn==0.13.2"
 ]
 
 [project.urls]

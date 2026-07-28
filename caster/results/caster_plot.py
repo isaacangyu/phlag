@@ -236,9 +236,9 @@ class CasterPlotter:
                     topo_names.append(col.replace('avg*', '').replace('c*', ''))
             suffix = "_".join(topo_names)
 
-        output_dir = os.path.dirname(os.path.abspath(__file__))
-        suffix_norm = "_n" if self.is_normalized_file else ""
-        save_path_top = os.path.join(output_dir, f'{self.distribution}_{suffix}_{self.gene_name}{suffix_norm}.png')
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_top = os.path.join(output_dir, 'dist.png')
         plt.savefig(save_path_top, dpi=300, bbox_inches='tight')
         print(f"Saved empirical topology distribution chart to: {save_path_top}")
         plt.close()
@@ -297,10 +297,9 @@ class CasterPlotter:
             
         plt.tight_layout()
         
-        # Saved explicitly to caster/results with _n suffix if normalized
-        output_dir = os.path.dirname(os.path.abspath(__file__))
-        suffix_norm = "_n" if self.is_normalized_file else ""
-        save_path_dstar = os.path.join(output_dir, f'distributions_dstar_{self.gene_name}{suffix_norm}.png')
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_dstar = os.path.join(output_dir, 'dstar.png')
         plt.savefig(save_path_dstar, dpi=300)
         print(f"Saved empirical D* distribution chart to: {save_path_dstar}")
         plt.close()
@@ -376,10 +375,9 @@ class CasterPlotter:
         plt.legend(loc='upper right', framealpha=0.9)
         plt.tight_layout()
         
-        # Save output to caster/results with _n suffix if normalized
-        output_dir = os.path.dirname(os.path.abspath(__file__))
-        suffix_norm = "_n" if self.is_normalized_file else ""
-        save_path_scatter = os.path.join(output_dir, f'scores_{self.gene_name}{suffix_norm}.png')
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_scatter = os.path.join(output_dir, 'scatter.png')
         plt.savefig(save_path_scatter, dpi=300)
         print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
         plt.show()
