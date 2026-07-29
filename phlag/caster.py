@@ -152,47 +152,46 @@ def main():
     if args.recent or args.fasta_file == pathlib.Path("-r") or args.fasta_file is None:
         recent_fasta = get_most_recent_file(
             default_subdirs=["store/msa/concat", "msa/concat", "concat", "store/msa", "msa"],
-            default_exts=[".fa", ".fasta", ".fa.gz"]
+            default_exts=[".fa", ".fasta", ".fa.gz"],
+            target_dir_name="concat"
         )
         if recent_fasta is None or not recent_fasta.exists():
             sys.exit("Error: No FASTA file found in store/msa/concat or candidate MSA directories.")
         print(f"Using most recent FASTA file: {recent_fasta}")
         args.fasta_file = recent_fasta
     else:
-        args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat"], default_exts=[".fa", ".fasta", ".fa.gz"])
+        args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat", "simulations"], default_exts=[".fa", ".fasta", ".fa.gz"])
                 
     if args.mapping is None:
-        # Auto-detect mapping file in repo root mapping directory or fasta_file parent
+        # Auto-detect mapping file in fasta_file parent
         stem = args.fasta_file.stem
-        # 1. Exact match
-        repo_map = repo_root / "mapping" / f"{stem}_mapping.tsv"
         default_map = args.fasta_file.parent / f"{stem}_mapping.tsv"
         
-        # 2. Check clade name extraction if full path contains clade substring
-        clade_map = None
-        mapping_dir = repo_root / "mapping"
-        if mapping_dir.exists():
-            full_path_str = str(args.fasta_file.resolve())
-            for mfile in mapping_dir.glob("*_mapping.tsv"):
-                clade = mfile.stem.replace("_mapping", "").split("_")[-1]
-                if clade and clade in full_path_str:
-                    clade_map = mfile
-                    break
-        
-        if repo_map.exists():
-            args.mapping = repo_map
-        elif default_map.exists():
+        if default_map.exists():
             args.mapping = default_map
-        elif clade_map and clade_map.exists():
-            args.mapping = clade_map
         else:
-            sys.exit(f"Error: No mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
+            # Fallback 1: check if parent directory has a neoaves_*_mapping.tsv file
+            neo_maps = list(args.fasta_file.parent.glob("neoaves_*_mapping.tsv"))
+            if not neo_maps:
+                # Fallback 2: check upper directory or simulations root pattern large_dir/simulations/<filename>/neoaves_<node>_mapping.tsv
+                neo_maps = list(args.fasta_file.parent.parent.glob("neoaves_*_mapping.tsv"))
+            if neo_maps:
+                args.mapping = neo_maps[0]
+            else:
+                # Fallback 3: try resolve_input_file
+                resolved = resolve_input_file(f"neoaves_{stem}_mapping.tsv", default_subdirs=["mapping", "simulations"], default_exts=[".tsv"])
+                if resolved and resolved.exists():
+                    args.mapping = resolved
+                else:
+                    sys.exit(f"Error: No mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
     else:
         # Resolve Mapping file fallback if not found
         args.mapping = resolve_input_file(args.mapping, default_subdirs=["mapping"], default_exts=[".tsv", "_mapping.tsv", ".txt"])
 
     if not args.mapping or not args.mapping.exists():
         sys.exit(f"Error: No valid mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
+        
+    print(f"Using mapping file: {args.mapping}")
     
     # 1. Validation
     if not args.fasta_file.exists():
@@ -367,7 +366,7 @@ def main():
                 sim_idx = parts.index("simulations")
                 if sim_idx + 1 < len(parts):
                     sim_name = parts[sim_idx + 1]
-                    final_output_path = data_dir / "phlag" / args.dist_type / sim_name / f"w{window_str}_s{step_str}" / clean_stem / "caster" / "scores.tsv"
+                    final_output_path = data_dir / "phlag" / args.dist_type / f"w{window_str}_s{step_str}" / sim_name / clean_stem / "caster" / "scores.tsv"
                     is_sim = True
             
             if not is_sim:

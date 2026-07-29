@@ -679,7 +679,7 @@ class PhlagHMM(HMM):
         initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]] = 1.1,
         transition_concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
         occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
-        emission_type: str = "gaussian",
+        model_design: str = "gaussian",
         **kwargs,
     ):
         self.num_states = num_states
@@ -705,13 +705,13 @@ class PhlagHMM(HMM):
         self.transition_component = PhlagHMMTransitions(
             num_states=self.num_states, concentration=self.transition_concentration
         )
-        if emission_type == "beta":
+        if model_design == "beta":
             self.emission_component = PhlagBetaHMMEmissions(
                 self.num_states,
                 self.emission_dim,
                 parameterization=self.emission_parameterization,
             )
-        elif emission_type == "gmm":
+        elif model_design == "gmm":
             num_mixtures = kwargs.get("num_mixtures", 2)
             self.emission_component = PhlagGMMHMMEmissions(
                 self.num_states,

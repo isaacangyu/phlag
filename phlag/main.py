@@ -36,7 +36,7 @@ class Phlag:
         if not hasattr(self.args, "step_size"):
             self.args.step_size = None
 
-        # Auto-extract emission_type from filename if not explicitly passed
+        # Auto-extract model_design from filename if not explicitly passed
         self.extract_distribution_type_from_filename()
 
         self.validate_parameters()
@@ -45,13 +45,13 @@ class Phlag:
         self.read_caster_scores(self.args.caster_scores)
         
         self.compute_emissions()
-        if getattr(self.args, "emission_type", "gaussian") == "gmm":
+        if getattr(self.args, "model_design", "gaussian") == "gmm":
             self.determine_optimal_mixtures()
         self.initialize_hmm()
         self.initialize_output()
 
     def extract_distribution_type_from_filename(self):
-        # Check if the user specified emission_type explicitly on CLI
+        # Check if the user specified model_design explicitly on CLI
         T_supplied = any(arg.startswith("-d") or arg.startswith("--emission-type") for arg in sys.argv)
         if not T_supplied:
             # Check input filename (caster_scores) and output filename
@@ -64,13 +64,13 @@ class Phlag:
             for fname in filenames_to_check:
                 fname_lower = os.path.basename(fname).lower()
                 if "beta" in fname_lower:
-                    self.args.emission_type = "beta"
+                    self.args.model_design = "beta"
                     break
                 elif "gmm" in fname_lower:
-                    self.args.emission_type = "gmm"
+                    self.args.model_design = "gmm"
                     break
                 elif "gaussian" in fname_lower:
-                    self.args.emission_type = "gaussian"
+                    self.args.model_design = "gaussian"
                     break
 
     def validate_parameters(self):
@@ -137,11 +137,30 @@ class Phlag:
         sorted_positions = sorted(self.pos_to_caster.keys())
         raw_caster_matrix = jnp.stack([self.pos_to_caster[pos] for pos in sorted_positions], axis=0)
 
-        if getattr(self.args, "emission_type", "gaussian") == "beta":
+        if getattr(self.args, "model_design", "gaussian") == "beta":
             raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
             self.Y = raw_clipped / raw_clipped.sum(axis=-1, keepdims=True)
         else:
             self.Y = raw_caster_matrix
+
+    def get_default_out_dir(self):
+        input_path = pathlib.Path(self.args.caster_scores)
+        dist_type = getattr(self.args, "model_design", "gaussian")
+        from .utils import parse_filename_to_dir_structure, get_repo_root
+        parsed = parse_filename_to_dir_structure(input_path.stem)
+        repo_root = get_repo_root()
+        
+        if parsed:
+            rel_dir = parsed["relative_dir"]
+            out_dir = repo_root / "large_dir" / "phlag" / dist_type / rel_dir / "phlag"
+        else:
+            if input_path.parent.name == "caster":
+                # Assuming input is like .../<name>/caster/scores.tsv
+                name = input_path.parent.parent.name
+                out_dir = repo_root / "large_dir" / "phlag" / dist_type / name / "phlag"
+            else:
+                out_dir = repo_root / "large_dir" / "phlag" / dist_type / input_path.stem / "phlag"
+        return out_dir
 
     def determine_optimal_mixtures(self):
         import sys
@@ -153,9 +172,11 @@ class Phlag:
             
         import caster_plot
         
-        output_dir = pathlib.Path.cwd() / "test" / pathlib.Path(self.args.caster_scores).stem
         if self.args.output_file:
             output_dir = pathlib.Path(self.args.output_file).parent
+        else:
+            output_dir = self.get_default_out_dir()
+            
         output_dir.mkdir(parents=True, exist_ok=True)
             
         num_mixtures_matrix = caster_plot.determine_optimal_mixtures(
@@ -178,23 +199,11 @@ class Phlag:
         print(f"\nFinal configuration: num_mixtures = {self.num_mixtures}, mixture_masks = \n{self.mixture_masks}\n")
 
     def initialize_output(self):
-        input_path = pathlib.Path(self.args.caster_scores)
         if getattr(self.args, "output_file", None):
             self.output_file = pathlib.Path(self.args.output_file)
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
         else:
-            dist_type = getattr(self.args, "emission_type", "gaussian")
-            from .utils import parse_filename_to_dir_structure, get_data_dir
-            parsed = parse_filename_to_dir_structure(input_path.stem)
-            
-            if parsed:
-                rel_dir = parsed["relative_dir"]
-                data_dir = get_data_dir()
-                out_dir = data_dir / "phlag" / dist_type / rel_dir / "phlag"
-            else:
-                data_dir = get_data_dir()
-                out_dir = data_dir / "phlag" / input_path.stem
-            
+            out_dir = self.get_default_out_dir()
             out_dir.mkdir(parents=True, exist_ok=True)
             self.output_file = out_dir / "report.tsv"
             
@@ -561,10 +570,10 @@ class Phlag:
             initial_probs_concentration=self.nu,
             transition_concentration=self.psi,
             occupancy_bias=self.occupancy_bias,
-            emission_type=self.args.emission_type,
+            model_design=self.args.model_design,
             num_mixtures=getattr(self, "num_mixtures", 2),
         )
-        if self.args.emission_type == "gmm":
+        if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
         
         # Compute empirical moments from CASTER data over genomic positions
@@ -574,7 +583,7 @@ class Phlag:
         # Implement symmetry breaking: Anchor state 0 to the baseline mean,
         # and seed state 1 slightly further along the alternative dimensions.
         # Initialize emissions using mean and variance for each state.
-        if self.args.emission_type == "beta":
+        if self.args.model_design == "beta":
             state1_mean = jnp.clip(data_mean + data_std, a_min=1e-4, a_max=0.95)
             state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
             state1_init = jnp.stack([state1_mean, data_std ** 2], axis=-1)
@@ -592,10 +601,10 @@ class Phlag:
         )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
-        if self.args.emission_type == "beta":
+        if self.args.model_design == "beta":
             self.props.emissions.concentration1.trainable = True
             self.props.emissions.concentration0.trainable = True
-        elif self.args.emission_type == "gmm":
+        elif self.args.model_design == "gmm":
             self.props.emissions.mixture_weights.trainable = True
             self.props.emissions.means.trainable = True
             self.props.emissions.stds.trainable = True
@@ -693,7 +702,7 @@ class PhlagPlotter:
         for d in range(self.emission_dim):
             ymin, ymax = float(np.min(self.phlag.Y[:, d])), float(np.max(self.phlag.Y[:, d]))
             ypad = (ymax - ymin) * 0.20 or 0.1
-            if self.phlag.args.emission_type == "beta":
+            if self.phlag.args.model_design == "beta":
                 ranges[d] = np.linspace(max(1e-5, ymin - ypad), min(1.0 - 1e-5, ymax + ypad), 300)
             else:
                 ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
@@ -740,13 +749,13 @@ class PhlagPlotter:
             for state in [0, 1]:
                 color_config = self.colors[state]
                 
-                if self.phlag.args.emission_type == "beta":
+                if self.phlag.args.model_design == "beta":
                     alpha = float(params.emissions.concentration1[state, d])
                     beta = float(params.emissions.concentration0[state, d])
                     pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
                     mu = alpha / (alpha + beta)
                     sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
-                elif self.phlag.args.emission_type == "gmm":
+                elif self.phlag.args.model_design == "gmm":
                     w = np.array(params.emissions.mixture_weights[state, d])
                     m_means = np.array(params.emissions.means[state, d])
                     m_stds = np.array(params.emissions.stds[state, d])
@@ -865,7 +874,7 @@ def parse_arguments():
         "--recent",
         dest="recent",
         action="store_true",
-        help="Use the most recently created score file in store/scores"
+        help="Use the most recently created score file in model parameter directories"
     )
 
     parser.add_argument(
@@ -914,7 +923,7 @@ def parse_arguments():
     )
     hmm_group.add_argument(
         "-d",
-        dest="emission_type",
+        dest="model_design",
         type=str.lower,
         default="gaussian",
         choices=["gaussian", "beta", "gmm"],
@@ -947,19 +956,64 @@ def parse_arguments():
 
     args = parser.parse_args()
 
-    from .utils import resolve_input_file, get_most_recent_file
+    from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
+    repo_root = get_repo_root()
+    data_dir = get_data_dir()
+
+    dist_type = getattr(args, "model_design", "gaussian")
+
+    def resolve_model_scores(target_name=None):
+        search_bases = [
+            data_dir / "phlag" / dist_type,
+        ]
+        candidates = []
+        for b in search_bases:
+            if not b.exists():
+                continue
+            if target_name:
+                # Look for target_name subdirectory
+                target_dirs = list(b.glob(f"**/{target_name}/**/caster")) + list(b.glob(f"**/{target_name}"))
+                for td in target_dirs:
+                    if td.is_dir():
+                        for sfile in td.rglob("scores.tsv"):
+                            if sfile.parent.name == "caster":
+                                candidates.append(sfile)
+                        for sfile in td.rglob("*.tsv"):
+                            if sfile.parent.name == "caster" and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                                candidates.append(sfile)
+            else:
+                for sfile in b.rglob("scores.tsv"):
+                    if sfile.parent.name == "caster":
+                        candidates.append(sfile)
+        if candidates:
+            candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            return candidates[0].resolve()
+        return None
+
     if args.recent or args.caster_scores == pathlib.Path("-r") or args.caster_scores is None:
-        recent_file = get_most_recent_file(
-            default_subdirs=["store/scores", "scores"],
-            default_exts=[".tsv", ".txt"],
-            exclude_prefixes=["report_", "gaussian_", "scores_", "em_", "walkthrough", "implementation_plan"]
-        )
+        recent_file = resolve_model_scores()
+        if recent_file is None:
+            recent_file = get_most_recent_file(
+                default_subdirs=["store/phlag", "phlag"],
+                default_exts=[".tsv", ".txt"],
+                exclude_prefixes=["report_", "em_", "walkthrough", "implementation_plan"],
+                target_dir_name="caster"
+            )
         if recent_file is None or not recent_file.exists():
-            sys.exit("Error: No score file found in store/scores or candidate data directories.")
+            sys.exit("Error: No score file found in store/phlag or candidate data directories.")
         print(f"Using most recent score file: {recent_file}")
         args.caster_scores = recent_file
     else:
-        args.caster_scores = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa"], default_exts=[".tsv", ".txt"])
+        # Check model params directory under dist_type first (e.g. gaussian/<name>/.../caster/scores.tsv)
+        model_scores = resolve_model_scores(target_name=args.caster_scores.name)
+        if model_scores and model_scores.exists():
+            args.caster_scores = model_scores
+        else:
+            resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
+            if resolved.exists() and resolved.is_file():
+                args.caster_scores = resolved
+            else:
+                sys.exit(f"Error: Score file not found for '{args.caster_scores.name}' under model output directories or relative paths.")
 
     # Check if --plot is supplied
     plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in sys.argv)

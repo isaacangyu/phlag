@@ -27,7 +27,7 @@ def parse_filename_to_dir_structure(filename):
             "pattern": m.group(3),
             "locus": m.group(4),
             "window_step": m.group(5),
-            "relative_dir": f"{m.group(5)}/{m.group(3)}/{m.group(2)}"
+            "relative_dir": f"{m.group(5)}/{m.group(2)}/{m.group(3)}"
         }
     # Attempt parsing without locus chunk
     m2 = re.search(r'null-(.*?)_alt-(.*?)_((?:[an]\d+)+)_(w\w+_s\w+)', filename)
@@ -37,7 +37,7 @@ def parse_filename_to_dir_structure(filename):
             "alt": m2.group(2),
             "pattern": m2.group(3),
             "window_step": m2.group(4),
-            "relative_dir": f"{m2.group(4)}/{m2.group(3)}/{m2.group(2)}"
+            "relative_dir": f"{m2.group(4)}/{m2.group(2)}/{m2.group(3)}"
         }
     return None
 
@@ -223,6 +223,8 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
         pathlib.Path.cwd(),
         data_dir,
         repo_root,
+        repo_root / "large_dir",
+        repo_root / "large_dir" / "simulations",
         repo_root / "store",
         repo_root / "test",
         pathlib.Path.cwd() / "test",
@@ -237,6 +239,12 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
                 sub_path = base / s
                 if sub_path.exists():
                     search_dirs.append(sub_path)
+            try:
+                for sim_sub in base.glob("simulations/*/concat"):
+                    if sim_sub.is_dir():
+                        search_dirs.append(sim_sub)
+            except Exception:
+                pass
 
     # Deduplicate search_dirs
     seen_dirs = set()
@@ -254,24 +262,49 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
         cand_name = cand.name
         for sdir in unique_dirs:
             check_path = sdir / cand_name
-            if check_path.exists():
+            if check_path.exists() and check_path.is_file():
                 return check_path.resolve()
 
-    # 4. Fuzzy match by stem in search directories
-    stem = path_obj.stem
-    for sdir in unique_dirs:
-        if sdir.exists():
-            try:
-                for f in sdir.iterdir():
-                    if f.is_file() and f.stem == stem:
-                        return f.resolve()
-            except Exception:
-                pass
+    # 5. Directory resolution: Check for concat subfolder under directory candidates
+    clean_name = path_obj.name
+    if clean_name.startswith("alt-"):
+        clean_name = clean_name[4:]
+    parts = clean_name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        clean_name = parts[0]
+
+    dir_candidates = [
+        path_obj,
+        repo_root / "large_dir" / "simulations" / clean_name,
+        data_dir / "simulations" / clean_name,
+        data_dir / clean_name,
+        repo_root / "simulations" / clean_name,
+        pathlib.Path("/drive2/iang/simulations") / clean_name,
+        repo_root / "large_dir" / "simulations" / path_obj.name,
+        data_dir / "simulations" / path_obj.name,
+        data_dir / path_obj.name,
+        repo_root / "simulations" / path_obj.name,
+        pathlib.Path("/drive2/iang/simulations") / path_obj.name,
+    ]
+    for dcand in dir_candidates:
+        if dcand.exists() and dcand.is_dir():
+            concat_dir = dcand / "concat"
+            target_dirs = [concat_dir] if (concat_dir.exists() and concat_dir.is_dir()) else [dcand]
+            for tdir in target_dirs:
+                if tdir.name == "simulated" or tdir.parent.name == "simulated":
+                    continue
+                files = list(tdir.glob("*.fa")) + list(tdir.glob("*.fasta")) + list(tdir.glob("*.fa.gz"))
+                # Exclude any files under a simulated subfolder
+                files = [f for f in files if "simulated" not in f.parts]
+                if files:
+                    # Pull most recent FASTA file in concat/ or directory
+                    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                    return files[0].resolve()
 
     return path_obj
 
 
-def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefixes=None):
+def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefixes=None, target_dir_name=None):
     """
     Finds the most recently created or modified file in store/scores, store/msa/concat,
     or specified subdirectories, ignoring report output files.
@@ -289,20 +322,36 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
         default_subdirs = ["store/scores", "scores", "store/msa/concat", "msa/concat"]
 
     search_dirs = []
+    bases_to_search = [repo_root, pathlib.Path.cwd(), data_dir, pathlib.Path("/drive2/iang")]
+
+    if target_dir_name:
+        for base in bases_to_search:
+            if base.exists():
+                try:
+                    for d in base.rglob(target_dir_name):
+                        if d.is_dir():
+                            search_dirs.append(d)
+                except Exception:
+                    pass
+    
     for s in default_subdirs:
-        for base in [repo_root, pathlib.Path.cwd(), data_dir, pathlib.Path("/drive2/iang")]:
+        for base in bases_to_search:
             sp = base / s
             if sp.exists():
                 search_dirs.append(sp)
 
-    # Add simulations/*/concat from data_dir (LARGE_DIR)
-    if data_dir and data_dir.exists():
-        try:
-            for concat_dir in data_dir.glob("simulations/*/concat"):
-                if concat_dir.is_dir():
-                    search_dirs.append(concat_dir)
-        except Exception:
-            pass
+    # Also search recursively in model output directories (store/phlag, phlag, data_dir) for scores files
+    for base in [repo_root / "store" / "phlag", repo_root / "phlag", data_dir / "phlag", data_dir]:
+        if base.exists():
+            try:
+                for score_file in base.rglob("scores.tsv"):
+                    if score_file.is_file():
+                        search_dirs.append(score_file.parent)
+                for score_file in base.rglob("*.tsv"):
+                    if score_file.is_file() and not any(score_file.name.startswith(p) for p in exclude_prefixes):
+                        search_dirs.append(score_file.parent)
+            except Exception:
+                pass
 
     seen_dirs = set()
     newest_file = None
@@ -311,6 +360,8 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
     for d in search_dirs:
         try:
             resolved_d = d.resolve()
+            if target_dir_name and resolved_d.name != target_dir_name:
+                continue
             if resolved_d in seen_dirs:
                 continue
             seen_dirs.add(resolved_d)
