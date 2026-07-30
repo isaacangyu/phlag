@@ -412,7 +412,7 @@ def read_caster_scores(path):
                 continue
     return pos_to_caster
 
-def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir):
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, cluster_topologies=False):
     NUM_STATES = 2
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -426,9 +426,17 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
     
     topology_names = ["ABBA", "BABA", "AABB"] if Y.shape[-1] == 3 else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
     
-    for d in range(Y.shape[-1]):
-        y_d = np.array(Y[:, [d]])
-        topo_name = topology_names[d]
+    dims_to_iterate = [None] if cluster_topologies else list(range(Y.shape[-1]))
+    
+    for d in dims_to_iterate:
+        if d is None:
+            y_d = Y
+            topo_name = "All_Topologies"
+            y_plot = np.linalg.norm(Y, axis=1)
+        else:
+            y_d = np.array(Y[:, [d]])
+            topo_name = topology_names[d]
+            y_plot = y_d.ravel()
         
         k_values = list(range(2, 11))
         scores = {}
@@ -463,10 +471,15 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
             labels_2 = kmeans_2.fit_predict(y_d)
             
-            # Assign cluster labels to Null vs Alternative based on mean topology score
-            mean_c0 = np.mean(y_d[labels_2 == 0])
-            mean_c1 = np.mean(y_d[labels_2 == 1])
-            if mean_c0 < mean_c1:
+            # Assign cluster labels to Null vs Alternative based on distance from global mean
+            global_mean = np.mean(y_d, axis=0)
+            mean_c0 = np.mean(y_d[labels_2 == 0], axis=0)
+            mean_c1 = np.mean(y_d[labels_2 == 1], axis=0)
+            
+            dist_c0 = np.linalg.norm(mean_c0 - global_mean)
+            dist_c1 = np.linalg.norm(mean_c1 - global_mean)
+            
+            if dist_c0 < dist_c1:
                 null_lbl, alt_lbl = 0, 1
             else:
                 null_lbl, alt_lbl = 1, 0
@@ -482,7 +495,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             # Save global 2-means plot (kmeans_2_{topo_name}.png)
             plt.figure(figsize=(10, 5))
             sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
             plt.title(f"{topo_name} | Global 2-means Partitioning (0=Null, 1=Alternative)", fontsize=12, fontweight='bold')
             plt.xlabel("Position (kb)", fontsize=10)
             plt.ylabel("Normalized score", fontsize=10)
@@ -507,14 +520,14 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                     continue
                     
                 if kn == 1:
-                    w_n = float(np.sum((y_sub_N - np.mean(y_sub_N)) ** 2))
+                    w_n = float(np.sum((y_sub_N - np.mean(y_sub_N, axis=0)) ** 2))
                 else:
                     km_n = KMeans(n_clusters=kn, random_state=42, n_init="auto")
                     km_n.fit(y_sub_N)
                     w_n = float(km_n.inertia_)
                     
                 if ka == 1:
-                    w_a = float(np.sum((y_sub_A - np.mean(y_sub_A)) ** 2))
+                    w_a = float(np.sum((y_sub_A - np.mean(y_sub_A, axis=0)) ** 2))
                 else:
                     km_a = KMeans(n_clusters=ka, random_state=42, n_init="auto")
                     km_a.fit(y_sub_A)
@@ -532,8 +545,12 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 
             print(f"Optimal split: Null count = {best_kn}, Alternative count = {best_ka} (Inertia: {min_inertia:.6f})")
             
-            num_mixtures_matrix[0, d] = best_kn
-            num_mixtures_matrix[1, d] = best_ka
+            if d is None:
+                num_mixtures_matrix[0, :] = best_kn
+                num_mixtures_matrix[1, :] = best_ka
+            else:
+                num_mixtures_matrix[0, d] = best_kn
+                num_mixtures_matrix[1, d] = best_ka
             
             # Save Null sub-cluster plot if kn >= 1
             if best_kn >= 1:
@@ -545,7 +562,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 
                 plt.figure(figsize=(10, 5))
                 sns.set_theme(style="whitegrid")
-                sns.scatterplot(x=pos_sub_N, y=y_sub_N.ravel(), hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                sns.scatterplot(x=pos_sub_N, y=y_plot[labels_2 == null_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
                 plt.title(f"{topo_name} | Null Sub-cluster {best_kn}-means Clustering", fontsize=12, fontweight='bold')
                 plt.xlabel("Position (kb)", fontsize=10)
                 plt.ylabel("Normalized score", fontsize=10)
@@ -565,7 +582,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 
                 plt.figure(figsize=(10, 5))
                 sns.set_theme(style="whitegrid")
-                sns.scatterplot(x=pos_sub_A, y=y_sub_A.ravel(), hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                sns.scatterplot(x=pos_sub_A, y=y_plot[labels_2 == alt_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
                 plt.title(f"{topo_name} | Alternative Sub-cluster {best_ka}-means Clustering", fontsize=12, fontweight='bold')
                 plt.xlabel("Position (kb)", fontsize=10)
                 plt.ylabel("Normalized score", fontsize=10)
@@ -578,7 +595,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             # Save combined optimal plot (kmeans_kstar_{topo_name}.png)
             plt.figure(figsize=(10, 5))
             sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
             plt.title(f"{topo_name} | Optimal GMM Mixture Partitions (Null count={best_kn}, Alt count={best_ka})", fontsize=11, fontweight='bold')
             plt.xlabel("Position (kb)", fontsize=10)
             plt.ylabel("Normalized score", fontsize=10)
@@ -591,8 +608,12 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
         else:
             m_val = max(1, int(round(k_opt / 2.0)))
             print(f"s_2 ({s_2:.4f}) <= threshold ({silhouette_threshold:.4f}) -> Use k*/2 = {m_val} mixtures for both states.")
-            num_mixtures_matrix[0, d] = m_val
-            num_mixtures_matrix[1, d] = m_val
+            if d is None:
+                num_mixtures_matrix[0, :] = m_val
+                num_mixtures_matrix[1, :] = m_val
+            else:
+                num_mixtures_matrix[0, d] = m_val
+                num_mixtures_matrix[1, d] = m_val
             
             # Save ONLY 2-means plot, NOT kmeans_kstar plot!
             kmeans_plot = KMeans(n_clusters=2, random_state=42, n_init="auto")
@@ -600,7 +621,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             
             plt.figure(figsize=(10, 5))
             sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_d.ravel(), hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
+            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
             plt.title(f"{topo_name} | 2-means Clustering", fontsize=12, fontweight='bold')
             plt.xlabel("Position (kb)", fontsize=10)
             plt.ylabel("Normalized score", fontsize=10)

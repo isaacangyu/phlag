@@ -131,12 +131,12 @@ def get_repo_root():
 
 def get_data_dir():
     """
-    Resolves the data directory to use. Looks up the PHLAG_DIR or LARGE_DIR environment variable
+    Resolves the data directory to use. Looks up the CONNECTION_DIR, PHLAG_DIR or LARGE_DIR environment variable
     or reads it from a .env file. Defaults to repo_root / "caster" / "data" if not found.
     """
     import os
     import pathlib
-    target_dir = os.environ.get("PHLAG_DIR") or os.environ.get("LARGE_DIR")
+    target_dir = os.environ.get("CONNECTION_DIR") or os.environ.get("PHLAG_DIR") or os.environ.get("LARGE_DIR")
     if not target_dir:
         repo_root = get_repo_root()
         # Search for .env file at repo root or cwd
@@ -150,7 +150,7 @@ def get_data_dir():
                             if line and not line.startswith("#") and "=" in line:
                                 key, val = line.split("=", 1)
                                 key_str = key.strip()
-                                if key_str in ("PHLAG_DIR", "LARGE_DIR"):
+                                if key_str in ("CONNECTION_DIR", "PHLAG_DIR", "LARGE_DIR"):
                                     target_dir = val.strip().strip("'").strip('"')
                                     break
                 except Exception:
@@ -166,7 +166,7 @@ def get_data_dir():
 
 def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
     """
-    Resolves an input path that may be a full path, relative path, filename with extension,
+    Resolves a file path input that might be relative, absolute,
     or base filename without path or extension.
     """
     import os
@@ -223,8 +223,8 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
         pathlib.Path.cwd(),
         data_dir,
         repo_root,
-        repo_root / "large_dir",
-        repo_root / "large_dir" / "simulations",
+        repo_root / "connection_dir",
+        repo_root / "connection_dir" / "simulations",
         repo_root / "store",
         repo_root / "test",
         pathlib.Path.cwd() / "test",
@@ -275,12 +275,12 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
 
     dir_candidates = [
         path_obj,
-        repo_root / "large_dir" / "simulations" / clean_name,
+        repo_root / "connection_dir" / "simulations" / clean_name,
         data_dir / "simulations" / clean_name,
         data_dir / clean_name,
         repo_root / "simulations" / clean_name,
         pathlib.Path("/drive2/iang/simulations") / clean_name,
-        repo_root / "large_dir" / "simulations" / path_obj.name,
+        repo_root / "connection_dir" / "simulations" / path_obj.name,
         data_dir / "simulations" / path_obj.name,
         data_dir / path_obj.name,
         repo_root / "simulations" / path_obj.name,

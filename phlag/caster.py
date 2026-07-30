@@ -173,7 +173,7 @@ def main():
             # Fallback 1: check if parent directory has a neoaves_*_mapping.tsv file
             neo_maps = list(args.fasta_file.parent.glob("neoaves_*_mapping.tsv"))
             if not neo_maps:
-                # Fallback 2: check upper directory or simulations root pattern large_dir/simulations/<filename>/neoaves_<node>_mapping.tsv
+                # Fallback 2: check upper directory or simulations root pattern connection_dir/simulations/<filename>/neoaves_<node>_mapping.tsv
                 neo_maps = list(args.fasta_file.parent.parent.glob("neoaves_*_mapping.tsv"))
             if neo_maps:
                 args.mapping = neo_maps[0]

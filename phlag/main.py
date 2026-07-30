@@ -146,20 +146,41 @@ class Phlag:
     def get_default_out_dir(self):
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
-        from .utils import parse_filename_to_dir_structure, get_repo_root
+        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir
         parsed = parse_filename_to_dir_structure(input_path.stem)
-        repo_root = get_repo_root()
+        
+        conn_env = os.environ.get("CONNECTION_DIR")
+        if conn_env:
+            base_dir = pathlib.Path(conn_env)
+        else:
+            base_dir = get_data_dir()
+            if base_dir == get_repo_root() / "caster" / "data":
+                base_dir = get_repo_root() / "connection_dir"
         
         if parsed:
             rel_dir = parsed["relative_dir"]
-            out_dir = repo_root / "large_dir" / "phlag" / dist_type / rel_dir / "phlag"
+            out_dir = base_dir / "phlag" / dist_type / rel_dir / "phlag"
         else:
             if input_path.parent.name == "caster":
-                # Assuming input is like .../<name>/caster/scores.tsv
-                name = input_path.parent.parent.name
-                out_dir = repo_root / "large_dir" / "phlag" / dist_type / name / "phlag"
+                # Find path relative to model design or phlag root if input is in a caster subfolder
+                # e.g., .../phlag/gaussian/w50k_s1k/Nyctibiidae_10X_up/n1n2n3n4n5a1a2a3n6n8n10n11/caster/scores.tsv
+                # should preserve w50k_s1k/Nyctibiidae_10X_up/n1n2n3n4n5a1a2a3n6n8n10n11 under phlag/<dist_type>/
+                locus_dir = input_path.parent.parent
+                parts = locus_dir.parts
+                # Check if model design or 'phlag' is in parent path parts
+                known_models = ["gaussian", "beta", "gmm"]
+                rel_parts = []
+                for i in range(len(parts) - 1, -1, -1):
+                    if parts[i] in known_models or parts[i] == "phlag":
+                        rel_parts = list(parts[i+1:])
+                        break
+                if rel_parts:
+                    sub_path = pathlib.Path(*rel_parts)
+                    out_dir = base_dir / "phlag" / dist_type / sub_path / "phlag"
+                else:
+                    out_dir = base_dir / "phlag" / dist_type / locus_dir.name / "phlag"
             else:
-                out_dir = repo_root / "large_dir" / "phlag" / dist_type / input_path.stem / "phlag"
+                out_dir = base_dir / "phlag" / dist_type / input_path.stem / "phlag"
         return out_dir
 
     def determine_optimal_mixtures(self):
@@ -185,6 +206,7 @@ class Phlag:
             self.pos_to_caster,
             self.args.silhouette_threshold,
             output_dir,
+            getattr(self.args, "cluster_topologies", False)
         )
         
         self.num_mixtures = int(np.max(num_mixtures_matrix))
@@ -382,21 +404,14 @@ class Phlag:
         y_pred = np.array(paths[0])
         flipped_for_eval = False
         
-        # Ensure state labeling matches ground truth (state 1 = anomalous state with higher emission divergence/mean)
-        # If State 0 happens to be assigned to the anomalous profile, flip labels for evaluation
+        # Flip the state assignments according to whichever has smaller hamming distance
         if has_ground_truth:
-            # Check mean score of predicted state 1 vs state 0 on raw data to verify orientation
-            mean_state1_score = np.mean(self.Y[y_pred == 1]) if np.any(y_pred == 1) else 0.0
-            mean_state0_score = np.mean(self.Y[y_pred == 0]) if np.any(y_pred == 0) else 0.0
+            hamming_dist = np.sum(y_pred != y_true)
+            hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
             
-            # If the ground truth anomaly overlaps predominantly with one state label:
-            true_anom_mask = (y_true == 1)
-            if np.any(true_anom_mask):
-                state1_overlap = np.sum(y_pred[true_anom_mask] == 1)
-                state0_overlap = np.sum(y_pred[true_anom_mask] == 0)
-                if state0_overlap > state1_overlap:
-                    y_pred = 1 - y_pred
-                    flipped_for_eval = True
+            if hamming_dist_flipped < hamming_dist:
+                y_pred = 1 - y_pred
+                flipped_for_eval = True
             
             tp = int(np.sum((y_true == 1) & (y_pred == 1)))
             fp = int(np.sum((y_true == 0) & (y_pred == 1)))
@@ -457,37 +472,9 @@ class Phlag:
                     line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
                     ax1.step(positions_kb, plot_path_data, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
                 
-                # Draw square wave for ground truth null/alt if available
-                pattern_str = None
-                pattern_str_match = re.search(r'((?:[an]\d+)+)', input_path.stem)
-                if pattern_str_match:
-                    pattern_str = pattern_str_match.group(1)
-                else:
-                    pattern_file = input_path.parent / "pattern.txt"
-                    if pattern_file.exists():
-                        try:
-                            content = pattern_file.read_text().strip()
-                            p_match = re.search(r'((?:[an]\d+)+)', content)
-                            if p_match:
-                                pattern_str = p_match.group(1)
-                        except Exception:
-                            pass
-
-                if pattern_str:
-                    blocks = re.findall(r'([an])(\d+)', pattern_str)
-                    if blocks:
-                        block_size_kb = 500.0  # 500Kb
-                        gt_x = []
-                        gt_y = []
-                        curr_pos_kb = 0.0
-                        for b_type, b_id in blocks:
-                            val = 1 if b_type == 'a' else 0
-                            gt_x.extend([curr_pos_kb, curr_pos_kb + block_size_kb])
-                            gt_y.extend([val, val])
-                            curr_pos_kb += block_size_kb
-                        
-                        gt_y_np = np.array(gt_y)
-                        ax1.plot(gt_x, gt_y_np, color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+                # Plot ground truth if available
+                if has_ground_truth:
+                    ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
 
                 ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
@@ -495,7 +482,7 @@ class Phlag:
                 ax1.set_yticks([0, 1])
                 ax1.grid(True, axis='x', linestyle=':', alpha=0.5)
                 
-                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths\nLocus: {input_path.stem}", fontsize=14, fontweight="bold", pad=15)
+                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
                 
                 lines1, labels1 = ax1.get_legend_handles_labels()
                 ax1.legend(lines1, labels1, loc="upper left", framealpha=0.9)
@@ -928,6 +915,13 @@ def parse_arguments():
         default="gaussian",
         choices=["gaussian", "beta", "gmm"],
         help="Type of HMM emissions (gaussian, beta, or gmm. Default: gaussian)",
+    )
+    hmm_group.add_argument(
+        "-c",
+        "--cluster-topologies",
+        dest="cluster_topologies",
+        action="store_true",
+        help="For GMM, cluster topologies together instead of independently",
     )
     hmm_group.add_argument(
         "-t",
