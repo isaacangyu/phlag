@@ -1,6 +1,7 @@
 import sys
 import pathlib
 import os
+import re
 import argparse
 import subprocess
 import shutil
@@ -135,6 +136,13 @@ def parse_arguments():
         default="gaussian",
         choices=["gaussian", "gmm"],
         help="Distribution type for output directory structure (default: gaussian)"
+    )
+    parser.add_argument(
+        "--tree",
+        dest="tree_file",
+        type=pathlib.Path,
+        default=None,
+        help="Optional species tree file (default: store/63K.tre)"
     )
     return parser.parse_args()
 
@@ -331,11 +339,77 @@ def main():
         sim_dir_name = args.fasta_file.parent.name if args.fasta_file.parent.name != "concat" else args.fasta_file.parent.parent.name
         
         # Display source node information for admixture simulations (taking the right taxon node e.g. N297 from Strigiformes_N297_admixture_...)
+        target_node = None
         if "admixture" in sim_dir_name.lower():
             parts_dir = sim_dir_name.split("_")
             if len(parts_dir) >= 2:
-                source_node = parts_dir[1]  # Right taxon node
-                print(f"Admixture source node: {source_node}")
+                target_node = parts_dir[1]  # Right taxon node
+                print(f"Admixture source node: {target_node}")
+        else:
+            if "_" in sim_dir_name:
+                target_node = sim_dir_name.split("_")[0]
+            else:
+                target_node = sim_dir_name
+
+        # Resolve tree file (defaulting to store/63K.tre)
+        tree_path = args.tree_file
+        if tree_path is None:
+            tree_candidates = [
+                repo_root / "store" / "63K.tre",
+                pathlib.Path.cwd() / "store" / "63K.tre",
+                pathlib.Path.cwd() / "63K.tre",
+                data_dir / "store" / "63K.tre",
+                repo_root / "63K.tre"
+            ]
+            for cand in tree_candidates:
+                if cand.exists():
+                    tree_path = cand
+                    break
+        else:
+            tree_path = resolve_input_file(tree_path, default_subdirs=["store", "tree"], default_exts=[".tre", ".tree", ".nwk"])
+
+        if tree_path and tree_path.exists() and target_node:
+            try:
+                with open(tree_path, "r") as tf:
+                    tree_str = tf.read().strip()
+                
+                # 1. Direct leaf or named internal node match: NodeName:length or NodeName)length or )NodeName:length
+                pattern = re.escape(target_node) + r'(?:[^\):]*):([0-9.]+)'
+                match = re.search(pattern, tree_str)
+                if not match:
+                    # 2. Support-value prefix before branch length e.g. )1:0.797287 or )Nyctibiidae:0.5
+                    pattern = r'\)[^:\)]*' + re.escape(target_node) + r'[^:\)]*:([0-9.]+)'
+                    match = re.search(pattern, tree_str)
+                
+                if match:
+                    branch_len = float(match.group(1))
+                    print(f"Internal node '{target_node}' CU branch length: {branch_len:.6f}")
+                else:
+                    # 3. Read species/taxa from mapping file if available
+                    mapping_taxa = []
+                    if args.mapping and args.mapping.exists():
+                        with open(args.mapping, "r") as mf:
+                            for mline in mf:
+                                mparts = mline.strip().split()
+                                if len(mparts) >= 2:
+                                    mapping_taxa.append(mparts[0])
+                    
+                    found_len = None
+                    for taxon in mapping_taxa:
+                        t_match = re.search(re.escape(taxon) + r'[^:]*:([0-9.]+)', tree_str)
+                        if t_match:
+                            found_len = float(t_match.group(1))
+                            print(f"Internal node '{target_node}' (via taxon {taxon}) CU branch length: {found_len:.6f}")
+                            break
+                    if not found_len:
+                        # 4. Partial taxon substring match
+                        taxon_match = re.search(r'([A-Za-z0-9_]*' + re.escape(target_node) + r'[A-Za-z0-9_]*):([0-9.]+)', tree_str, re.IGNORECASE)
+                        if taxon_match:
+                            print(f"Internal node '{target_node}' (matching {taxon_match.group(1)}) CU branch length: {float(taxon_match.group(2)):.6f}")
+                        else:
+                            print(f"Tree loaded ({tree_path.name}), target node '{target_node}' branch length not found.")
+            except Exception as ex:
+                pass
 
 
 

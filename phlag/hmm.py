@@ -337,28 +337,35 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         key: PRNGKeyT = jr.PRNGKey(0),
         method: str = "prior",
         emission_probs: Optional[Float[Array, "num_states emission_dim 2"]] = None,
+        initial_gmm_params: Optional[Tuple[Array, Array, Array]] = None,
     ) -> Tuple[ParamsGMMHMMEmissions, ParamsGMMHMMEmissions]:
         S = self.num_states
         D = self.emission_dim
         M = self.num_mixtures
         
-        if emission_probs is not None:
-            state_means = emission_probs[..., 0]
-            state_vars = emission_probs[..., 1]
-            state_stds = jnp.sqrt(jnp.clip(state_vars, a_min=1e-5))
+        if initial_gmm_params is not None:
+            mixture_weights, means, stds = initial_gmm_params
+            mixture_weights = jnp.array(mixture_weights, dtype=jnp.float32)
+            means = jnp.array(means, dtype=jnp.float32)
+            stds = jnp.array(stds, dtype=jnp.float32)
         else:
-            state_means = jnp.zeros((S, D))
-            state_stds = jnp.ones((S, D))
+            if emission_probs is not None:
+                state_means = emission_probs[..., 0]
+                state_vars = emission_probs[..., 1]
+                state_stds = jnp.sqrt(jnp.clip(state_vars, a_min=1e-5))
+            else:
+                state_means = jnp.zeros((S, D))
+                state_stds = jnp.ones((S, D))
+                
+            if M == 1:
+                offsets = jnp.array([0.0])
+            else:
+                offsets = jnp.linspace(-1.0, 1.0, M)
+                
+            means = state_means[:, :, None] + offsets[None, None, :] * state_stds[:, :, None] * 0.5
+            stds = jnp.stack([state_stds for _ in range(M)], axis=-1)
+            mixture_weights = jnp.ones((S, D, M)) / M
             
-        if M == 1:
-            offsets = jnp.array([0.0])
-        else:
-            offsets = jnp.linspace(-1.0, 1.0, M)
-            
-        means = state_means[:, :, None] + offsets[None, None, :] * state_stds[:, :, None] * 0.5
-        stds = jnp.stack([state_stds for _ in range(M)], axis=-1)
-        mixture_weights = jnp.ones((S, D, M)) / M
-        
         params = ParamsGMMHMMEmissions(mixture_weights=mixture_weights, means=means, stds=stds)
         props = ParamsGMMHMMEmissions(
             mixture_weights=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
@@ -741,6 +748,7 @@ class PhlagHMM(HMM):
         emission_probs: Optional[Float[Array, "num_states emission_dim num_classes"]] = None,
         initial_probs: Optional[Float[Array, "num_states"]] = None,
         transition_matrix: Optional[Float[Array, "num_states num_states"]] = None,
+        initial_gmm_params: Optional[Tuple[Array, Array, Array]] = None,
     ) -> Tuple[ParamsPhlagHMM, ParamsPhlagHMM]:
         key1, key2, key3 = jr.split(key, 3)
         params, props = dict(), dict()
@@ -750,9 +758,14 @@ class PhlagHMM(HMM):
         params["transitions"], props["transitions"] = self.transition_component.initialize(
             key2, method=method, transition_matrix=transition_matrix
         )
-        params["emissions"], props["emissions"] = self.emission_component.initialize(
-            key3, method=method, emission_probs=emission_probs
-        )
+        if isinstance(self.emission_component, PhlagGMMHMMEmissions):
+            params["emissions"], props["emissions"] = self.emission_component.initialize(
+                key3, method=method, emission_probs=emission_probs, initial_gmm_params=initial_gmm_params
+            )
+        else:
+            params["emissions"], props["emissions"] = self.emission_component.initialize(
+                key3, method=method, emission_probs=emission_probs
+            )
         return ParamsPhlagHMM(**params), ParamsPhlagHMM(**props)
 
     def initialize_m_step_state(

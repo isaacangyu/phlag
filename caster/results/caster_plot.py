@@ -127,8 +127,9 @@ class CasterPlotter:
             return
 
         # Check for ground truth locus pattern in filename or gene name
-        base_name = os.path.basename(self.scores_file)
-        pattern_str_match = re.search(r'((?:[an]\d+)+(?:[;_,]\d+-\d+(?:[;_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[;_,])?){2,}|\d+-\d+(?:[;_,]\d+-\d+)*)', base_name)
+        # Check for ground truth locus pattern in filename or gene name
+        full_path_str = str(self.scores_file)
+        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
         
         has_ground_truth = False
         y_true = np.zeros(len(self.df), dtype=int)
@@ -138,15 +139,13 @@ class CasterPlotter:
             from phlag.utils import parse_pattern_string
             total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
             blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
-            if blocks:
+            if anomaly_intervals or blocks:
                 has_ground_truth = True
                 if 'pos' in self.df.columns:
                     positions = self.df['pos'].values
                     for idx, pos in enumerate(positions):
                         for start_bp, end_bp in anomaly_intervals:
                             if start_bp <= pos < end_bp:
-                                y_true[idx] = 1
-                                break
                                 y_true[idx] = 1
                                 break
 
@@ -330,20 +329,39 @@ class CasterPlotter:
         # Create scatter plot with small points and transparency
         sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
         
-        # Draw vertical split lines and null/alt annotations if filename contains ground truth pattern
-        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:_\d+-\d+)*)', self.gene_name)
+        # Draw vertical split lines and shade alt regions if path/filename contains ground truth pattern
+        full_path_str = str(self.scores_file)
+        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
         if pattern_str_match:
             pattern_str = pattern_str_match.group(1)
             from phlag.utils import parse_pattern_string
-            blocks, _, _ = parse_pattern_string(pattern_str, block_size_bp=500000)
-            if blocks:
+            total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
+            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+            
+            if anomaly_intervals and not any(b[0] == 'n' for b in blocks):
+                # Pure interval format (e.g. 40-65)
+                alt_shaded = False
+                for start_pos, end_pos in anomaly_intervals:
+                    mid_pos = (start_pos + end_pos) / 2.0
+                    lbl = 'Alt' if not alt_shaded else None
+                    plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                    alt_shaded = True
+                    plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+                    plt.axvline(x=end_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+            elif blocks:
                 curr_pos_bp = 0
+                alt_shaded = False
                 for idx, (b_type, b_id, length_bp) in enumerate(blocks):
                     start_pos = curr_pos_bp
                     end_pos = curr_pos_bp + length_bp
                     mid_pos = (start_pos + end_pos) / 2.0
                     label_text = "null" if b_type == 'n' else "alt"
                     
+                    if b_type == 'a':
+                        lbl = 'Alt' if not alt_shaded else None
+                        plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                        alt_shaded = True
+
                     # Draw vertical boundary line at start of block (except 0)
                     if start_pos > 0:
                         plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
@@ -369,7 +387,7 @@ class CasterPlotter:
         save_path_scatter = os.path.join(output_dir, 'scatter.png')
         plt.savefig(save_path_scatter, dpi=300)
         print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
-        plt.show()
+        plt.close()
 
 def read_caster_scores(path):
     pos_to_caster = {}
@@ -410,6 +428,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
     positions_kb = np.array(sorted_positions) / 1000.0
     
     num_mixtures_matrix = np.zeros((NUM_STATES, Y.shape[-1]), dtype=int)
+    dim_cluster_info = {}
     
     print("\n=== K-means Clustering & Silhouette Scores ===")
     
@@ -593,6 +612,50 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             plt.savefig(plot_path_opt, dpi=150)
             plt.close()
             print(f"Saved combined optimal plot to: {plot_path_opt}")
+
+            # Compute Null sub-cluster mixture parameters
+            null_params = []
+            if best_kn == 1:
+                mu_n = np.mean(y_sub_N, axis=0)
+                std_n = np.clip(np.std(y_sub_N, axis=0), a_min=1e-4, a_max=None)
+                null_params.append((1.0, mu_n, std_n))
+            else:
+                km_n = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+                sub_labels_n = km_n.fit_predict(y_sub_N)
+                for m in range(best_kn):
+                    pts = y_sub_N[sub_labels_n == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_sub_N)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / best_kn
+                        mu = km_n.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    null_params.append((w, mu, std))
+
+            # Compute Alt sub-cluster mixture parameters
+            alt_params = []
+            if best_ka == 1:
+                mu_a = np.mean(y_sub_A, axis=0)
+                std_a = np.clip(np.std(y_sub_A, axis=0), a_min=1e-4, a_max=None)
+                alt_params.append((1.0, mu_a, std_a))
+            else:
+                km_a = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+                sub_labels_a = km_a.fit_predict(y_sub_A)
+                for m in range(best_ka):
+                    pts = y_sub_A[sub_labels_a == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_sub_A)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / best_ka
+                        mu = km_a.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    alt_params.append((w, mu, std))
+
+            dim_cluster_info[d] = (null_params, alt_params)
             
         else:
             m_val = max(1, int(round(k_opt / 2.0)))
@@ -621,8 +684,66 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             plt.savefig(plot_path, dpi=150)
             plt.close()
             print(f"Saved diagnostic clustering plot to: {plot_path}")
-                
-    return num_mixtures_matrix
+
+            null_params = []
+            alt_params = []
+            if m_val == 1:
+                mu_base = np.mean(y_d, axis=0)
+                std_base = np.clip(np.std(y_d, axis=0), a_min=1e-4, a_max=None)
+                null_params.append((1.0, mu_base, std_base))
+                alt_params.append((1.0, mu_base + std_base, std_base))
+            else:
+                km = KMeans(n_clusters=m_val, random_state=42, n_init="auto")
+                labels_m = km.fit_predict(y_d)
+                for m in range(m_val):
+                    pts = y_d[labels_m == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_d)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / m_val
+                        mu = km.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    null_params.append((w, mu, std))
+                    alt_params.append((w, mu + std, std))
+
+            dim_cluster_info[d] = (null_params, alt_params)
+
+    D = Y.shape[-1]
+    max_m = int(np.max(num_mixtures_matrix))
+    init_means = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
+    init_stds = np.ones((NUM_STATES, D, max_m), dtype=np.float32)
+    init_weights = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
+
+    if cluster_topologies:
+        null_params, alt_params = dim_cluster_info[None]
+        for s_idx, state_params in enumerate([null_params, alt_params]):
+            m_cnt = len(state_params)
+            for m_idx, (w, mu, std) in enumerate(state_params):
+                for d_idx in range(D):
+                    init_weights[s_idx, d_idx, m_idx] = w
+                    init_means[s_idx, d_idx, m_idx] = mu[d_idx]
+                    init_stds[s_idx, d_idx, m_idx] = std[d_idx]
+            for d_idx in range(D):
+                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
+                if sum_w > 0:
+                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
+    else:
+        for d_idx in range(D):
+            null_params, alt_params = dim_cluster_info[d_idx]
+            for s_idx, state_params in enumerate([null_params, alt_params]):
+                m_cnt = len(state_params)
+                for m_idx, (w, mu, std) in enumerate(state_params):
+                    init_weights[s_idx, d_idx, m_idx] = w
+                    init_means[s_idx, d_idx, m_idx] = mu[0]
+                    init_stds[s_idx, d_idx, m_idx] = std[0]
+                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
+                if sum_w > 0:
+                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
+
+    gmm_init_params = (init_weights, init_means, init_stds)
+    return num_mixtures_matrix, gmm_init_params
 
 if __name__ == "__main__":
     import argparse

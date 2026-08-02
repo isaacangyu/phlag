@@ -200,7 +200,7 @@ class Phlag:
             
         output_dir.mkdir(parents=True, exist_ok=True)
             
-        num_mixtures_matrix = caster_plot.determine_optimal_mixtures(
+        num_mixtures_matrix, self.gmm_init_params = caster_plot.determine_optimal_mixtures(
             self.args.caster_scores,
             self.Y,
             self.pos_to_caster,
@@ -423,9 +423,10 @@ class Phlag:
             tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
             f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
             
-            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}"
+            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}, Accuracy: {accuracy:.4f}"
             print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -585,9 +586,19 @@ class Phlag:
         p0, p1 = 0.6, 0.6
         initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
         
-        self.params, self.props = self.hmm.initialize(
-            initial_probs=INITIAL_PROBS, emission_probs=init_emissions, transition_matrix=initial_transition_matrix
-        )
+        if self.args.model_design == "gmm":
+            self.params, self.props = self.hmm.initialize(
+                initial_probs=INITIAL_PROBS,
+                emission_probs=init_emissions,
+                transition_matrix=initial_transition_matrix,
+                initial_gmm_params=getattr(self, "gmm_init_params", None),
+            )
+        else:
+            self.params, self.props = self.hmm.initialize(
+                initial_probs=INITIAL_PROBS,
+                emission_probs=init_emissions,
+                transition_matrix=initial_transition_matrix,
+            )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
         if self.args.model_design == "beta":
