@@ -229,7 +229,7 @@ class Phlag:
             out_dir.mkdir(parents=True, exist_ok=True)
             self.output_file = out_dir / "report.tsv"
             
-        headers = [f"# {' '.join(sys.argv)}"]
+        headers = [f"{' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
     def get_n_best_viterbi_paths(self, initial_probs, transition_matrix, log_likelihoods, n):
@@ -309,45 +309,47 @@ class Phlag:
         # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
         # Each token (e.g., 'n1', 'n8', 'a1', 'n5') represents one 500Kb locus block.
         import re
-        input_stem = pathlib.Path(self.args.caster_scores).stem
+        input_path_obj = pathlib.Path(self.args.caster_scores)
         
         sorted_positions = sorted(self.pos_to_caster.keys())
         y_true = np.zeros(len(sorted_positions), dtype=int)
         has_ground_truth = False
         
         pattern_str = None
-        pattern_str_match = re.search(r'((?:[an]\d+)+)', input_stem)
-        if pattern_str_match:
-            pattern_str = pattern_str_match.group(1)
-        else:
-            # Look for pattern.txt in the directory of the scores file
-            pattern_file = pathlib.Path(self.args.caster_scores).parent / "pattern.txt"
+        # 1. Try to find the pattern in the path parts (matches [an]\d+ blocks, range syntax, or start-end coords)
+        pattern_full_match_regex = r'(?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?)+|\d+-\d+(?:[_,]\d+-\d+)*'
+        for part in reversed(input_path_obj.parts):
+            if re.fullmatch(pattern_full_match_regex, part):
+                pattern_str = part
+                break
+                
+        # 2. Try the file stem
+        if not pattern_str:
+            pattern_str_match = re.search(r'((?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?){2,}|\d+-\d+(?:[_,]\d+-\d+)*)', input_path_obj.stem)
+            if pattern_str_match:
+                pattern_str = pattern_str_match.group(1)
+                
+        # 3. Try pattern.txt
+        if not pattern_str:
+            pattern_file = input_path_obj.parent / "pattern.txt"
             if pattern_file.exists():
                 try:
                     content = pattern_file.read_text().strip()
-                    p_match = re.search(r'((?:[an]\d+)+)', content)
+                    p_match = re.search(r'((?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?)+|\d+-\d+(?:[_,]\d+-\d+)*)', content)
                     if p_match:
                         pattern_str = p_match.group(1)
                 except Exception:
                     pass
 
         if pattern_str:
-            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            from .utils import parse_pattern_string
+            total_span = sorted_positions[-1] if sorted_positions else None
+            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
             if blocks:
                 has_ground_truth = True
-                block_size_bp = 500000  # Each locus block is 500Kb
-                
-                curr_pos_bp = 0
-                anomaly_intervals = []
-                for b_type, b_id in blocks:
-                    length_bp = block_size_bp
-                    if b_type == 'a':
-                        anomaly_intervals.append((curr_pos_bp, curr_pos_bp + length_bp))
-                    curr_pos_bp += length_bp
-                    
                 for idx, pos in enumerate(sorted_positions):
                     for start_bp, end_bp in anomaly_intervals:
-                        if start_bp <= pos < end_bp:
+                        if start_bp <= pos <= end_bp:
                             y_true[idx] = 1
                             break
 
@@ -423,25 +425,25 @@ class Phlag:
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
             
-            metrics_str = f"TPR (Recall/Sensitivity): {tpr:.4f}, FPR: {fpr:.4f}, F1 (Avg of TPR and TNR): {f1:.4f} (TP={tp}, FP={fp}, FN={fn}, TN={tn})"
+            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}"
             print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
         headers = []
-        headers.append("# State divergence: " + emission_divergence_str)
-        headers.append(f"# Outer EM iterations: {self.n_iters}")
-        headers.append(f"# Inner EM iterations: {self.increment_steps}")
+        headers.append("State divergence: " + emission_divergence_str)
+        headers.append(f"Outer EM iterations: {self.n_iters}")
+        headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
             tm_before_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in self.initial_transition_matrix.tolist())
-            headers.append(f"# Initial transition matrix (before EM): [{tm_before_str}]")
+            headers.append(f"Initial transition matrix (before EM): [{tm_before_str}]")
         tm_after_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in transition_matrix_np.tolist())
-        headers.append(f"# Final transition matrix (after EM): [{tm_after_str}]")
+        headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
         if correct_trans_arg is not None:
-            headers.append("# Corrected transition matrix applied: True")
+            headers.append("Corrected transition matrix applied: True")
         if has_ground_truth:
-            headers.append(f"# Performance Metrics (Path 1 vs Pattern Indices Ground Truth): {metrics_str}")
+            headers.append(f"{metrics_str}")
         for idx, l in enumerate(path_likelihoods):
-            headers.append(f"# Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
+            headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
             
         self.output_str += "\n" + "\n".join(headers)
         
@@ -512,8 +514,8 @@ class Phlag:
         # 1. Text-based ASCII histogram
         lines = [
             "",
-            f"# Step-based counts of flagged positions (step size = {step_size}):",
-            "# Range       | Count | Bar",
+            f"Step-based counts of flagged positions (step size = {step_size}):",
+            "Range       | Count | Bar",
         ]
         
         max_count = max([c for _, _, c in step_counts]) if step_counts else 0
@@ -625,6 +627,8 @@ class Phlag:
     def save_output(self):
         with open(self.output_file, "w") as f:
             f.write(self.output_str)
+        print(f"Saved PHLAG output report to: {self.output_file}")
+
 
 
 class PhlagPlotter:

@@ -83,8 +83,8 @@ def parse_arguments():
         "-w",
         dest="window_size",
         type=int_or_abbrev,
-        default=10000,
-        help="Window size (default: 10000)"
+        default=50000,
+        help="Window size (default: 50000 / 50k)"
     )
     parser.add_argument(
         "-n",
@@ -96,9 +96,10 @@ def parse_arguments():
         "-s",
         dest="step_size",
         type=int_or_abbrev,
-        default=None,
-        help="Step size (default: same as window size)"
+        default=1000,
+        help="Step size (default: 1000 / 1k)"
     )
+
     parser.add_argument(
         "-m",
         dest="mapping",
@@ -160,30 +161,84 @@ def main():
         print(f"Using most recent FASTA file: {recent_fasta}")
         args.fasta_file = recent_fasta
     else:
-        args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat", "simulations"], default_exts=[".fa", ".fasta", ".fa.gz"])
+        # If passed a scores.tsv path (e.g. store/phlag/.../caster/scores.tsv), map to corresponding fasta in simulations
+        input_str = str(args.fasta_file)
+        if "scores.tsv" in input_str or input_str.endswith(".tsv") or "caster" in args.fasta_file.parts:
+            # Extract simulation name and clean locus stem from path structure
+            parts = args.fasta_file.parts
+            sim_name = None
+            locus_stem = None
+            
+            for idx, p in enumerate(parts):
+                if "_" in p and ("admixture" in p or "recombination" in p or "down" in p or "up" in p):
+                    sim_name = p
+                    if idx + 1 < len(parts):
+                        locus_stem = parts[idx + 1]
+                    break
+            
+            if sim_name and locus_stem:
+                from .utils import get_data_dir
+                sim_base = get_data_dir() / "simulations" / sim_name
+                cand_fasta = sim_base / "concat" / f"{locus_stem}.fa"
+                if not cand_fasta.exists():
+                    cand_fasta = sim_base / f"{locus_stem}.fa"
+                if cand_fasta.exists():
+                    args.fasta_file = cand_fasta
+                else:
+                    args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat", "concat_*", "simulations"], default_exts=[".fa", ".fasta", ".fa.gz"])
+        else:
+            args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat", "concat_*", "simulations"], default_exts=[".fa", ".fasta", ".fa.gz"])
+
+
+
+
                 
     if args.mapping is None:
-        # Auto-detect mapping file in fasta_file parent
+        # Auto-detect mapping file based on simulation parent directory node for quadripartition (using left node for admixture)
         stem = args.fasta_file.stem
-        default_map = args.fasta_file.parent / f"{stem}_mapping.tsv"
+        sim_dir = args.fasta_file.parent if args.fasta_file.parent.name not in ["concat"] and not args.fasta_file.parent.name.startswith("concat_") else args.fasta_file.parent.parent
+        sim_dir_name = sim_dir.name
+        
+        # Check if sim_name was present in original input path parts (e.g. store/phlag/.../Strigiformes_N297_admixture_.../...)
+        for p in pathlib.Path(input_str).parts if 'input_str' in locals() else args.fasta_file.parts:
+            if "admixture" in p or "recombination" in p:
+                sim_dir_name = p
+                break
+        
+        # Determine left node for quadripartition mapping
+        node_name = stem
+        if "_" in sim_dir_name:
+            node_name = sim_dir_name.split("_")[0]  # Left node for quadripartition mapping
+            
+        default_map = sim_dir / f"neoaves_{node_name}_mapping.tsv"
         
         if default_map.exists():
             args.mapping = default_map
         else:
-            # Fallback 1: check if parent directory has a neoaves_*_mapping.tsv file
-            neo_maps = list(args.fasta_file.parent.glob("neoaves_*_mapping.tsv"))
-            if not neo_maps:
-                # Fallback 2: check upper directory or simulations root pattern connection_dir/simulations/<filename>/neoaves_<node>_mapping.tsv
-                neo_maps = list(args.fasta_file.parent.parent.glob("neoaves_*_mapping.tsv"))
-            if neo_maps:
-                args.mapping = neo_maps[0]
+            # Fallback 1: search for mapping file under simulations directory using sim_dir_name or node_name
+            sim_map = resolve_input_file(f"neoaves_{node_name}_mapping.tsv", default_subdirs=[f"simulations/{sim_dir_name}", "simulations", "mapping"], default_exts=[".tsv"])
+            if sim_map and sim_map.exists():
+                args.mapping = sim_map
             else:
-                # Fallback 3: try resolve_input_file
-                resolved = resolve_input_file(f"neoaves_{stem}_mapping.tsv", default_subdirs=["mapping", "simulations"], default_exts=[".tsv"])
-                if resolved and resolved.exists():
-                    args.mapping = resolved
+                # Fallback 2: check if simulation directory or parent has a neoaves_*_mapping.tsv file
+                neo_maps = list(sim_dir.glob("neoaves_*_mapping.tsv"))
+                if not neo_maps:
+                    neo_maps = list(args.fasta_file.parent.glob("neoaves_*_mapping.tsv"))
+                if not neo_maps and args.fasta_file.parent.parent.exists():
+                    neo_maps = list(args.fasta_file.parent.parent.glob("neoaves_*_mapping.tsv"))
+                if neo_maps:
+                    args.mapping = neo_maps[0]
                 else:
-                    sys.exit(f"Error: No mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
+                    # Fallback 3: try general resolve_input_file
+                    resolved = resolve_input_file("neoaves_*_mapping.tsv", default_subdirs=["simulations", "mapping"], default_exts=[".tsv"])
+                    if resolved and resolved.exists():
+                        args.mapping = resolved
+                    else:
+                        sys.exit(f"Error: No mapping file found for '{args.fasta_file.name}'. Please specify a mapping file using --mapping.")
+
+
+
+
     else:
         # Resolve Mapping file fallback if not found
         args.mapping = resolve_input_file(args.mapping, default_subdirs=["mapping"], default_exts=[".tsv", "_mapping.tsv", ".txt"])
@@ -272,6 +327,20 @@ def main():
         # 4. Parse TSV lines from stdout and perform rolling window sum
         norm_suffix = "_n" if args.normalize else ""
         
+        # Display mapping clade information for the simulation/source node if present
+        sim_dir_name = args.fasta_file.parent.name if args.fasta_file.parent.name != "concat" else args.fasta_file.parent.parent.name
+        
+        # Display source node information for admixture simulations (taking the right taxon node e.g. N297 from Strigiformes_N297_admixture_...)
+        if "admixture" in sim_dir_name.lower():
+            parts_dir = sim_dir_name.split("_")
+            if len(parts_dir) >= 2:
+                source_node = parts_dir[1]  # Right taxon node
+                print(f"Admixture source node: {source_node}")
+
+
+
+
+        
         lines = result.stdout.splitlines()
         if not lines:
             sys.exit(f"Error: D* output was empty. Stderr: {result.stderr}")
@@ -294,35 +363,64 @@ def main():
         if not raw_rows:
             sys.exit(f"Error: No window scores calculated for '{args.fasta_file.name}' using mapping '{args.mapping.name}'. Please check that sequence headers in the FASTA match species in the mapping file.")
                 
-        # Perform rolling window sum
+        # Perform rolling window average with O(1) sliding window
         K = max(1, args.window_size // args.step_size)
         
+        # Pre-parse numeric columns for all rows
+        parsed_rows = [
+            (
+                row[0],             # file
+                int(row[1]),        # pos
+                float(row[2]),      # abba
+                float(row[3]),      # baba
+                float(row[4]),      # aabb
+                float(row[6])       # qcnt
+            )
+            for row in raw_rows
+        ]
+        
         results = []
-        for i in range(len(raw_rows) - K + 1):
-            window_rows = raw_rows[i : i + K]
+        if len(parsed_rows) >= K:
+            # Initialize running sum for the first window
+            run_abba = sum(r[2] for r in parsed_rows[:K])
+            run_baba = sum(r[3] for r in parsed_rows[:K])
+            run_aabb = sum(r[4] for r in parsed_rows[:K])
+            run_qcnt = sum(r[5] for r in parsed_rows[:K])
             
-            sum_abba = sum(float(row[2]) for row in window_rows)
-            sum_baba = sum(float(row[3]) for row in window_rows)
-            sum_aabb = sum(float(row[4]) for row in window_rows)
-            sum_qcnt = sum(float(row[6]) for row in window_rows)
-            
-            pos_val = int(window_rows[0][1]) # Position of the start of the window
-            
-            # Recalculate D* for the combined window
-            denom = sum_abba + sum_baba + sum_aabb
-            dstar_val = (sum_abba - sum_baba) / denom if denom != 0 else 0.0
-            
-            if args.left <= pos_val < args.right:
-                file_val = window_rows[0][0]
-                results.append({
-                    'file': file_val,
-                    'pos': pos_val,
-                    'abba': sum_abba,
-                    'baba': sum_baba,
-                    'aabb': sum_aabb,
-                    'dstar': dstar_val,
-                    'qcnt': sum_qcnt
-                })
+            for i in range(len(parsed_rows) - K + 1):
+                if i > 0:
+                    # Subtract outgoing element (i - 1) and add incoming element (i + K - 1)
+                    outgoing = parsed_rows[i - 1]
+                    incoming = parsed_rows[i + K - 1]
+                    run_abba += incoming[2] - outgoing[2]
+                    run_baba += incoming[3] - outgoing[3]
+                    run_aabb += incoming[4] - outgoing[4]
+                    run_qcnt += incoming[5] - outgoing[5]
+                
+                pos_val = parsed_rows[i][1]  # Position of the start of the window
+                
+                # Average scores by dividing by K sub-windows
+                avg_abba = run_abba / K
+                avg_baba = run_baba / K
+                avg_aabb = run_aabb / K
+                avg_qcnt = run_qcnt / K
+                
+                # Recalculate D* for the combined window (denom ratio is invariant to K)
+                denom = run_abba + run_baba + run_aabb
+                dstar_val = (run_abba - run_baba) / denom if denom != 0 else 0.0
+                
+                if args.left <= pos_val < args.right:
+                    file_val = parsed_rows[i][0]
+                    results.append({
+                        'file': file_val,
+                        'pos': pos_val,
+                        'abba': avg_abba,
+                        'baba': avg_baba,
+                        'aabb': avg_aabb,
+                        'dstar': dstar_val,
+                        'qcnt': avg_qcnt
+                    })
+
                 
         # If normalization is requested, apply min-max scaling to [0, 1] for each score column
         if args.normalize and len(results) > 0:
@@ -371,7 +469,8 @@ def main():
             
             if not is_sim:
                 final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-                final_output_path = data_dir / "scores" / final_output_name
+                final_output_path = data_dir / "phlag" / args.dist_type / f"w{window_str}_s{step_str}" / clean_stem / "caster" / final_output_name
+
             
         os.makedirs(final_output_path.parent, exist_ok=True)
         

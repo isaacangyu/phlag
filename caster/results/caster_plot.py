@@ -126,38 +126,27 @@ class CasterPlotter:
             print("No matching topology columns found to plot.")
             return
 
-        # Check for ground truth locus pattern in filename (e.g., ...n1n8a1n5...)
+        # Check for ground truth locus pattern in filename or gene name
         base_name = os.path.basename(self.scores_file)
-        pattern_str_match = re.search(r'((?:[an]\d+)+)', base_name)
+        pattern_str_match = re.search(r'((?:[an]\d+)+(?:[;_,]\d+-\d+(?:[;_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[;_,])?){2,}|\d+-\d+(?:[;_,]\d+-\d+)*)', base_name)
         
         has_ground_truth = False
         y_true = np.zeros(len(self.df), dtype=int)
         
         if pattern_str_match:
             pattern_str = pattern_str_match.group(1)
-            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            from phlag.utils import parse_pattern_string
+            total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
+            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
             if blocks:
                 has_ground_truth = True
-                max_pos = self.df['pos'].max() if 'pos' in self.df.columns else 0
-                step_size = self.df['pos'].diff().median() if ('pos' in self.df.columns and len(self.df) > 1) else 1000
-                if np.isnan(step_size) or step_size <= 0:
-                    step_size = 1000
-                total_span = max_pos + step_size
-                block_size_bp = total_span / len(blocks) if len(blocks) > 0 else 500000
-                
-                curr_pos_bp = 0
-                anomaly_intervals = []
-                for b_type, b_id in blocks:
-                    length_bp = block_size_bp
-                    if b_type == 'a':
-                        anomaly_intervals.append((curr_pos_bp, curr_pos_bp + length_bp))
-                    curr_pos_bp += length_bp
-                    
                 if 'pos' in self.df.columns:
                     positions = self.df['pos'].values
                     for idx, pos in enumerate(positions):
                         for start_bp, end_bp in anomaly_intervals:
                             if start_bp <= pos < end_bp:
+                                y_true[idx] = 1
+                                break
                                 y_true[idx] = 1
                                 break
 
@@ -342,16 +331,16 @@ class CasterPlotter:
         sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
         
         # Draw vertical split lines and null/alt annotations if filename contains ground truth pattern
-        pattern_str_match = re.search(r'((?:[an]\d+)+)', self.gene_name)
+        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:_\d+-\d+)*)', self.gene_name)
         if pattern_str_match:
             pattern_str = pattern_str_match.group(1)
-            blocks = re.findall(r'([an])(\d+)', pattern_str)
+            from phlag.utils import parse_pattern_string
+            blocks, _, _ = parse_pattern_string(pattern_str, block_size_bp=500000)
             if blocks:
-                block_size_bp = 500000
                 curr_pos_bp = 0
-                for idx, (b_type, b_id) in enumerate(blocks):
+                for idx, (b_type, b_id, length_bp) in enumerate(blocks):
                     start_pos = curr_pos_bp
-                    end_pos = curr_pos_bp + block_size_bp
+                    end_pos = curr_pos_bp + length_bp
                     mid_pos = (start_pos + end_pos) / 2.0
                     label_text = "null" if b_type == 'n' else "alt"
                     

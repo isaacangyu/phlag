@@ -12,14 +12,114 @@ def count_lines(filepath):
         print(f"An error occurred: {e}")
         raise e
 
+def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
+    """
+    Parses pattern strings representing locus blocks, percentage intervals, or coordinate intervals.
+    
+    Supported formats:
+      1. Standard token sequence: e.g., 'n1n2n3n4n5n6n8a1a2a3n10n11' (12-chunk pattern)
+      2. Range-token sequence: e.g., 'n1-n6,a1-a3,n10-n11' or 'n1-n6_a1-a3_n10-n11'
+      3. Percentage interval lists: e.g. '70-80,85-100' or '40-45' (marked as state 1 / anomaly)
+      4. Prepended locus pattern + interval suffix: e.g., 'n4n6n3n8n9a3a1a2n1n10n12n2_40-65'
+      5. Coordinate intervals: e.g. '0-3000000,3000000-4500000,4500000-6000000'
+
+    Returns:
+      (blocks, anomaly_intervals, total_length_bp)
+    """
+    import re
+    blocks = []
+    anomaly_intervals = []
+    curr_pos = 0
+
+    # 0. Check if there is a trailing/standalone explicit interval range suffix (e.g. '_40-65', ';40-65', '_70-80,85-100', '70-80;85-100')
+    range_suffix_match = re.search(r'(?:^|[;_,])(\d+-\d+(?:[;_,]\d+-\d+)*)$', pattern_str)
+    if range_suffix_match:
+        suffix_str = range_suffix_match.group(1)
+        coord_matches = re.findall(r'(\d+)-(\d+)', suffix_str)
+        if coord_matches:
+            all_vals = [int(v) for pair in coord_matches for v in pair]
+            max_val = max(all_vals) if all_vals else 0
+            first_start = int(coord_matches[0][0])
+            
+            # Case A: Percentage intervals (0-100) (e.g. 40-65 or 70-80,85-100)
+            if max_val == 100 or (first_start >= 15 and max_val <= 100):
+                span = total_span if total_span is not None and total_span > 0 else 6000000
+                for s_str, e_str in coord_matches:
+                    s_pct, e_pct = int(s_str) / 100.0, int(e_str) / 100.0
+                    start_bp = s_pct * span
+                    end_bp = e_pct * span
+                    anomaly_intervals.append((start_bp, end_bp))
+                    blocks.append(('a', f"{s_str}%-{e_str}%", end_bp - start_bp))
+                return blocks, anomaly_intervals, span
+
+            # Case B: Contiguous base-pair coordinate partition starting at 0
+            elif coord_matches[0][0] == '0' and max_val > 100:
+                for idx, (s_str, e_str) in enumerate(coord_matches):
+                    s_bp, e_bp = int(s_str), int(e_str)
+                    b_type = 'a' if (len(coord_matches) == 3 and idx == 1) or (len(coord_matches) > 3 and 0.25 <= (idx / len(coord_matches)) <= 0.75) else ('n' if idx % 2 == 0 else 'a')
+                    length_bp = max(0, e_bp - s_bp)
+                    blocks.append((b_type, f"{s_bp}-{e_bp}", length_bp))
+                    if b_type == 'a':
+                        anomaly_intervals.append((s_bp, e_bp))
+                    curr_pos = max(curr_pos, e_bp)
+                return blocks, anomaly_intervals, curr_pos
+
+    # 1. Try range tokens with explicit 'n' or 'a' prefixes (e.g. n1-n6,a1-a3 or n1n2n3a1a2...)
+    if re.search(r'[an]\d+', pattern_str, re.IGNORECASE):
+        range_matches = re.findall(r'([an])(\d+)-(?:([an])?(\d+))', pattern_str, re.IGNORECASE)
+        if range_matches:
+            for b_type, start_str, _, end_str in range_matches:
+                b_type = b_type.lower()
+                start_id = int(start_str)
+                end_id = int(end_str)
+                
+                if end_id >= start_id and (end_id - start_id) < 1000:
+                    for chunk_id in range(start_id, end_id + 1):
+                        blocks.append((b_type, str(chunk_id), block_size_bp))
+                        if b_type == 'a':
+                            anomaly_intervals.append((curr_pos, curr_pos + block_size_bp))
+                        curr_pos += block_size_bp
+                else:
+                    length_bp = max(0, end_id - start_id)
+                    blocks.append((b_type, f"{start_id}-{end_id}", length_bp))
+                    if b_type == 'a':
+                        anomaly_intervals.append((start_id, end_id))
+                    curr_pos = max(curr_pos, end_id)
+        else:
+            # Fallback to individual chunk tokens like n1n2n3a1a2...
+            token_matches = re.findall(r'([an])(\d+)', pattern_str, re.IGNORECASE)
+            for b_type, b_id in token_matches:
+                b_type = b_type.lower()
+                blocks.append((b_type, b_id, block_size_bp))
+                if b_type == 'a':
+                    anomaly_intervals.append((curr_pos, curr_pos + block_size_bp))
+                curr_pos += block_size_bp
+
+    # 2. Chunk index ranges without 'a'/'n' prefix (e.g. 1-6,7-9,10-12)
+    if not blocks:
+        coord_matches = re.findall(r'(\d+)-(\d+)', pattern_str)
+        if coord_matches:
+            for idx, (s_str, e_str) in enumerate(coord_matches):
+                s_val, e_val = int(s_str), int(e_str)
+                b_type = 'a' if (len(coord_matches) == 3 and idx == 1) or (len(coord_matches) > 3 and 0.25 <= (idx / len(coord_matches)) <= 0.75) else ('n' if idx % 2 == 0 else 'a')
+                for chunk_id in range(s_val, e_val + 1):
+                    blocks.append((b_type, str(chunk_id), block_size_bp))
+                    if b_type == 'a':
+                        anomaly_intervals.append((curr_pos, curr_pos + block_size_bp))
+                    curr_pos += block_size_bp
+
+    return blocks, anomaly_intervals, curr_pos
+
 def parse_filename_to_dir_structure(filename):
     """
     Parses a filename like 'null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k'
+    or 'null-neoaves_alt-Nyctibiidae_10X_up_1-6,7-9,10-11_w50k_s1k'
     Returns a dict with 'null', 'alt', 'pattern', 'locus', 'window_step'.
     """
     import re
+    pattern_regex = r'((?:[a-zA-Z0-9;_-]+[;_,])?(?:[an]?\d+-[an]?\d+[;_,]?)+|(?:[an]\d+)+|\d+-\d+(?:[;_,]\d+-\d+)*)'
     # Fallback structure
-    m = re.search(r'null-(.*?)_alt-(.*?)_((?:[an]\d+)+)_(\d+_\d+m)_(w\w+_s\w+)', filename)
+    m = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(\d+_\d+m)_(w\w+_s\w+)', filename)
     if m:
         return {
             "null": m.group(1),
@@ -30,7 +130,7 @@ def parse_filename_to_dir_structure(filename):
             "relative_dir": f"{m.group(5)}/{m.group(2)}/{m.group(3)}"
         }
     # Attempt parsing without locus chunk
-    m2 = re.search(r'null-(.*?)_alt-(.*?)_((?:[an]\d+)+)_(w\w+_s\w+)', filename)
+    m2 = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(w\w+_s\w+)', filename)
     if m2:
         return {
             "null": m2.group(1),
