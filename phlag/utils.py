@@ -110,6 +110,75 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
 
     return blocks, anomaly_intervals, curr_pos
 
+def get_short_sim_name(sim_name):
+    """
+    Strips redundant category suffixes/infixes from simulation names to match shortened folder names on disk.
+    e.g. 'Nyctibiidae_10X_up' -> 'Nyctibiidae'
+         'N109_10X_down' -> 'N109'
+         'N252_recombination_down' -> 'N252'
+         'N482_N477_admixture_rate090-time2599554' -> 'N482_N477_rate090-time2599554'
+    """
+    s = str(sim_name)
+    s = s.replace("_10X_up", "").replace("_10X_down", "")
+    s = s.replace("_recombination_up", "").replace("_recombination_down", "")
+    s = s.replace("_admixture_", "_")
+    return s
+
+def get_simulation_categories(sim_name):
+    """
+    Categorizes a simulation name or path into two subdirectory levels.
+    Returns (level1, level2) or () if not a recognized 10X/recombination/admixture simulation.
+    
+    10X:
+      up: '10X_up', '10X/up', 'Nyctibiidae', 'N497', 'N544', 'N554', 'N716' -> ('10X', 'up')
+      down: '10X_down', '10X/down', 'N109', 'N498', 'N717' -> ('10X', 'down')
+      
+    recombination:
+      up: 'recombination_up', 'recombination/up' -> ('recombination', 'up')
+      down: 'recombination_down', 'recombination/down', 'N252' -> ('recombination', 'down')
+      
+    admixture:
+      'admixture', or ('rate' and 'time') -> ('admixture', 'low' if time < 4.0 else 'high')
+      Time is parsed from 'time<NUM>' in sim_name (if > 1000, divided by 1e6).
+    """
+    import re
+    s = str(sim_name)
+    if "10X_down" in s or "10X/down" in s:
+        return ("10X", "down")
+    elif "10X_up" in s or "10X/up" in s:
+        return ("10X", "up")
+    elif "recombination_down" in s or "recombination/down" in s:
+        return ("recombination", "down")
+    elif "recombination_up" in s or "recombination/up" in s:
+        return ("recombination", "up")
+    elif "admixture" in s or ("rate" in s and "time" in s):
+        m = re.search(r'time(\d+(?:\.\d+)?)', s)
+        if m:
+            val = float(m.group(1))
+            t_val = val / 1000000.0 if val > 1000 else val
+            sub2 = "low" if t_val < 4.0 else "high"
+        else:
+            sub2 = "low"
+        return ("admixture", sub2)
+    elif "10X" in s:
+        if "down" in s or any(k in s for k in ["N109", "N498", "N717"]):
+            return ("10X", "down")
+        if "up" in s or any(k in s for k in ["Nyctibiidae", "N497", "N544", "N554", "N716"]):
+            return ("10X", "up")
+    elif "recombination" in s:
+        if "down" in s or "N252" in s:
+            return ("recombination", "down")
+        if "up" in s:
+            return ("recombination", "up")
+    # Check node stubs
+    if any(k in s for k in ["Nyctibiidae", "N497", "N544", "N554", "N716"]):
+        return ("10X", "up")
+    if any(k in s for k in ["N109", "N498", "N717"]):
+        return ("10X", "down")
+    if "N252" in s:
+        return ("recombination", "down")
+    return ()
+
 def parse_filename_to_dir_structure(filename):
     """
     Parses a filename like 'null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k'
@@ -121,23 +190,31 @@ def parse_filename_to_dir_structure(filename):
     # Fallback structure
     m = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(\d+_\d+m)_(w\w+_s\w+)', filename)
     if m:
+        alt_name = m.group(2)
+        short_alt = get_short_sim_name(alt_name)
+        cats = get_simulation_categories(alt_name)
+        cat_prefix = f"{cats[0]}/{cats[1]}/" if cats else ""
         return {
             "null": m.group(1),
-            "alt": m.group(2),
+            "alt": alt_name,
             "pattern": m.group(3),
             "locus": m.group(4),
             "window_step": m.group(5),
-            "relative_dir": f"{m.group(5)}/{m.group(2)}/{m.group(3)}"
+            "relative_dir": f"{m.group(5)}/{cat_prefix}{short_alt}/{m.group(3)}"
         }
     # Attempt parsing without locus chunk
     m2 = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(w\w+_s\w+)', filename)
     if m2:
+        alt_name = m2.group(2)
+        short_alt = get_short_sim_name(alt_name)
+        cats = get_simulation_categories(alt_name)
+        cat_prefix = f"{cats[0]}/{cats[1]}/" if cats else ""
         return {
             "null": m2.group(1),
-            "alt": m2.group(2),
+            "alt": alt_name,
             "pattern": m2.group(3),
             "window_step": m2.group(4),
-            "relative_dir": f"{m2.group(4)}/{m2.group(2)}/{m2.group(3)}"
+            "relative_dir": f"{m2.group(4)}/{cat_prefix}{short_alt}/{m2.group(3)}"
         }
     return None
 
@@ -176,100 +253,60 @@ def limited_float(min_val, max_val):
 
 def limited_int(min_val, max_val):
     def check_range(value):
-        fvalue = int(value)
-        if not (min_val <= fvalue <= max_val):
+        ivalue = int(value)
+        if not (min_val <= ivalue <= max_val):
             raise ValueError(
-                f"Argument must be an integer between {min_val} and {max_val} (inclusive)."
+                f"Argument must be between {min_val} and {max_val} (inclusive)."
             )
-        return fvalue
+        return ivalue
 
     return check_range
 
 
 def timeit(func):
-    """
-    A decorator that measures the execution time of a function.
-    """
-
     @wraps(func)
     def wrapper(*args, **kwargs):
-        start_time = time.perf_counter()
+        start_time = time.time()
         result = func(*args, **kwargs)
-        end_time = time.perf_counter()
-        elapsed_time = end_time - start_time
-        print(f"Function '{func.__name__}' executed in {elapsed_time:.4f} seconds.")
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Function {func.__name__} took {execution_time:.4f} seconds to execute.")
         return result
 
     return wrapper
 
 
 def get_repo_root():
-    """
-    Resolves the repository root directory.
-    Checks:
-    1. PHLAG_REPO_ROOT environment variable
-    2. ~/phlag (pathlib.Path.home() / "phlag") if it exists
-    3. pathlib.Path.cwd() if it contains a 'caster' or 'phlag' directory
-    4. Fallback to pathlib.Path(__file__).parent.parent.resolve()
-    """
-    import os
     import pathlib
-    env_root = os.environ.get("PHLAG_REPO_ROOT")
-    if env_root:
-        return pathlib.Path(env_root).resolve()
-        
-    home_phlag = pathlib.Path.home() / "phlag"
-    if home_phlag.exists():
-        return home_phlag.resolve()
-        
-    cwd = pathlib.Path.cwd()
-    if (cwd / "caster").exists() or (cwd / "phlag").exists():
-        return cwd.resolve()
-        
-    return pathlib.Path(__file__).parent.parent.resolve()
+    return pathlib.Path(__file__).resolve().parent.parent
 
 
 def get_data_dir():
     """
-    Resolves the data directory to use. Looks up the CONNECTION_DIR, PHLAG_DIR or LARGE_DIR environment variable
-    or reads it from a .env file. Defaults to repo_root / "caster" / "data" if not found.
+    Returns the user data output directory where scores and HMM state files should be stored.
+    Checks CONNECTION_DIR environment variable first, then defaults to /drive2/iang/phlag if present,
+    else repository 'caster/data' directory.
     """
     import os
     import pathlib
-    target_dir = os.environ.get("CONNECTION_DIR") or os.environ.get("PHLAG_DIR") or os.environ.get("LARGE_DIR")
-    if not target_dir:
-        repo_root = get_repo_root()
-        # Search for .env file at repo root or cwd
-        for base_dir in [repo_root, pathlib.Path.cwd()]:
-            env_path = base_dir / ".env"
-            if env_path.exists():
-                try:
-                    with open(env_path, "r") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("#") and "=" in line:
-                                key, val = line.split("=", 1)
-                                key_str = key.strip()
-                                if key_str in ("CONNECTION_DIR", "PHLAG_DIR", "LARGE_DIR"):
-                                    target_dir = val.strip().strip("'").strip('"')
-                                    break
-                except Exception:
-                    pass
-            if target_dir:
-                break
-    if target_dir:
-        return pathlib.Path(target_dir)
-    else:
-        repo_root = get_repo_root()
-        return repo_root / "caster" / "data"
+    conn_env = os.environ.get("CONNECTION_DIR")
+    if conn_env:
+        return pathlib.Path(conn_env)
+    
+    drive2_dir = pathlib.Path("/drive2/iang/phlag")
+    if drive2_dir.exists():
+        return drive2_dir
+        
+    return get_repo_root() / "caster" / "data"
 
 
 def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
     """
-    Resolves a file path input that might be relative, absolute,
-    or base filename without path or extension.
+    Resolves a user-provided file or directory path flexibly.
+    Supports absolute paths, relative paths, filenames without directory,
+    stem names without extension, directory names containing fasta files,
+    and automatic searches within repo store/msa/simulations directories.
     """
-    import os
     import pathlib
 
     if path_input is None:
@@ -277,45 +314,34 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
 
     path_obj = pathlib.Path(path_input)
 
-    # 1. Direct check
-    if path_obj.exists():
+    # 1. Direct path check (file exists)
+    if path_obj.exists() and path_obj.is_file():
         return path_obj.resolve()
 
-    if default_exts is None:
-        default_exts = [".fa", ".fasta", ".tsv", ".txt", ".fa.gz"]
-
-    if default_subdirs is None:
-        default_subdirs = [
-            "msa/concat", "msa", "concat", 
-            "store/msa/concat", "store/msa", "store", 
-            "scores", "mapping"
-        ]
-    else:
-        expanded = []
-        for s in default_subdirs:
-            expanded.append(s)
-            if "msa" in s:
-                expanded.extend(["msa/concat", "concat", "store/msa/concat", "store/msa", "store"])
-        default_subdirs = expanded
-
-    # Generate extensions to try
-    exts_to_try = [""]
-    if not path_obj.suffix:
-        exts_to_try.extend(default_exts)
-
+    # 2. Build candidate filenames
     candidates = []
-    for ext in exts_to_try:
-        if ext:
-            candidates.append(path_obj.with_suffix(ext))
+    if path_obj.suffix:
+        candidates.append(path_obj)
+    else:
+        if default_exts:
+            for ext in default_exts:
+                if not ext.startswith("."):
+                    ext = "." + ext
+                candidates.append(pathlib.Path(str(path_obj) + ext))
         else:
-            candidates.append(path_obj)
+            candidates.extend([
+                pathlib.Path(str(path_obj) + ".fa"),
+                pathlib.Path(str(path_obj) + ".fasta"),
+                pathlib.Path(str(path_obj) + ".tsv"),
+                pathlib.Path(str(path_obj) + ".txt"),
+            ])
 
-    # 2. Check candidates directly
+    # Direct candidate checks relative to CWD
     for cand in candidates:
-        if cand.exists():
+        if cand.exists() and cand.is_file():
             return cand.resolve()
 
-    # 3. Search in candidate directories
+    # 3. Build search directories
     repo_root = get_repo_root()
     data_dir = get_data_dir()
 
@@ -331,6 +357,12 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
         pathlib.Path("/drive2/iang"),
     ]
 
+    if default_subdirs is None:
+        default_subdirs = [
+            "store/msa/concat", "store/msa", "store", 
+            "msa/concat", "msa", "concat", "simulations"
+        ]
+
     search_dirs = []
     for base in search_bases:
         if base.exists():
@@ -340,7 +372,7 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
                 if sub_path.exists():
                     search_dirs.append(sub_path)
             try:
-                for sim_sub in base.glob("simulations/*/concat"):
+                for sim_sub in list(base.glob("simulations/*/*/*/concat")) + list(base.glob("simulations/*/concat")):
                     if sim_sub.is_dir():
                         search_dirs.append(sim_sub)
             except Exception:
@@ -365,7 +397,7 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
             if check_path.exists() and check_path.is_file():
                 return check_path.resolve()
 
-    # 5. Directory resolution: Check for concat subfolder under directory candidates
+    # 5. Directory resolution
     clean_name = path_obj.name
     if clean_name.startswith("alt-"):
         clean_name = clean_name[4:]
@@ -373,19 +405,32 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
     if len(parts) == 2 and parts[1].isdigit():
         clean_name = parts[0]
 
-    dir_candidates = [
-        path_obj,
-        repo_root / "connection_dir" / "simulations" / clean_name,
-        data_dir / "simulations" / clean_name,
-        data_dir / clean_name,
-        repo_root / "simulations" / clean_name,
-        pathlib.Path("/drive2/iang/simulations") / clean_name,
-        repo_root / "connection_dir" / "simulations" / path_obj.name,
-        data_dir / "simulations" / path_obj.name,
-        data_dir / path_obj.name,
-        repo_root / "simulations" / path_obj.name,
-        pathlib.Path("/drive2/iang/simulations") / path_obj.name,
-    ]
+    cats = get_simulation_categories(clean_name) or get_simulation_categories(path_obj.name)
+    short_clean = get_short_sim_name(clean_name)
+    short_path_name = get_short_sim_name(path_obj.name)
+    names_to_try = []
+    for n in [short_clean, short_path_name, clean_name, path_obj.name]:
+        if n and n not in names_to_try:
+            names_to_try.append(n)
+
+    dir_candidates = [path_obj]
+    if cats:
+        cat_rel = pathlib.Path(cats[0]) / cats[1]
+        for sname in names_to_try:
+            dir_candidates.extend([
+                repo_root / "connection_dir" / "simulations" / cat_rel / sname,
+                data_dir / "simulations" / cat_rel / sname,
+                repo_root / "simulations" / cat_rel / sname,
+                pathlib.Path("/drive2/iang/simulations") / cat_rel / sname,
+            ])
+    for sname in names_to_try:
+        dir_candidates.extend([
+            repo_root / "connection_dir" / "simulations" / sname,
+            data_dir / "simulations" / sname,
+            data_dir / sname,
+            repo_root / "simulations" / sname,
+            pathlib.Path("/drive2/iang/simulations") / sname,
+        ])
     for dcand in dir_candidates:
         if dcand.exists() and dcand.is_dir():
             concat_dir = dcand / "concat"

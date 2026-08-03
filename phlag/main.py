@@ -175,12 +175,29 @@ class Phlag:
                         rel_parts = list(parts[i+1:])
                         break
                 if rel_parts:
+                    from .utils import get_simulation_categories, get_short_sim_name
+                    for idx, p in enumerate(rel_parts):
+                        cats = get_simulation_categories(p)
+                        if cats:
+                            short_p = get_short_sim_name(p)
+                            rel_parts[idx] = short_p
+                            if not (cats[0] in rel_parts and cats[1] in rel_parts):
+                                rel_parts = rel_parts[:idx] + list(cats) + rel_parts[idx:]
+                            break
                     sub_path = pathlib.Path(*rel_parts)
                     out_dir = base_dir / "phlag" / dist_type / sub_path / "phlag"
                 else:
-                    out_dir = base_dir / "phlag" / dist_type / locus_dir.name / "phlag"
+                    from .utils import get_simulation_categories, get_short_sim_name
+                    cats = get_simulation_categories(locus_dir.name)
+                    short_name = get_short_sim_name(locus_dir.name)
+                    cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
+                    out_dir = base_dir / "phlag" / dist_type / cat_prefix / short_name / "phlag"
             else:
-                out_dir = base_dir / "phlag" / dist_type / input_path.stem / "phlag"
+                from .utils import get_simulation_categories, get_short_sim_name
+                cats = get_simulation_categories(input_path.stem)
+                short_name = get_short_sim_name(input_path.stem)
+                cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
+                out_dir = base_dir / "phlag" / dist_type / cat_prefix / short_name / "phlag"
         return out_dir
 
     def determine_optimal_mixtures(self):

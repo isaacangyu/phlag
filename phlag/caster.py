@@ -185,12 +185,29 @@ def main():
                     break
             
             if sim_name and locus_stem:
-                from .utils import get_data_dir
-                sim_base = get_data_dir() / "simulations" / sim_name
-                cand_fasta = sim_base / "concat" / f"{locus_stem}.fa"
-                if not cand_fasta.exists():
-                    cand_fasta = sim_base / f"{locus_stem}.fa"
-                if cand_fasta.exists():
+                from .utils import get_data_dir, get_simulation_categories, get_short_sim_name
+                cats = get_simulation_categories(sim_name)
+                short_sim = get_short_sim_name(sim_name)
+                candidate_bases = []
+                data_dir = get_data_dir()
+                if cats:
+                    for sname in set([short_sim, sim_name]):
+                        candidate_bases.append(data_dir / "simulations" / cats[0] / cats[1] / sname)
+                        candidate_bases.append(pathlib.Path("/drive2/iang/simulations") / cats[0] / cats[1] / sname)
+                for sname in set([short_sim, sim_name]):
+                    candidate_bases.append(data_dir / "simulations" / sname)
+                    candidate_bases.append(pathlib.Path("/drive2/iang/simulations") / sname)
+                
+                cand_fasta = None
+                for base in candidate_bases:
+                    if (base / "concat" / f"{locus_stem}.fa").exists():
+                        cand_fasta = base / "concat" / f"{locus_stem}.fa"
+                        break
+                    elif (base / f"{locus_stem}.fa").exists():
+                        cand_fasta = base / f"{locus_stem}.fa"
+                        break
+                
+                if cand_fasta:
                     args.fasta_file = cand_fasta
                 else:
                     args.fasta_file = resolve_input_file(args.fasta_file, default_subdirs=["msa/concat", "msa", "concat", "concat_*", "simulations"], default_exts=[".fa", ".fasta", ".fa.gz"])
@@ -209,14 +226,15 @@ def main():
         
         # Check if sim_name was present in original input path parts (e.g. store/phlag/.../Strigiformes_N297_admixture_.../...)
         for p in pathlib.Path(input_str).parts if 'input_str' in locals() else args.fasta_file.parts:
-            if "admixture" in p or "recombination" in p:
+            if "admixture" in p or "recombination" in p or "10X" in p:
                 sim_dir_name = p
                 break
         
         # Determine left node for quadripartition mapping
-        node_name = stem
         if "_" in sim_dir_name:
             node_name = sim_dir_name.split("_")[0]  # Left node for quadripartition mapping
+        else:
+            node_name = sim_dir_name
             
         default_map = sim_dir / f"neoaves_{node_name}_mapping.tsv"
         
@@ -224,7 +242,17 @@ def main():
             args.mapping = default_map
         else:
             # Fallback 1: search for mapping file under simulations directory using sim_dir_name or node_name
-            sim_map = resolve_input_file(f"neoaves_{node_name}_mapping.tsv", default_subdirs=[f"simulations/{sim_dir_name}", "simulations", "mapping"], default_exts=[".tsv"])
+            from .utils import get_simulation_categories, get_short_sim_name
+            cats = get_simulation_categories(sim_dir_name)
+            short_sim = get_short_sim_name(sim_dir_name)
+            map_subdirs = []
+            if cats:
+                for sname in set([short_sim, sim_dir_name]):
+                    map_subdirs.append(f"simulations/{cats[0]}/{cats[1]}/{sname}")
+            map_subdirs.extend(["simulations/null", f"simulations/{sim_dir_name}", "simulations", "mapping"])
+            sim_map = resolve_input_file(f"neoaves_{node_name}_mapping.tsv", default_subdirs=map_subdirs, default_exts=[".tsv"])
+            if not sim_map:
+                sim_map = resolve_input_file(f"avian_{node_name}_mapping.tsv", default_subdirs=map_subdirs, default_exts=[".tsv"])
             if sim_map and sim_map.exists():
                 args.mapping = sim_map
             else:
@@ -534,12 +562,20 @@ def main():
             
             parts = args.fasta_file.parts
             is_sim = False
-            if "simulations" in parts and "concat" in parts:
-                sim_idx = parts.index("simulations")
-                if sim_idx + 1 < len(parts):
-                    sim_name = parts[sim_idx + 1]
-                    final_output_path = data_dir / "phlag" / args.dist_type / f"w{window_str}_s{step_str}" / sim_name / clean_stem / "caster" / "scores.tsv"
-                    is_sim = True
+            if "simulations" in parts:
+                sim_dir = args.fasta_file.parent
+                if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
+                    sim_dir = sim_dir.parent
+                sim_name = sim_dir.name
+                
+                from .utils import get_simulation_categories, get_short_sim_name
+                cats = get_simulation_categories(sim_name)
+                short_sim = get_short_sim_name(sim_name)
+                if cats:
+                    final_output_path = data_dir / "phlag" / args.dist_type / f"w{window_str}_s{step_str}" / cats[0] / cats[1] / short_sim / clean_stem / "caster" / "scores.tsv"
+                else:
+                    final_output_path = data_dir / "phlag" / args.dist_type / f"w{window_str}_s{step_str}" / short_sim / clean_stem / "caster" / "scores.tsv"
+                is_sim = True
             
             if not is_sim:
                 final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
