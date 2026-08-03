@@ -674,12 +674,12 @@ class PhlagPlotter:
             0: {
                 'line': '#2B4C7E',    # Deep Steel Blue
                 'fill': '#2B4C7E',
-                'label': 'State 0 (Null)'
+                'label': 'Null'
             },
             1: {
                 'line': '#E05A47',    # Warm Coral
                 'fill': '#E05A47',
-                'label': 'State 1 (Alternative)'
+                'label': 'Alt'
             }
         }
 

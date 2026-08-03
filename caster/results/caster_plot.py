@@ -439,7 +439,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
     for d in dims_to_iterate:
         if d is None:
             y_d = Y
-            topo_name = "All_Topologies"
+            topo_name = "All"
             y_plot = np.linalg.norm(Y, axis=1)
         else:
             y_d = np.array(Y[:, [d]])
@@ -500,19 +500,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             n_N = len(y_sub_N)
             n_A = len(y_sub_A)
             
-            # Save global 2-means plot (kmeans_2_{topo_name}.png)
-            plt.figure(figsize=(10, 5))
-            sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
-            plt.title(f"{topo_name} | Global 2-means Partitioning (0=Null, 1=Alternative)", fontsize=12, fontweight='bold')
-            plt.xlabel("Position (kb)", fontsize=10)
-            plt.ylabel("Normalized score", fontsize=10)
-            plt.tight_layout()
-            plot_path_2 = output_dir / f"kmeans_2_{topo_name}.png"
-            plt.savefig(plot_path_2, dpi=150)
-            plt.close()
-            print(f"Saved diagnostic global partitioning plot to: {plot_path_2}")
-            
+
             # Search for best split kn + ka = k_opt minimizing total within-cluster sum of squares (inertia)
             best_kn = 1
             best_ka = k_opt - 1
@@ -560,13 +548,10 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 num_mixtures_matrix[0, d] = best_kn
                 num_mixtures_matrix[1, d] = best_ka
             
-            # Save Null sub-cluster plot if kn >= 1
-            if best_kn >= 1:
-                if best_kn > 1:
-                    sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
-                    sub_labels = sub_kmeans.fit_predict(y_sub_N)
-                else:
-                    sub_labels = np.zeros(len(y_sub_N), dtype=int)
+            # Save Null sub-cluster plot if kn > 1
+            if best_kn > 1:
+                sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+                sub_labels = sub_kmeans.fit_predict(y_sub_N)
                 
                 plt.figure(figsize=(10, 5))
                 sns.set_theme(style="whitegrid")
@@ -580,13 +565,10 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 plt.close()
                 print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
                 
-            # Save Alternative sub-cluster plot if ka >= 1
-            if best_ka >= 1:
-                if best_ka > 1:
-                    sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
-                    sub_labels = sub_kmeans.fit_predict(y_sub_A)
-                else:
-                    sub_labels = np.zeros(len(y_sub_A), dtype=int)
+            # Save Alternative sub-cluster plot if ka > 1
+            if best_ka > 1:
+                sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+                sub_labels = sub_kmeans.fit_predict(y_sub_A)
                 
                 plt.figure(figsize=(10, 5))
                 sns.set_theme(style="whitegrid")
