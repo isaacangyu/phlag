@@ -78,11 +78,13 @@ class CasterPlotter:
             sim_part = None
             locus_stem = None
 
-            for p in parts:
+            for idx, p in enumerate(parts):
                 if re.match(r'w\w+_s\w+', p):
                     w_s_part = p
                 elif p in ['admixture', '10X', 'recombination']:
                     cat_part = p
+                    if idx + 1 < len(parts) and parts[idx + 1] in ['up', 'down', 'low', 'high']:
+                        cat_part = f"{p}_{parts[idx + 1]}"
                 elif p not in ['scores.tsv', 'caster', 'phlag', 'store', 'gaussian', 'gmm', 'low', 'high', 'up', 'down']:
                     if '_' in p or 'N' in p or 'Nyctibiidae' in p or 'Strigiformes' in p:
                         if not sim_part:
@@ -227,6 +229,7 @@ class CasterPlotter:
                         ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label='Null Fit')
                         ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
                         ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                        ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
                     if len(df_alt) > 1:
                         mu_alt, std_alt = norm.fit(df_alt[col])
@@ -234,6 +237,7 @@ class CasterPlotter:
                         ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit')
                         ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
                         ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                        ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
             else:
                 color = self.color_mapping.get(col, '#2B4C7E')
                 sns.histplot(self.df[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=color, label='Observed Data', bins=30)
@@ -244,6 +248,7 @@ class CasterPlotter:
                     ax.plot(x_grid, pdf_tot, color=color, linewidth=2.2, label=f'Fit')
                     ax.axvline(mu_tot, color=color, linestyle='--', linewidth=1.5)
                     ax.text(mu_tot, 0.90, f"$\\mu={mu_tot:.2f}$", transform=trans, color=color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    ax.text(mu_tot + std_tot, 0.82, f"$\\sigma={std_tot:.2f}$", transform=trans, color=color, fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
             ax.set_title(f'Topology: {topo_name}', fontsize=12, fontweight='bold')
             ax.set_xlabel(f'{norm_label} Score')

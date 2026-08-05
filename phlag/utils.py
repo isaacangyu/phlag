@@ -261,11 +261,13 @@ def get_locus_description(file_path):
     sim_part = None
     pattern_stem = None
 
-    for p in parts:
+    for idx, p in enumerate(parts):
         if re.match(r'w\w+_s\w+', p):
             w_s_part = p
         elif p in ['admixture', '10X', 'recombination']:
             cat_part = p
+            if idx + 1 < len(parts) and parts[idx + 1] in ['up', 'down', 'low', 'high']:
+                cat_part = f"{p}_{parts[idx + 1]}"
         elif p not in ['scores.tsv', 'report.tsv', 'caster', 'phlag', 'store', 'gaussian', 'gmm', 'low', 'high', 'up', 'down', 'simulations']:
             if '_' in p or 'N' in p or 'Nyctibiidae' in p or 'Strigiformes' in p:
                 if not sim_part and not re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', p):

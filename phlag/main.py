@@ -32,7 +32,7 @@ class Phlag:
         self.args = args
         if not hasattr(self.args, "n_iters"):
             self.args.n_iters = 10
-        self.args.increment_steps = 50
+        self.args.increment_steps = 5
         if not hasattr(self.args, "step_size"):
             self.args.step_size = None
 
@@ -165,8 +165,8 @@ class Phlag:
         else:
             if input_path.parent.name == "caster":
                 # Find path relative to model design or phlag root if input is in a caster subfolder
-                # e.g., .../phlag/gaussian/w50k_s1k/Nyctibiidae_10X_up/n1n2n3n4n5a1a2a3n6n8n10n11/caster/scores.tsv
-                # should preserve w50k_s1k/Nyctibiidae_10X_up/n1n2n3n4n5a1a2a3n6n8n10n11 under phlag/<dist_type>/
+                # e.g., .../phlag/gaussian/w50k_s1k/admixture/high/Columbiformes_.../40-65/caster/scores.tsv
+                # should preserve w50k_s1k/admixture/high/Columbiformes_.../40-65 under phlag/<dist_type>/
                 locus_dir = input_path.parent.parent
                 parts = locus_dir.parts
                 # Check if model design or 'phlag' is in parent path parts
@@ -177,15 +177,6 @@ class Phlag:
                         rel_parts = list(parts[i+1:])
                         break
                 if rel_parts:
-                    from .utils import get_simulation_categories, get_short_sim_name
-                    for idx, p in enumerate(rel_parts):
-                        cats = get_simulation_categories(p)
-                        if cats:
-                            short_p = get_short_sim_name(p)
-                            rel_parts[idx] = short_p
-                            if not (cats[0] in rel_parts and cats[1] in rel_parts):
-                                rel_parts = rel_parts[:idx] + list(cats) + rel_parts[idx:]
-                            break
                     sub_path = pathlib.Path(*rel_parts)
                     out_dir = phlag_base / dist_type / sub_path / "phlag"
                 else:
