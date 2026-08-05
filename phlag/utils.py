@@ -110,6 +110,22 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
 
     return blocks, anomaly_intervals, curr_pos
 
+def clean_locus_name(locus_str):
+    """
+    Cleans locus strings by stripping 'concat' patterns, prefixes, and file extension tokens.
+    e.g. 'neoaves_N482_N477_rate090-time2599554_a200k-a700k_10M_concat' -> 'N482_N477_rate090-time2599554_a200k-a700k'
+         'n1n2n3n4n5n6a1a2a3n8n10n11_10M_concat' -> 'n1n2n3n4n5n6a1a2a3n8n10n11'
+         'Strigiformes_N297_rate090-time7099554_concat' -> 'Strigiformes_N297_rate090-time7099554'
+    """
+    import re
+    if not locus_str:
+        return ""
+    s = str(locus_str).strip()
+    s = re.sub(r'_(?:10m_|10m|10M_|10M_)?concat(?:_\w+)?$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'_concat$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^(?:neoaves_|avian_)', '', s, flags=re.IGNORECASE)
+    return s
+
 def get_short_sim_name(sim_name):
     """
     Strips redundant category suffixes/infixes from simulation names to match shortened folder names on disk.
@@ -118,7 +134,7 @@ def get_short_sim_name(sim_name):
          'N252_recombination_down' -> 'N252'
          'N482_N477_admixture_rate090-time2599554' -> 'N482_N477_rate090-time2599554'
     """
-    s = str(sim_name)
+    s = clean_locus_name(sim_name)
     s = s.replace("_10X_up", "").replace("_10X_down", "")
     s = s.replace("_recombination_up", "").replace("_recombination_down", "")
     s = s.replace("_admixture_", "_")
@@ -179,6 +195,109 @@ def get_simulation_categories(sim_name):
         return ("recombination", "down")
     return ()
 
+def convert_pattern_to_interval(pattern_str):
+    """
+    Converts a pattern string (which may be a string pattern like 'n1n2n3n4n5n6a1a2a3n8n10n11'
+    or 'n4n6n3n8n9a3a1a2n1n10n12n2_40-65') into an interval representation (e.g. '40-65').
+    """
+    if not pattern_str:
+        return ""
+    import re
+    s = str(pattern_str).strip()
+
+    # 1. Check for trailing explicit interval suffix e.g. '_40-65', ';40-65', '40-65'
+    m_suffix = re.search(r'(?:^|[;_,])(\d+-\d+(?:[;_,]\d+-\d+)*)$', s)
+    if m_suffix:
+        return m_suffix.group(1)
+
+    # 2. Check if string is already a pure interval (e.g., '40-65', '1-6,7-9,10-11', '70-80,85-100')
+    if re.fullmatch(r'\d+-\d+(?:[;_,]\d+-\d+)*', s):
+        return s
+
+    # 3. Check for aXXk-aYYk_ZZM format
+    m_ak = re.search(r'a(\d+)k-a(\d+)k_(\d+)M', s, re.IGNORECASE)
+    if m_ak:
+        start_k = int(m_ak.group(1))
+        end_k = int(m_ak.group(2))
+        total_m = int(m_ak.group(3))
+        start_pct = int(round((start_k * 1000) / (total_m * 1000000) * 100))
+        end_pct = int(round((end_k * 1000) / (total_m * 1000000) * 100))
+        return f"{start_pct}-{end_pct}"
+
+    # 4. Handle token patterns containing 'a' and 'n' (e.g. 'n1n2n3n4n5n6a1a2a3n8n10n11')
+    if re.search(r'[an]\d+', s, re.IGNORECASE):
+        # General conversion via parse_pattern_string
+        try:
+            blocks, anomaly_intervals, total_span = parse_pattern_string(s)
+            if anomaly_intervals and total_span:
+                parts = []
+                for start_bp, end_bp in anomaly_intervals:
+                    start_pct = int(round((start_bp / total_span) * 100))
+                    end_pct = int(round((end_bp / total_span) * 100))
+                    parts.append(f"{start_pct}-{end_pct}")
+                if parts:
+                    return ",".join(parts)
+        except Exception:
+            pass
+
+    return s
+
+def get_locus_description(file_path):
+    """
+    Extracts a full locus description (branch, params, change/pattern, category, window/step size)
+    from a file path or filename, matching Caster's scatter plot locus format.
+    e.g. 'N482_N477_rate090-time2599554_40-65_admixture_w50k_s1k'
+    """
+    if not file_path:
+        return ""
+    import re
+    import pathlib
+
+    file_path = pathlib.Path(file_path)
+    parts = file_path.parts
+
+    w_s_part = None
+    cat_part = None
+    sim_part = None
+    pattern_stem = None
+
+    for p in parts:
+        if re.match(r'w\w+_s\w+', p):
+            w_s_part = p
+        elif p in ['admixture', '10X', 'recombination']:
+            cat_part = p
+        elif p not in ['scores.tsv', 'report.tsv', 'caster', 'phlag', 'store', 'gaussian', 'gmm', 'low', 'high', 'up', 'down', 'simulations']:
+            if '_' in p or 'N' in p or 'Nyctibiidae' in p or 'Strigiformes' in p:
+                if not sim_part and not re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', p):
+                    sim_part = clean_locus_name(p)
+
+    for idx, p in enumerate(parts):
+        if p in ['phlag', 'caster'] and idx > 0:
+            candidate = clean_locus_name(parts[idx - 1])
+            if candidate not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations']:
+                if re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', candidate) or 'a' in candidate.lower() or 'n' in candidate.lower():
+                    pattern_stem = candidate
+                elif not sim_part:
+                    sim_part = candidate
+            if idx > 1 and not sim_part:
+                candidate2 = clean_locus_name(parts[idx - 2])
+                if candidate2 not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations']:
+                    sim_part = candidate2
+
+    locus_tokens = []
+    if sim_part:
+        locus_tokens.append(clean_locus_name(sim_part))
+    if pattern_stem and pattern_stem != sim_part:
+        locus_tokens.append(convert_pattern_to_interval(pattern_stem))
+    if cat_part and (not sim_part or cat_part not in sim_part):
+        locus_tokens.append(cat_part)
+    if w_s_part:
+        locus_tokens.append(w_s_part)
+
+    if locus_tokens:
+        return "_".join(filter(None, locus_tokens))
+    return clean_locus_name(file_path.stem)
+
 def parse_filename_to_dir_structure(filename):
     """
     Parses a filename like 'null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k'
@@ -194,13 +313,14 @@ def parse_filename_to_dir_structure(filename):
         short_alt = get_short_sim_name(alt_name)
         cats = get_simulation_categories(alt_name)
         cat_prefix = f"{cats[0]}/{cats[1]}/" if cats else ""
+        pattern_val = convert_pattern_to_interval(m.group(3))
         return {
             "null": m.group(1),
             "alt": alt_name,
-            "pattern": m.group(3),
+            "pattern": pattern_val,
             "locus": m.group(4),
             "window_step": m.group(5),
-            "relative_dir": f"{m.group(5)}/{cat_prefix}{short_alt}/{m.group(3)}"
+            "relative_dir": f"{m.group(5)}/{cat_prefix}{short_alt}/{pattern_val}"
         }
     # Attempt parsing without locus chunk
     m2 = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(w\w+_s\w+)', filename)
@@ -209,12 +329,13 @@ def parse_filename_to_dir_structure(filename):
         short_alt = get_short_sim_name(alt_name)
         cats = get_simulation_categories(alt_name)
         cat_prefix = f"{cats[0]}/{cats[1]}/" if cats else ""
+        pattern_val = convert_pattern_to_interval(m2.group(3))
         return {
             "null": m2.group(1),
             "alt": alt_name,
-            "pattern": m2.group(3),
+            "pattern": pattern_val,
             "window_step": m2.group(4),
-            "relative_dir": f"{m2.group(4)}/{cat_prefix}{short_alt}/{m2.group(3)}"
+            "relative_dir": f"{m2.group(4)}/{cat_prefix}{short_alt}/{pattern_val}"
         }
     return None
 
@@ -284,20 +405,45 @@ def get_repo_root():
 def get_data_dir():
     """
     Returns the user data output directory where scores and HMM state files should be stored.
-    Checks CONNECTION_DIR environment variable first, then defaults to /drive2/iang/phlag if present,
+    Checks CONNECTION_DIR environment variable or .env file first, then defaults to /drive2/iang if present,
     else repository 'caster/data' directory.
     """
     import os
     import pathlib
     conn_env = os.environ.get("CONNECTION_DIR")
+    if not conn_env:
+        try:
+            env_file = get_repo_root() / ".env"
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if line.startswith("CONNECTION_DIR="):
+                        conn_env = line.split("=", 1)[1].strip().strip("\"'")
+                        break
+        except Exception:
+            pass
+
     if conn_env:
         return pathlib.Path(conn_env)
     
-    drive2_dir = pathlib.Path("/drive2/iang/phlag")
+    drive2_dir = pathlib.Path("/drive2/iang")
     if drive2_dir.exists():
         return drive2_dir
         
     return get_repo_root() / "caster" / "data"
+
+
+def get_phlag_output_base(base_path=None):
+    """
+    Ensures that output paths do not duplicate 'phlag/phlag' when base_path already ends with 'phlag'.
+    """
+    import pathlib
+    if base_path is None:
+        base_path = get_data_dir()
+    p = pathlib.Path(base_path)
+    if p.name.lower() == "phlag":
+        return p
+    return p / "phlag"
 
 
 def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
@@ -486,7 +632,7 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
                 search_dirs.append(sp)
 
     # Also search recursively in model output directories (store/phlag, phlag, data_dir) for scores files
-    for base in [repo_root / "store" / "phlag", repo_root / "phlag", data_dir / "phlag", data_dir]:
+    for base in [get_phlag_output_base(repo_root / "store" / "phlag"), get_phlag_output_base(data_dir), repo_root / "phlag", data_dir]:
         if base.exists():
             try:
                 for score_file in base.rglob("scores.tsv"):

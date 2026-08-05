@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None, plot_dstar=False, plot_scores=True, plot_dist=True):
+    def __init__(self, scores_file, distribution='gaussian', data_dir='../data', topologies=None, plot_dstar=False, plot_scores=True, plot_dist=True, plot_hist=False):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir
@@ -47,26 +47,71 @@ class CasterPlotter:
 
             # 1. Run empirical histograms with optional parametric distribution overlay
             if plot_dist:
-                self.plot_caster_histograms()
+                self.plot_caster_histograms(show_fits=True, filename='dist.png')
                 if self.plot_dstar:
                     self.plot_dstar_histogram()
+
+            if plot_hist:
+                self.plot_caster_histograms(show_fits=False, filename='hist.png')
             
             # 2. Scatter plot three topology scores over the genome
             if plot_scores:
                 self.plot_topology_scatter()
 
     def extract_filename_parameters(self):
-        """Extracts genomic filename and normalization token from path."""
-        base_name = os.path.basename(self.scores_file)
+        """Extracts genomic locus descriptor and normalization token from path."""
+        from phlag.utils import clean_locus_name
+        file_path = pathlib.Path(self.scores_file)
+        base_name = file_path.name
         
-        # Check if the filename ends with normalized suffix before the extension
         name_part, ext = os.path.splitext(base_name)
         if name_part.endswith('_n'):
-            self.gene_name = name_part[:-2]
+            name_part = name_part[:-2]
             self.is_normalized_file = True
         else:
-            self.gene_name = name_part
             self.is_normalized_file = False
+
+        if name_part in ['scores', 'scores.tsv', ''] or base_name == 'scores.tsv':
+            parts = file_path.parts
+            w_s_part = None
+            cat_part = None
+            sim_part = None
+            locus_stem = None
+
+            for p in parts:
+                if re.match(r'w\w+_s\w+', p):
+                    w_s_part = p
+                elif p in ['admixture', '10X', 'recombination']:
+                    cat_part = p
+                elif p not in ['scores.tsv', 'caster', 'phlag', 'store', 'gaussian', 'gmm', 'low', 'high', 'up', 'down']:
+                    if '_' in p or 'N' in p or 'Nyctibiidae' in p or 'Strigiformes' in p:
+                        if not sim_part:
+                            sim_part = clean_locus_name(p)
+
+            caster_indices = [i for i, p in enumerate(parts) if p == 'caster']
+            if caster_indices and caster_indices[0] > 0:
+                locus_stem = clean_locus_name(parts[caster_indices[0] - 1])
+                if caster_indices[0] - 2 >= 0 and not sim_part:
+                    candidate = clean_locus_name(parts[caster_indices[0] - 2])
+                    if candidate not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm']:
+                        sim_part = candidate
+
+            locus_tokens = []
+            if sim_part:
+                locus_tokens.append(clean_locus_name(sim_part))
+            if locus_stem and locus_stem != sim_part and locus_stem not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'concat']:
+                locus_tokens.append(clean_locus_name(locus_stem))
+            if cat_part and (not sim_part or cat_part not in sim_part):
+                locus_tokens.append(cat_part)
+            if w_s_part:
+                locus_tokens.append(w_s_part)
+
+            if locus_tokens:
+                self.gene_name = "_".join(filter(None, locus_tokens))
+            else:
+                self.gene_name = clean_locus_name(file_path.parent.parent.name if file_path.parent.name == 'caster' else file_path.parent.name)
+        else:
+            self.gene_name = clean_locus_name(name_part)
 
     def load_data(self):
         """Parses the tab-separated value file into a Pandas DataFrame."""
@@ -107,8 +152,8 @@ class CasterPlotter:
             }
         return self.params
 
-    def plot_caster_histograms(self):
-        """Generates 3 subplots (1 row x 3 columns) for ABBA, BABA, AABB, fitting Gaussian to null and alt ground truth separately."""
+    def plot_caster_histograms(self, show_fits=True, filename='dist.png'):
+        """Generates 3 subplots for ABBA, BABA, AABB topologies, plotting empirical histogram and optional fitted distribution curves."""
         norm_label = 'Normalized (Min-Max)' if self.is_normalized_file else 'Raw'
 
         # Determine topology columns to plot
@@ -126,7 +171,6 @@ class CasterPlotter:
             print("No matching topology columns found to plot.")
             return
 
-        # Check for ground truth locus pattern in filename or gene name
         # Check for ground truth locus pattern in filename or gene name
         full_path_str = str(self.scores_file)
         pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
@@ -172,32 +216,34 @@ class CasterPlotter:
                 df_alt = self.df[y_true == 1]
 
                 if len(df_null) > 0:
-                    sns.histplot(df_null[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#2B4C7E', label='Null GT (Observed)', bins=30)
+                    sns.histplot(df_null[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#2B4C7E', label='Null Histogram', bins=30)
                 if len(df_alt) > 0:
-                    sns.histplot(df_alt[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt GT (Observed)', bins=30)
+                    sns.histplot(df_alt[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=30)
 
-                if len(df_null) > 1:
-                    mu_null, std_null = norm.fit(df_null[col])
-                    pdf_null = norm.pdf(x_grid, mu_null, std_null)
-                    ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label=f'Null Fit ($\mu={mu_null:.2f}, \sigma={std_null:.2f}$)')
-                    ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
-                    ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                if show_fits:
+                    if len(df_null) > 1:
+                        mu_null, std_null = norm.fit(df_null[col])
+                        pdf_null = norm.pdf(x_grid, mu_null, std_null)
+                        ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label='Null Fit')
+                        ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
+                        ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
-                if len(df_alt) > 1:
-                    mu_alt, std_alt = norm.fit(df_alt[col])
-                    pdf_alt = norm.pdf(x_grid, mu_alt, std_alt)
-                    ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit ($\mu={mu_alt:.2f}, \sigma={std_alt:.2f}$)')
-                    ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
-                    ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    if len(df_alt) > 1:
+                        mu_alt, std_alt = norm.fit(df_alt[col])
+                        pdf_alt = norm.pdf(x_grid, mu_alt, std_alt)
+                        ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit')
+                        ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                        ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
             else:
                 color = self.color_mapping.get(col, '#2B4C7E')
                 sns.histplot(self.df[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=color, label='Observed Data', bins=30)
 
-                mu_tot, std_tot = norm.fit(self.df[col])
-                pdf_tot = norm.pdf(x_grid, mu_tot, std_tot)
-                ax.plot(x_grid, pdf_tot, color=color, linewidth=2.2, label=f'Gaussian Fit ($\mu={mu_tot:.2f}, \sigma={std_tot:.2f}$)')
-                ax.axvline(mu_tot, color=color, linestyle='--', linewidth=1.5)
-                ax.text(mu_tot, 0.90, f"$\\mu={mu_tot:.2f}$", transform=trans, color=color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                if show_fits:
+                    mu_tot, std_tot = norm.fit(self.df[col])
+                    pdf_tot = norm.pdf(x_grid, mu_tot, std_tot)
+                    ax.plot(x_grid, pdf_tot, color=color, linewidth=2.2, label=f'Fit')
+                    ax.axvline(mu_tot, color=color, linestyle='--', linewidth=1.5)
+                    ax.text(mu_tot, 0.90, f"$\\mu={mu_tot:.2f}$", transform=trans, color=color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
             ax.set_title(f'Topology: {topo_name}', fontsize=12, fontweight='bold')
             ax.set_xlabel(f'{norm_label} Score')
@@ -206,29 +252,18 @@ class CasterPlotter:
             ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
             ax.grid(True, linestyle=':', alpha=0.5)
 
-        fig.suptitle(f'Topology Distribution & Gaussian Fits: {self.gene_name}', fontsize=13, fontweight='bold')
-        fig.tight_layout()
-
-        all_avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
-        is_all_topologies = (len(avg_cols) == len(all_avg_cols))
-
-        if is_all_topologies:
-            suffix = "all"
+        if show_fits:
+            fig.suptitle(f'Topology Histograms & {self.distribution} Fits: {self.gene_name}', fontsize=13, fontweight='bold')
         else:
-            topo_names = []
-            for col in avg_cols:
-                match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
-                if match:
-                    topo_names.append(match.group(1).lower())
-                else:
-                    topo_names.append(col.replace('avg*', '').replace('c*', ''))
-            suffix = "_".join(topo_names)
+            fig.suptitle(f'Topology Histograms: {self.gene_name}', fontsize=13, fontweight='bold')
+
+        fig.tight_layout()
 
         output_dir = self.data_dir
         os.makedirs(output_dir, exist_ok=True)
-        save_path_top = os.path.join(output_dir, 'dist.png')
+        save_path_top = os.path.join(output_dir, filename)
         plt.savefig(save_path_top, dpi=300, bbox_inches='tight')
-        print(f"Saved empirical topology distribution chart to: {save_path_top}")
+        print(f"Saved topology histogram chart to: {save_path_top}")
         plt.close()
 
     def plot_dstar_histogram(self):

@@ -146,7 +146,7 @@ class Phlag:
     def get_default_out_dir(self):
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
-        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir
+        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base
         parsed = parse_filename_to_dir_structure(input_path.stem)
         
         conn_env = os.environ.get("CONNECTION_DIR")
@@ -157,9 +157,11 @@ class Phlag:
             if base_dir == get_repo_root() / "caster" / "data":
                 base_dir = get_repo_root() / "connection_dir"
         
+        phlag_base = get_phlag_output_base(base_dir)
+        
         if parsed:
             rel_dir = parsed["relative_dir"]
-            out_dir = base_dir / "phlag" / dist_type / rel_dir / "phlag"
+            out_dir = phlag_base / dist_type / rel_dir / "phlag"
         else:
             if input_path.parent.name == "caster":
                 # Find path relative to model design or phlag root if input is in a caster subfolder
@@ -185,19 +187,19 @@ class Phlag:
                                 rel_parts = rel_parts[:idx] + list(cats) + rel_parts[idx:]
                             break
                     sub_path = pathlib.Path(*rel_parts)
-                    out_dir = base_dir / "phlag" / dist_type / sub_path / "phlag"
+                    out_dir = phlag_base / dist_type / sub_path / "phlag"
                 else:
                     from .utils import get_simulation_categories, get_short_sim_name
                     cats = get_simulation_categories(locus_dir.name)
-                    short_name = get_short_sim_name(locus_dir.name)
+                    pattern_name = get_short_sim_name(locus_dir.name)
                     cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                    out_dir = base_dir / "phlag" / dist_type / cat_prefix / short_name / "phlag"
+                    out_dir = phlag_base / dist_type / cat_prefix / pattern_name / "phlag"
             else:
                 from .utils import get_simulation_categories, get_short_sim_name
                 cats = get_simulation_categories(input_path.stem)
-                short_name = get_short_sim_name(input_path.stem)
+                pattern_name = get_short_sim_name(input_path.stem)
                 cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                out_dir = base_dir / "phlag" / dist_type / cat_prefix / short_name / "phlag"
+                out_dir = phlag_base / dist_type / cat_prefix / pattern_name / "phlag"
         return out_dir
 
     def determine_optimal_mixtures(self):
@@ -500,9 +502,12 @@ class Phlag:
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
                 ax1.set_ylim(-0.05, 1.05)
                 ax1.set_yticks([0, 1])
-                ax1.grid(True, axis='x', linestyle=':', alpha=0.5)
-                
-                plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
+                from .utils import get_locus_description
+                locus_desc = get_locus_description(input_path)
+                if locus_desc:
+                    plt.title(f"Genomic Profile: {locus_desc}\nTop {len(paths)} Viterbi Paths", fontsize=12, fontweight="bold", pad=12)
+                else:
+                    plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
                 
                 lines1, labels1 = ax1.get_legend_handles_labels()
                 ax1.legend(lines1, labels1, loc="upper left", framealpha=0.9)
@@ -732,7 +737,13 @@ class PhlagPlotter:
         # Plot Row 1: After EM (Fitted theoretical setup and assigned empirical data)
         self._plot_row(axes[1], self.phlag.params, ranges, title_prefix="After EM", plot_empirical=True)
         
-        plt.tight_layout()
+        from .utils import get_locus_description
+        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+        if locus_desc:
+            fig.suptitle(f"EM Distributions | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+        else:
+            plt.tight_layout()
         self.save_plot()
 
     def _plot_row(self, row_axes, params, ranges, title_prefix, plot_empirical=False):
@@ -755,13 +766,13 @@ class PhlagPlotter:
                     sns.histplot(
                         y_state0, ax=ax, color=self.colors[0]['fill'], 
                         stat="density", kde=False, alpha=0.12, 
-                        element="step", label=f"{self.colors[0]['label']} data"
+                        element="step", label=f"{self.colors[0]['label']} Histogram"
                     )
                 if len(y_state1) > 0:
                     sns.histplot(
                         y_state1, ax=ax, color=self.colors[1]['fill'], 
                         stat="density", kde=False, alpha=0.12, 
-                        element="step", label=f"{self.colors[1]['label']} data"
+                        element="step", label=f"{self.colors[1]['label']} Histogram"
                     )
             
             # 2. Plot PDF curves and Vertical Guideline Markers (Mean and +/- 1 Std)
@@ -792,7 +803,7 @@ class PhlagPlotter:
                 # Plot theoretical curve
                 ax.plot(
                     x_vals, pdf_vals, color=color_config['line'], 
-                    linewidth=2.2, label=f"{color_config['label']} PDF"
+                    linewidth=2.2, label=f"{color_config['label']} Curve"
                 )
                 
                 # Shading under curve
@@ -834,7 +845,10 @@ class PhlagPlotter:
                 
             ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
             ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
-            ax.set_ylabel("Probability Density", fontsize=9, labelpad=4)
+            if d == 0:
+                ax.set_ylabel("Probability Density", fontsize=9, labelpad=4)
+            else:
+                ax.set_ylabel("")
             ax.tick_params(axis='both', which='major', labelsize=8)
             
             # De-duplicate legend entries to keep layout clean and readable
@@ -989,10 +1003,15 @@ def parse_arguments():
     dist_type = getattr(args, "model_design", "gaussian")
 
     def resolve_model_scores(target_name=None):
+        from .utils import get_phlag_output_base
         search_bases = [
-            data_dir / "phlag" / dist_type,
+            get_phlag_output_base(data_dir) / dist_type,
+            get_phlag_output_base(repo_root / "store" / "phlag") / dist_type,
+            get_phlag_output_base(data_dir),
+            get_phlag_output_base(repo_root / "store" / "phlag"),
         ]
         candidates = []
+        seen = set()
         for b in search_bases:
             if not b.exists():
                 continue
@@ -1002,14 +1021,17 @@ def parse_arguments():
                 for td in target_dirs:
                     if td.is_dir():
                         for sfile in td.rglob("scores.tsv"):
-                            if sfile.parent.name == "caster":
+                            if sfile.parent.name == "caster" and sfile.resolve() not in seen:
+                                seen.add(sfile.resolve())
                                 candidates.append(sfile)
                         for sfile in td.rglob("*.tsv"):
-                            if sfile.parent.name == "caster" and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                            if sfile.parent.name == "caster" and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]) and sfile.resolve() not in seen:
+                                seen.add(sfile.resolve())
                                 candidates.append(sfile)
             else:
                 for sfile in b.rglob("scores.tsv"):
-                    if sfile.parent.name == "caster":
+                    if sfile.parent.name == "caster" and sfile.resolve() not in seen:
+                        seen.add(sfile.resolve())
                         candidates.append(sfile)
         if candidates:
             candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
@@ -1030,16 +1052,11 @@ def parse_arguments():
         print(f"Using most recent score file: {recent_file}")
         args.caster_scores = recent_file
     else:
-        # Check model params directory under dist_type first (e.g. gaussian/<name>/.../caster/scores.tsv)
-        model_scores = resolve_model_scores(target_name=args.caster_scores.name)
-        if model_scores and model_scores.exists():
-            args.caster_scores = model_scores
+        resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
+        if resolved.exists() and resolved.is_file():
+            args.caster_scores = resolved
         else:
-            resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
-            if resolved.exists() and resolved.is_file():
-                args.caster_scores = resolved
-            else:
-                sys.exit(f"Error: Score file not found for '{args.caster_scores.name}' under model output directories or relative paths.")
+            sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
 
     # Check if --plot is supplied
     plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in sys.argv)
