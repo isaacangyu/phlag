@@ -6,6 +6,11 @@ import argparse
 import subprocess
 import shutil
 import tempfile
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
 
 def format_val(val):
     """
@@ -40,7 +45,282 @@ def get_fasta_length(fasta_path):
             length += len(line.strip())
     return length
 
-def parse_arguments():
+
+class CasterPlotter:
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=True):
+        self.scores_file = scores_file
+        self.distribution = distribution
+        self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
+        self.topologies = topologies
+
+        os.makedirs(self.data_dir, exist_ok=True)
+
+        base_name = pathlib.Path(scores_file).name
+        name_part, _ = os.path.splitext(base_name)
+        self.is_normalized_file = name_part.endswith('_n')
+
+        from .utils import get_locus_description
+        self.gene_name = get_locus_description(scores_file)
+
+        self.load_data()
+
+        if self.df is not None:
+            # High-contrast, vibrant, and highly distinguishable color palette for the 3 topologies
+            self.topo_colors = {
+                'ABBA': '#1F77B4',    # Bold Royal Blue
+                'BABA': '#D62728',    # Vivid Crimson Red
+                'AABB': '#2CA02C',    # Vibrant Forest Green
+            }
+
+            # 1. Run empirical histograms with parametric distribution overlay
+            if plot_dist:
+                self.plot_caster_histograms(show_fits=True, filename='dist.png')
+
+            # 2. Scatter plot three topology scores over the genome
+            if plot_scores:
+                self.plot_topology_scatter()
+
+    def load_data(self):
+        """Parses the tab-separated value file into a Pandas DataFrame."""
+        target_path = self.scores_file
+        if not os.path.exists(target_path) and not os.path.isabs(target_path):
+            target_path = os.path.join(self.data_dir, self.scores_file)
+
+        try:
+            self.df = pd.read_csv(target_path, sep='\t')
+            print(f"Loaded {len(self.df)} windows for locus '{self.gene_name}' from: {target_path}")
+            print("Detected columns:", self.df.columns.tolist())
+            sns.set_theme(style="whitegrid")
+        except Exception as e:
+            print(f"Error reading dataset file {target_path}: {e}")
+            self.df = None
+
+    def calculate_summary_statistics(self, series):
+        """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
+        if self.distribution:
+            dist_name = self.distribution.lower()
+            if dist_name in ['gaussian', 'normal']:
+                dist_name = 'norm'
+
+            import scipy.stats as stats_module
+            dist_class = getattr(stats_module, dist_name)
+            fit_vals = dist_class.fit(series)
+
+            param_names = []
+            if dist_class.shapes:
+                param_names.extend([s.strip() for s in dist_class.shapes.split(',')])
+            param_names.extend(['loc', 'scale'])
+            self.params = dict(zip(param_names, fit_vals))
+        else:
+            self.params = {
+                'loc': series.mean(),
+                'scale': series.std()
+            }
+        return self.params
+
+    def plot_caster_histograms(self, show_fits=True, filename='dist.png'):
+        """Generates 3 subplots for ABBA, BABA, AABB topologies, plotting empirical histogram and optional fitted distribution curves."""
+        norm_label = 'Normalized (Min-Max)' if self.is_normalized_file else 'Raw'
+
+        # Determine topology columns to plot
+        avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        if self.topologies is not None:
+            filtered_cols = []
+            for col in avg_cols:
+                for t in self.topologies:
+                    if t.lower() in col.lower():
+                        filtered_cols.append(col)
+                        break
+            avg_cols = filtered_cols
+
+        if not avg_cols:
+            print("No matching topology columns found to plot.")
+            return
+
+        # Require a ground truth locus pattern in the filename or path
+        full_path_str = str(self.scores_file)
+        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
+        if not pattern_str_match:
+            sys.exit(f"Error: No ground truth locus pattern (e.g. 'n1a1n5...') found in '{full_path_str}'. Caster requires a ground truth pattern in the score file's path or filename to plot '{filename}'.")
+
+        pattern_str = pattern_str_match.group(1)
+        from .utils import parse_pattern_string
+        total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
+        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+        if not (anomaly_intervals or blocks):
+            sys.exit(f"Error: Could not parse ground truth locus pattern '{pattern_str}' from '{full_path_str}'.")
+
+        y_true = np.zeros(len(self.df), dtype=int)
+        if 'pos' in self.df.columns:
+            positions = self.df['pos'].values
+            for idx, pos in enumerate(positions):
+                for start_bp, end_bp in anomaly_intervals:
+                    if start_bp <= pos < end_bp:
+                        y_true[idx] = 1
+                        break
+
+        num_plots = len(avg_cols)
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5), squeeze=False)
+        axes = axes[0]
+
+        import matplotlib.transforms as transforms
+
+        for i, col in enumerate(avg_cols):
+            ax = axes[i]
+            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+            topo_name = match.group(1).upper() if match else col.replace('avg*', '').replace('c*', '')
+
+            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+            vals = self.df[col].values
+            xmin, xmax = vals.min(), vals.max()
+            margin = (xmax - xmin) * 0.15 if xmax > xmin else 1.0
+            x_grid = np.linspace(xmin - margin, xmax + margin, 200)
+
+            df_null = self.df[y_true == 0]
+            df_alt = self.df[y_true == 1]
+
+            if len(df_null) > 0:
+                sns.histplot(df_null[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#2B4C7E', label='Null Histogram', bins=30)
+            if len(df_alt) > 0:
+                sns.histplot(df_alt[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=30)
+
+            if show_fits:
+                if len(df_null) > 1:
+                    mu_null, std_null = norm.fit(df_null[col])
+                    pdf_null = norm.pdf(x_grid, mu_null, std_null)
+                    ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label='Null Fit')
+                    ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
+                    ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+                if len(df_alt) > 1:
+                    mu_alt, std_alt = norm.fit(df_alt[col])
+                    pdf_alt = norm.pdf(x_grid, mu_alt, std_alt)
+                    ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit')
+                    ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                    ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            ax.set_title(f'Topology: {topo_name}', fontsize=12, fontweight='bold')
+            ax.set_xlabel(f'{norm_label} Score')
+            if i == 0:
+                ax.set_ylabel('Density')
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+            ax.grid(True, linestyle=':', alpha=0.5)
+
+        if show_fits:
+            fig.suptitle(f'Topology Histograms & {self.distribution} Fits: {self.gene_name}', fontsize=13, fontweight='bold')
+        else:
+            fig.suptitle(f'Topology Histograms: {self.gene_name}', fontsize=13, fontweight='bold')
+
+        fig.tight_layout()
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_top = os.path.join(output_dir, filename)
+        plt.savefig(save_path_top, dpi=300, bbox_inches='tight')
+        print(f"Saved topology histogram chart to: {save_path_top}")
+        plt.close()
+
+    def plot_topology_scatter(self):
+        """Generates a scatter plot of topology scores across genomic coordinates."""
+        avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        if self.topologies is not None:
+            filtered_cols = []
+            for col in avg_cols:
+                for t in self.topologies:
+                    if t.lower() in col.lower():
+                        filtered_cols.append(col)
+                        break
+            avg_cols = filtered_cols
+
+        if not avg_cols:
+            print("No matching topology columns found to scatter plot.")
+            return
+
+        plt.figure(figsize=(12, 6))
+
+        # Rename columns to standard topology names (ABBA, BABA, AABB) for clean palette hue mapping
+        rename_map = {}
+        for col in avg_cols:
+            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+            if match:
+                rename_map[col] = match.group(1).upper()
+            else:
+                rename_map[col] = col
+
+        renamed_df = self.df.rename(columns=rename_map)
+        clean_cols = [rename_map.get(c, c) for c in avg_cols]
+
+        # Melt the dataframe for seaborn plotting
+        melted_df = renamed_df.melt(id_vars=['pos'], value_vars=clean_cols,
+                                 var_name='Topology', value_name='Score')
+
+        # Create scatter plot with small points and transparency
+        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
+
+        # Draw vertical split lines and shade alt regions if path/filename contains ground truth pattern
+        full_path_str = str(self.scores_file)
+        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
+        if pattern_str_match:
+            pattern_str = pattern_str_match.group(1)
+            from .utils import parse_pattern_string
+            total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
+            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+
+            if anomaly_intervals and not any(b[0] == 'n' for b in blocks):
+                # Pure interval format (e.g. 40-65)
+                alt_shaded = False
+                for start_pos, end_pos in anomaly_intervals:
+                    mid_pos = (start_pos + end_pos) / 2.0
+                    lbl = 'Alt' if not alt_shaded else None
+                    plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                    alt_shaded = True
+                    plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+                    plt.axvline(x=end_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+            elif blocks:
+                curr_pos_bp = 0
+                alt_shaded = False
+                for idx, (b_type, b_id, length_bp) in enumerate(blocks):
+                    start_pos = curr_pos_bp
+                    end_pos = curr_pos_bp + length_bp
+                    mid_pos = (start_pos + end_pos) / 2.0
+                    label_text = "null" if b_type == 'n' else "alt"
+
+                    if b_type == 'a':
+                        lbl = 'Alt' if not alt_shaded else None
+                        plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                        alt_shaded = True
+
+                    # Draw vertical boundary line at start of block (except 0)
+                    if start_pos > 0:
+                        plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+
+                    # Label null/alt above x-axis at bottom of plot
+                    plt.text(mid_pos, 0.02, label_text, transform=plt.gca().get_xaxis_transform(),
+                             ha='center', va='bottom', fontsize=10, fontweight='bold',
+                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='none'))
+
+                    curr_pos_bp = end_pos
+                # Vertical line at end of last block
+                plt.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+
+        # Format names for cleaner legend and title
+        plt.title(f'Genomic Topology Profile: {self.gene_name}', fontsize=13, fontweight='bold', pad=10)
+        plt.xlabel('Genomic Position (pos)', fontsize=11, labelpad=8)
+        plt.ylabel('Topology Score Value', fontsize=11, labelpad=8)
+        plt.legend(loc='upper right', framealpha=0.9)
+        plt.tight_layout()
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_scatter = os.path.join(output_dir, 'scatter.png')
+        plt.savefig(save_path_scatter, dpi=300)
+        print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
+        plt.close()
+
+
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Caster: Load scores and generate topology distribution and scatter plots."
     )
@@ -111,9 +391,9 @@ def parse_arguments():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["scores", "dist", "hist"],
+        choices=["scores", "dist"],
         default=["scores", "dist"],
-        help="List of plots to generate (choices: scores, dist, hist. Default: scores, dist)",
+        help="List of plots to generate (choices: scores, dist. Default: scores, dist)",
     )
     parser.add_argument(
         "-t",
@@ -122,12 +402,6 @@ def parse_arguments():
         nargs="+",
         default=None,
         help="List of topologies to plot (default: all)"
-    )
-    parser.add_argument(
-        "--plot-dstar",
-        dest="plot_dstar",
-        action="store_true",
-        help="Plot D* distribution (default: False)"
     )
     parser.add_argument(
         "-d",
@@ -144,10 +418,10 @@ def parse_arguments():
         default=None,
         help="Optional species tree file (default: store/63K.tre)"
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
-def main():
-    args = parse_arguments()
+def main(argv=None):
+    args = parse_arguments(argv)
     
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
@@ -212,6 +486,17 @@ def main():
 
     is_fasta = not (input_str.endswith('.tsv') or args.fasta_file.name == 'scores.tsv')
     if is_fasta or not final_output_path.exists():
+        if not is_fasta and not args.fasta_file.exists():
+            # A scores.tsv-style path was given but doesn't exist yet -- recover the
+            # source concat FASTA from the path structure and recompute from there,
+            # instead of wrongly reporting it as a missing FASTA.
+            from .utils import resolve_fasta_from_scores_path
+            recovered_fasta = resolve_fasta_from_scores_path(args.fasta_file)
+            if recovered_fasta is None:
+                sys.exit(f"Error: Score file not found at '{args.fasta_file}', and no matching source FASTA could be found under the simulations directory to recompute it.")
+            print(f"Score file '{args.fasta_file}' does not exist yet; recomputing from source FASTA: {recovered_fasta}")
+            args.fasta_file = recovered_fasta
+            is_fasta = True
         if not args.fasta_file.exists():
             sys.exit(f"Error: FASTA file not found at '{args.fasta_file}'")
         if args.left < 0:
@@ -408,22 +693,18 @@ def main():
     if args.plot:
         plot_scores = "scores" in args.plot
         plot_dist = "dist" in args.plot
-        plot_hist = "hist" in args.plot
-        
-        if plot_scores or plot_dist or plot_hist:
-            sys.path.append(str(repo_root / "caster" / "results"))
-            from caster_plot import CasterPlotter
-            
+
+        if plot_scores or plot_dist:
             CasterPlotter(
                 scores_file=str(final_output_path.resolve()),
                 distribution=args.dist_type,
                 data_dir=str(final_output_path.parent.resolve()),
                 topologies=args.topologies,
-                plot_dstar=args.plot_dstar,
                 plot_scores=plot_scores,
                 plot_dist=plot_dist,
-                plot_hist=plot_hist,
             )
+
+    return final_output_path
 
 if __name__ == "__main__":
     main()

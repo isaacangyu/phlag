@@ -16,6 +16,8 @@ import scipy.stats as stats
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib.transforms as transforms
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 from . import hmm
 from . import utils
@@ -25,6 +27,351 @@ PSI_EPS = 0.001
 NUM_STATES = 2
 BETA_PRIME = 0.0025
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
+
+
+def get_topology_names(dim):
+    """Maps an emission dimension count to human-readable topology labels."""
+    if dim == 3:
+        return ["ABBA", "BABA", "AABB"]
+    return [f"Coord {i+1}" for i in range(dim)]
+
+
+def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
+    """Extracts (mu, sigma, pdf_vals) for a given HMM state/dimension, branching on model_design."""
+    if model_design == "beta":
+        alpha = float(params.emissions.concentration1[state, dim])
+        beta = float(params.emissions.concentration0[state, dim])
+        pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
+        mu = alpha / (alpha + beta)
+        sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
+    elif model_design == "gmm":
+        w = np.array(params.emissions.mixture_weights[state, dim])
+        m_means = np.array(params.emissions.means[state, dim])
+        m_stds = np.array(params.emissions.stds[state, dim])
+        pdf_vals = np.zeros_like(x_vals)
+        for m in range(len(w)):
+            pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
+        mu = float(np.sum(w * m_means))
+        var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
+        sigma = np.sqrt(max(1e-6, var))
+    else:
+        mu = float(params.emissions.means[state, dim])
+        sigma = np.sqrt(np.clip(float(params.emissions.covariances[state, dim, dim]), a_min=1e-6, a_max=None))
+        pdf_vals = stats.norm.pdf(x_vals, mu, sigma)
+    return mu, sigma, pdf_vals
+
+
+def format_rel_err(value):
+    """Formats a relative-error percentage to 4 decimals."""
+    return f"{value:.4f}"
+
+
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, cluster_topologies=False):
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sorted_positions = sorted(pos_to_caster.keys())
+    positions_kb = np.array(sorted_positions) / 1000.0
+
+    num_mixtures_matrix = np.zeros((NUM_STATES, Y.shape[-1]), dtype=int)
+    dim_cluster_info = {}
+
+    print("\n=== K-means Clustering & Silhouette Scores ===")
+
+    topology_names = ["ABBA", "BABA", "AABB"] if Y.shape[-1] == 3 else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
+
+    dims_to_iterate = [None] if cluster_topologies else list(range(Y.shape[-1]))
+
+    for d in dims_to_iterate:
+        if d is None:
+            y_d = Y
+            topo_name = "All"
+            y_plot = np.linalg.norm(Y, axis=1)
+        else:
+            y_d = np.array(Y[:, [d]])
+            topo_name = topology_names[d]
+            y_plot = y_d.ravel()
+
+        k_values = list(range(2, 11))
+        scores = {}
+        k_opt = 2
+        max_score = -2.0
+
+        for k in k_values:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = kmeans.fit_predict(y_d)
+            score = silhouette_score(y_d, labels)
+            scores[k] = score
+            if score > max_score:
+                max_score = score
+                k_opt = k
+
+        s_2 = scores[2]
+
+        # Print global table
+        print(f"\nTopology / Dimension: {topo_name}")
+        print(f"{'k':<5} | {'Global Silhouette Score':<25}")
+        print("-" * 35)
+        for k in k_values:
+            marker = " *" if k == k_opt else ""
+            print(f"{k:<5} | {scores[k]:<25.6f}{marker}")
+        print(f"Global Optimal k* = {k_opt} (Score: {max_score:.6f})")
+        print(f"Global k=2 Score = {s_2:.6f}")
+
+        if s_2 > silhouette_threshold:
+            print(f"s_2 ({s_2:.4f}) > threshold ({silhouette_threshold:.4f}) -> Partitioning into Null and Alternative clusters:")
+
+            # Fit 2-means to partition the data
+            kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
+            labels_2 = kmeans_2.fit_predict(y_d)
+
+            # Assign cluster labels to Null vs Alternative based on distance from global mean
+            global_mean = np.mean(y_d, axis=0)
+            mean_c0 = np.mean(y_d[labels_2 == 0], axis=0)
+            mean_c1 = np.mean(y_d[labels_2 == 1], axis=0)
+
+            dist_c0 = np.linalg.norm(mean_c0 - global_mean)
+            dist_c1 = np.linalg.norm(mean_c1 - global_mean)
+
+            if dist_c0 < dist_c1:
+                null_lbl, alt_lbl = 0, 1
+            else:
+                null_lbl, alt_lbl = 1, 0
+
+            y_sub_N = y_d[labels_2 == null_lbl]
+            pos_sub_N = positions_kb[labels_2 == null_lbl]
+            y_sub_A = y_d[labels_2 == alt_lbl]
+            pos_sub_A = positions_kb[labels_2 == alt_lbl]
+
+            n_N = len(y_sub_N)
+            n_A = len(y_sub_A)
+
+
+            # Search for best split kn + ka = k_opt minimizing total within-cluster sum of squares (inertia)
+            best_kn = 1
+            best_ka = k_opt - 1
+            min_inertia = float('inf')
+
+            print(f"\nEvaluating partitions (kn + ka = k* = {k_opt}):")
+            print(f"{'Split':<12} | {'Null Inertia':<15} | {'Alt Inertia':<15} | {'Total Inertia':<15}")
+            print("-" * 65)
+
+            for kn in range(1, k_opt):
+                ka = k_opt - kn
+                if kn > n_N or ka > n_A:
+                    continue
+
+                if kn == 1:
+                    w_n = float(np.sum((y_sub_N - np.mean(y_sub_N, axis=0)) ** 2))
+                else:
+                    km_n = KMeans(n_clusters=kn, random_state=42, n_init="auto")
+                    km_n.fit(y_sub_N)
+                    w_n = float(km_n.inertia_)
+
+                if ka == 1:
+                    w_a = float(np.sum((y_sub_A - np.mean(y_sub_A, axis=0)) ** 2))
+                else:
+                    km_a = KMeans(n_clusters=ka, random_state=42, n_init="auto")
+                    km_a.fit(y_sub_A)
+                    w_a = float(km_a.inertia_)
+
+                total_w = w_n + w_a
+                marker = ""
+                if total_w < min_inertia:
+                    min_inertia = total_w
+                    best_kn = kn
+                    best_ka = ka
+                    marker = " *"
+
+                print(f"{kn:<2} + {ka:<2} = {k_opt:<2}  | {w_n:<15.6f} | {w_a:<15.6f} | {total_w:<15.6f}{marker}")
+
+            print(f"Optimal split: Null count = {best_kn}, Alternative count = {best_ka} (Inertia: {min_inertia:.6f})")
+
+            if d is None:
+                num_mixtures_matrix[0, :] = best_kn
+                num_mixtures_matrix[1, :] = best_ka
+            else:
+                num_mixtures_matrix[0, d] = best_kn
+                num_mixtures_matrix[1, d] = best_ka
+
+            # Save Null sub-cluster plot if kn > 1
+            if best_kn > 1:
+                sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+                sub_labels = sub_kmeans.fit_predict(y_sub_N)
+
+                plt.figure(figsize=(10, 5))
+                sns.set_theme(style="whitegrid")
+                sns.scatterplot(x=pos_sub_N, y=y_plot[labels_2 == null_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                plt.title(f"{topo_name} | Null Sub-cluster {best_kn}-means Clustering", fontsize=12, fontweight='bold')
+                plt.xlabel("Position (kb)", fontsize=10)
+                plt.ylabel("Normalized score", fontsize=10)
+                plt.tight_layout()
+                plot_path_sub_N = output_dir / f"kmeans_kstar_{topo_name}_null.png"
+                plt.savefig(plot_path_sub_N, dpi=150)
+                plt.close()
+                print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
+
+            # Save Alternative sub-cluster plot if ka > 1
+            if best_ka > 1:
+                sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+                sub_labels = sub_kmeans.fit_predict(y_sub_A)
+
+                plt.figure(figsize=(10, 5))
+                sns.set_theme(style="whitegrid")
+                sns.scatterplot(x=pos_sub_A, y=y_plot[labels_2 == alt_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+                plt.title(f"{topo_name} | Alternative Sub-cluster {best_ka}-means Clustering", fontsize=12, fontweight='bold')
+                plt.xlabel("Position (kb)", fontsize=10)
+                plt.ylabel("Normalized score", fontsize=10)
+                plt.tight_layout()
+                plot_path_sub_A = output_dir / f"kmeans_kstar_{topo_name}_alternative.png"
+                plt.savefig(plot_path_sub_A, dpi=150)
+                plt.close()
+                print(f"Saved Alternative sub-cluster optimal plot to: {plot_path_sub_A}")
+
+            # Save combined optimal plot (kmeans_kstar_{topo_name}.png)
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | Optimal GMM Mixture Partitions (Null count={best_kn}, Alt count={best_ka})", fontsize=11, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.tight_layout()
+            plot_path_opt = output_dir / f"kmeans_kstar_{topo_name}.png"
+            plt.savefig(plot_path_opt, dpi=150)
+            plt.close()
+            print(f"Saved combined optimal plot to: {plot_path_opt}")
+
+            # Compute Null sub-cluster mixture parameters
+            null_params = []
+            if best_kn == 1:
+                mu_n = np.mean(y_sub_N, axis=0)
+                std_n = np.clip(np.std(y_sub_N, axis=0), a_min=1e-4, a_max=None)
+                null_params.append((1.0, mu_n, std_n))
+            else:
+                km_n = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+                sub_labels_n = km_n.fit_predict(y_sub_N)
+                for m in range(best_kn):
+                    pts = y_sub_N[sub_labels_n == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_sub_N)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / best_kn
+                        mu = km_n.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    null_params.append((w, mu, std))
+
+            # Compute Alt sub-cluster mixture parameters
+            alt_params = []
+            if best_ka == 1:
+                mu_a = np.mean(y_sub_A, axis=0)
+                std_a = np.clip(np.std(y_sub_A, axis=0), a_min=1e-4, a_max=None)
+                alt_params.append((1.0, mu_a, std_a))
+            else:
+                km_a = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+                sub_labels_a = km_a.fit_predict(y_sub_A)
+                for m in range(best_ka):
+                    pts = y_sub_A[sub_labels_a == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_sub_A)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / best_ka
+                        mu = km_a.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    alt_params.append((w, mu, std))
+
+            dim_cluster_info[d] = (null_params, alt_params)
+
+        else:
+            m_val = max(1, int(round(k_opt / 2.0)))
+            print(f"s_2 ({s_2:.4f}) <= threshold ({silhouette_threshold:.4f}) -> Use k*/2 = {m_val} mixtures for both states.")
+            if d is None:
+                num_mixtures_matrix[0, :] = m_val
+                num_mixtures_matrix[1, :] = m_val
+            else:
+                num_mixtures_matrix[0, d] = m_val
+                num_mixtures_matrix[1, d] = m_val
+
+            # Save ONLY 2-means plot, NOT kmeans_kstar plot!
+            kmeans_plot = KMeans(n_clusters=2, random_state=42, n_init="auto")
+            labels_plot = kmeans_plot.fit_predict(y_d)
+
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | 2-means Clustering", fontsize=12, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.legend(title="Cluster")
+            plt.tight_layout()
+
+            plot_path = output_dir / f"kmeans_2_{topo_name}.png"
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+            print(f"Saved diagnostic clustering plot to: {plot_path}")
+
+            null_params = []
+            alt_params = []
+            if m_val == 1:
+                mu_base = np.mean(y_d, axis=0)
+                std_base = np.clip(np.std(y_d, axis=0), a_min=1e-4, a_max=None)
+                null_params.append((1.0, mu_base, std_base))
+                alt_params.append((1.0, mu_base + std_base, std_base))
+            else:
+                km = KMeans(n_clusters=m_val, random_state=42, n_init="auto")
+                labels_m = km.fit_predict(y_d)
+                for m in range(m_val):
+                    pts = y_d[labels_m == m]
+                    if len(pts) > 0:
+                        w = len(pts) / len(y_d)
+                        mu = np.mean(pts, axis=0)
+                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                    else:
+                        w = 1.0 / m_val
+                        mu = km.cluster_centers_[m]
+                        std = np.full(y_d.shape[-1], 1e-4)
+                    null_params.append((w, mu, std))
+                    alt_params.append((w, mu + std, std))
+
+            dim_cluster_info[d] = (null_params, alt_params)
+
+    D = Y.shape[-1]
+    max_m = int(np.max(num_mixtures_matrix))
+    init_means = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
+    init_stds = np.ones((NUM_STATES, D, max_m), dtype=np.float32)
+    init_weights = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
+
+    if cluster_topologies:
+        null_params, alt_params = dim_cluster_info[None]
+        for s_idx, state_params in enumerate([null_params, alt_params]):
+            m_cnt = len(state_params)
+            for m_idx, (w, mu, std) in enumerate(state_params):
+                for d_idx in range(D):
+                    init_weights[s_idx, d_idx, m_idx] = w
+                    init_means[s_idx, d_idx, m_idx] = mu[d_idx]
+                    init_stds[s_idx, d_idx, m_idx] = std[d_idx]
+            for d_idx in range(D):
+                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
+                if sum_w > 0:
+                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
+    else:
+        for d_idx in range(D):
+            null_params, alt_params = dim_cluster_info[d_idx]
+            for s_idx, state_params in enumerate([null_params, alt_params]):
+                m_cnt = len(state_params)
+                for m_idx, (w, mu, std) in enumerate(state_params):
+                    init_weights[s_idx, d_idx, m_idx] = w
+                    init_means[s_idx, d_idx, m_idx] = mu[0]
+                    init_stds[s_idx, d_idx, m_idx] = std[0]
+                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
+                if sum_w > 0:
+                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
+
+    gmm_init_params = (init_weights, init_means, init_stds)
+    return num_mixtures_matrix, gmm_init_params
 
 
 class Phlag:
@@ -194,23 +541,14 @@ class Phlag:
         return out_dir
 
     def determine_optimal_mixtures(self):
-        import sys
-        from .utils import get_repo_root
-        repo_root = get_repo_root()
-        caster_results_dir = repo_root / "caster" / "results"
-        if str(caster_results_dir) not in sys.path:
-            sys.path.append(str(caster_results_dir))
-            
-        import caster_plot
-        
         if self.args.output_file:
             output_dir = pathlib.Path(self.args.output_file).parent
         else:
             output_dir = self.get_default_out_dir()
-            
+
         output_dir.mkdir(parents=True, exist_ok=True)
-            
-        num_mixtures_matrix, self.gmm_init_params = caster_plot.determine_optimal_mixtures(
+
+        num_mixtures_matrix, self.gmm_init_params = determine_optimal_mixtures(
             self.args.caster_scores,
             self.Y,
             self.pos_to_caster,
@@ -314,17 +652,16 @@ class Phlag:
         transition_matrix_np = np.array(self.params.transitions.transition_matrix)
         log_likelihoods_np = np.array(log_likelihoods)
         
-        # Extract ground truth pattern indices from input filename if present
+        # Extract the required ground truth pattern from the input filename/path.
         # Format example: ...a1n5a2a3n8n1...
         # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
         # Each token (e.g., 'n1', 'n8', 'a1', 'n5') represents one 500Kb locus block.
         import re
         input_path_obj = pathlib.Path(self.args.caster_scores)
-        
+
         sorted_positions = sorted(self.pos_to_caster.keys())
         y_true = np.zeros(len(sorted_positions), dtype=int)
-        has_ground_truth = False
-        
+
         pattern_str = None
         # 1. Try to find the pattern in the path parts (matches [an]\d+ blocks, range syntax, or start-end coords)
         pattern_full_match_regex = r'(?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?)+|\d+-\d+(?:[_,]\d+-\d+)*'
@@ -332,36 +669,40 @@ class Phlag:
             if re.fullmatch(pattern_full_match_regex, part):
                 pattern_str = part
                 break
-                
+
         # 2. Try the file stem
         if not pattern_str:
             pattern_str_match = re.search(r'((?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?){2,}|\d+-\d+(?:[_,]\d+-\d+)*)', input_path_obj.stem)
             if pattern_str_match:
                 pattern_str = pattern_str_match.group(1)
-                
-        # 3. Try pattern.txt
-        if not pattern_str:
-            pattern_file = input_path_obj.parent / "pattern.txt"
-            if pattern_file.exists():
-                try:
-                    content = pattern_file.read_text().strip()
-                    p_match = re.search(r'((?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?)+|\d+-\d+(?:[_,]\d+-\d+)*)', content)
-                    if p_match:
-                        pattern_str = p_match.group(1)
-                except Exception:
-                    pass
 
-        if pattern_str:
-            from .utils import parse_pattern_string
-            total_span = sorted_positions[-1] if sorted_positions else None
-            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
-            if blocks:
-                has_ground_truth = True
-                for idx, pos in enumerate(sorted_positions):
-                    for start_bp, end_bp in anomaly_intervals:
-                        if start_bp <= pos <= end_bp:
-                            y_true[idx] = 1
-                            break
+        if not pattern_str:
+            sys.exit(f"Error: No ground truth locus pattern (e.g. 'n1a1n5...') found in '{input_path_obj}'. Phlag requires a ground truth pattern in the score file's path or filename.")
+
+        from .utils import parse_pattern_string
+        total_span = sorted_positions[-1] if sorted_positions else None
+        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+        if not blocks:
+            sys.exit(f"Error: Could not parse ground truth locus pattern '{pattern_str}' from '{input_path_obj}'.")
+
+        for idx, pos in enumerate(sorted_positions):
+            for start_bp, end_bp in anomaly_intervals:
+                if start_bp <= pos <= end_bp:
+                    y_true[idx] = 1
+                    break
+
+        # Store ground truth info and compute the ground-truth-split empirical fits
+        # (Null vs Alt), shared by the report's relative-error stats and the em.png top row
+        self.y_true = y_true
+        self.ground_truth_fits = {}
+        Y_np = np.array(self.Y)
+        for d in range(Y_np.shape[-1]):
+            null_vals = Y_np[y_true == 0, d]
+            alt_vals = Y_np[y_true == 1, d]
+            if len(null_vals) > 1 and len(alt_vals) > 1:
+                mu_null, std_null = stats.norm.fit(null_vals)
+                mu_alt, std_alt = stats.norm.fit(alt_vals)
+                self.ground_truth_fits[d] = (float(mu_null), float(std_null), float(mu_alt), float(std_alt))
 
         # Check if --correct-transition was requested to manually/automatically set ground truth transition matrix
         correct_trans_arg = getattr(self.args, "correct_transition", None)
@@ -382,21 +723,18 @@ class Phlag:
                     correct_trans_arg = "auto"
             
             if correct_trans_arg == "auto" or (isinstance(correct_trans_arg, str) and correct_trans_arg.lower() == "auto"):
-                if has_ground_truth:
-                    N_00 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 0))
-                    N_01 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 1))
-                    N_10 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 0))
-                    N_11 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 1))
+                N_00 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 0))
+                N_01 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 1))
+                N_10 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 0))
+                N_11 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 1))
 
-                    A00 = float(N_00 / (N_00 + N_01)) if (N_00 + N_01) > 0 else 0.5
-                    A01 = 1.0 - A00
-                    A10 = float(N_10 / (N_10 + N_11)) if (N_10 + N_11) > 0 else 0.5
-                    A11 = 1.0 - A10
+                A00 = float(N_00 / (N_00 + N_01)) if (N_00 + N_01) > 0 else 0.5
+                A01 = 1.0 - A00
+                A10 = float(N_10 / (N_10 + N_11)) if (N_10 + N_11) > 0 else 0.5
+                A11 = 1.0 - A10
 
-                    gt_tm = np.array([[A00, A01], [A10, A11]], dtype=np.float32)
-                    transition_corrected = True
-                else:
-                    print("Warning: --correct-transition auto requested, but ground truth locus pattern not found in filename or pattern.txt.")
+                gt_tm = np.array([[A00, A01], [A10, A11]], dtype=np.float32)
+                transition_corrected = True
 
             if transition_corrected and gt_tm is not None:
                 from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
@@ -417,30 +755,65 @@ class Phlag:
         flipped_for_eval = False
         
         # Flip the state assignments according to whichever has smaller hamming distance
-        if has_ground_truth:
-            hamming_dist = np.sum(y_pred != y_true)
-            hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
-            
-            if hamming_dist_flipped < hamming_dist:
-                y_pred = 1 - y_pred
-                flipped_for_eval = True
-            
-            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
-            
-            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
-            f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
-            
-            metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}, Accuracy: {accuracy:.4f}"
-            print(f"\n[Evaluation Metrics] {metrics_str}\n")
+        hamming_dist = np.sum(y_pred != y_true)
+        hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
+
+        if hamming_dist_flipped < hamming_dist:
+            y_pred = 1 - y_pred
+            flipped_for_eval = True
+
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
+        f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
+
+        metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}, Accuracy: {accuracy:.4f}"
+        print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
+        from .utils import get_simulation_clade, get_tree_branch_length
+        _, clade_name, clade_number = get_simulation_clade(self.args.caster_scores)
         headers = []
+        headers.append(f"Clade: {clade_name if clade_name else 'N/A'}")
+        if clade_number:
+            headers.append(f"Clade number: {clade_number}")
+
+        is_admixture = "admixture" in pathlib.Path(self.args.caster_scores).parts
+        if is_admixture:
+            # Admixture events reference an internal simulator node distinct from the
+            # named donor clade, not a single tree edge -- no branch length to report.
+            headers.append("Branch length (CU): N/A (not applicable for admixture)")
+        elif clade_name:
+            matched_name, branch_len = get_tree_branch_length([clade_name])
+            if matched_name is None:
+                headers.append("Branch length (CU): N/A (node not found directly in tree)")
+            elif branch_len is None:
+                headers.append(f"Branch length (CU, node '{matched_name}'): N/A (no length recorded for this node)")
+            else:
+                headers.append(f"Branch length (CU, node '{matched_name}'): {branch_len:.6f}")
+        else:
+            headers.append("Branch length (CU): N/A")
+
+        # Self-describing ground-truth/evaluation summary. These three lines let
+        # downstream consumers (phlag.benchmark) read the anomaly fraction, the raw
+        # confusion counts and the eval-time label polarity straight out of the
+        # report, instead of re-deriving them from the locus pattern -- the fraction
+        # in particular is not a pure function of the pattern string, since it
+        # depends on where the actual window grid (sorted_positions) falls inside
+        # the anomaly intervals.
+        n_windows = int(len(y_true))
+        n_anomaly = int(np.sum(y_true == 1))
+        anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
+        headers.append(f"Anomaly fraction: {anomaly_fraction:.6f} ({n_anomaly}/{n_windows} windows)")
+        headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
+        headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
+
         headers.append("State divergence: " + emission_divergence_str)
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
@@ -451,8 +824,23 @@ class Phlag:
         headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
-        if has_ground_truth:
-            headers.append(f"{metrics_str}")
+        headers.append(f"{metrics_str}")
+        if self.ground_truth_fits:
+            topology_names = get_topology_names(self.Y.shape[-1])
+            headers.append("Topology\tState\tStatistic\tRel.err(%)")
+            for d in sorted(self.ground_truth_fits.keys()):
+                mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
+                mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, 0, d, np.array([0.0]))
+                mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, 1, d, np.array([0.0]))
+                rel_mu_null = (mu_null_fit - mu_null_gt) / mu_null_gt * 100 if mu_null_gt != 0 else float('nan')
+                rel_std_null = (std_null_fit - std_null_gt) / std_null_gt * 100 if std_null_gt != 0 else float('nan')
+                rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt * 100 if mu_alt_gt != 0 else float('nan')
+                rel_std_alt = (std_alt_fit - std_alt_gt) / std_alt_gt * 100 if std_alt_gt != 0 else float('nan')
+                topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
+                headers.append(f"{topo_name}\tNull\tmean\t{format_rel_err(rel_mu_null)}")
+                headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(rel_std_null)}")
+                headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(rel_mu_alt)}")
+                headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(rel_std_alt)}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
             
@@ -485,9 +873,7 @@ class Phlag:
                     line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
                     ax1.step(positions_kb, plot_path_data, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
                 
-                # Plot ground truth if available
-                if has_ground_truth:
-                    ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+                ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
 
                 ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
@@ -596,7 +982,7 @@ class Phlag:
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
-        p0, p1 = 0.6, 0.6
+        p0, p1 = 0.99, 0.99
         initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
         
         if self.args.model_design == "gmm":
@@ -659,15 +1045,18 @@ class PhlagPlotter:
     """
     Object-oriented plotter for visualizing the probability distributions
     of standard multi-species coalescent (MSC) background (State 0, Null) vs.
-    alternative/anomalous (State 1, Alternative) states before and after EM fitting.
+    alternative/anomalous (State 1, Alternative) states.
+
+    Row 0 shows the ground-truth-split empirical histogram and independent Null/Alt
+    gaussian fits (or a single ungrounded distribution when no ground truth is available).
+    Row 1 shows the empirical HMM-assigned histogram and EM-fitted emission curves.
     """
-    def __init__(self, phlag, initial_params):
+    def __init__(self, phlag):
         self.phlag = phlag
-        self.initial_params = initial_params
-        
+
         # Ingest and configure metadata parameters
         self.extract_metadata()
-        
+
         # Generate the visual distribution charts
         self.plot_distributions()
 
@@ -675,12 +1064,7 @@ class PhlagPlotter:
         """Extracts genomic filename, dimension, and styles configuration."""
         self.input_path = pathlib.Path(self.phlag.args.caster_scores)
         self.emission_dim = self.phlag.Y.shape[-1]
-        
-        # Map coordinates to topology names if we have the standard 3 topologies
-        if self.emission_dim == 3:
-            self.topology_names = ["ABBA", "BABA", "AABB"]
-        else:
-            self.topology_names = [f"Coord {i+1}" for i in range(self.emission_dim)]
+        self.topology_names = get_topology_names(self.emission_dim)
 
         # Define premium color palette and labels
         self.colors = {
@@ -697,7 +1081,7 @@ class PhlagPlotter:
         }
 
     def plot_distributions(self):
-        """Prepares the subplot layout and runs plotting for Before and After EM states."""
+        """Prepares the subplot layout and runs plotting for the ground-truth and After-EM rows."""
         sns.set_theme(style="whitegrid")
         plt.rcParams.update({
             'font.family': 'sans-serif',
@@ -705,14 +1089,15 @@ class PhlagPlotter:
             'axes.edgecolor': '#cccccc',
             'grid.color': '#f0f0f0'
         })
-        
-        # Create a 2x3 panel layout (or 2x1 if single dimension)
-        fig, axes = plt.subplots(2, self.emission_dim, figsize=(5 * self.emission_dim, 9.0), sharey=False)
-        
+
+        # Create a 2x3 panel layout (or 2x1 if single dimension); extra width reserved for
+        # the outside-axes per-row legend.
+        fig, axes = plt.subplots(2, self.emission_dim, figsize=(5.5 * self.emission_dim, 9.5), sharey=False)
+
         if self.emission_dim == 1:
             axes = np.array([[axes[0]], [axes[1]]])
-            
-        # Determine consistent coordinate limits across Before/After plots
+
+        # Determine consistent coordinate limits across both rows
         ranges = {}
         for d in range(self.emission_dim):
             ymin, ymax = float(np.min(self.phlag.Y[:, d])), float(np.max(self.phlag.Y[:, d]))
@@ -722,93 +1107,174 @@ class PhlagPlotter:
             else:
                 ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
 
-        # Plot Row 0: Before EM (Initial theoretical setup)
-        self._plot_row(axes[0], self.initial_params, ranges, title_prefix="Before EM", plot_empirical=False)
-        
-        # Plot Row 1: After EM (Fitted theoretical setup and assigned empirical data)
-        self._plot_row(axes[1], self.phlag.params, ranges, title_prefix="After EM", plot_empirical=True)
-        
+        # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian/beta)
+        if self.phlag.args.model_design == "gmm":
+            self._plot_gmm_init_row(axes[0], ranges)
+        else:
+            self._plot_ground_truth_row(axes[0], ranges)
+
+        # Row 1: After EM (fitted emission curves and HMM-assigned empirical data)
+        self._plot_em_row(axes[1], ranges)
+
         from .utils import get_locus_description
         locus_desc = get_locus_description(self.phlag.args.caster_scores)
         if locus_desc:
             fig.suptitle(f"EM Distributions | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.tight_layout(rect=[0, 0, 0.92, 0.96])
         else:
-            plt.tight_layout()
+            plt.tight_layout(rect=[0, 0, 0.92, 1])
         self.save_plot()
 
-    def _plot_row(self, row_axes, params, ranges, title_prefix, plot_empirical=False):
-        """Plots a single row (either Before EM or After EM) across all topologies."""
-        if plot_empirical:
-            most_likely_states = self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y)
-            
+    def _finalize_row_legend(self, row_axes, title):
+        """Collects de-duplicated handles/labels across a row's axes and places a single
+        legend outside the plot area (to the right of the row), so it never overlaps the
+        mu/sigma text annotations drawn near the curves."""
+        unique = {}
+        for ax in row_axes:
+            handles, labels = ax.get_legend_handles_labels()
+            for handle, label in zip(handles, labels):
+                if label and label not in unique:
+                    unique[label] = handle
+        if unique:
+            row_axes[-1].legend(
+                unique.values(), unique.keys(), title=title,
+                bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.,
+                fontsize=7.5, framealpha=0.9
+            )
+
+    def _plot_ground_truth_row(self, row_axes, ranges):
+        """Plots the ground-truth-split empirical histogram and independent Null/Alt gaussian fits."""
+        y_true = self.phlag.y_true
+        ground_truth_fits = self.phlag.ground_truth_fits
+        title_prefix = "Ground Truth Split"
+        Y_np = np.array(self.phlag.Y)
+
         for d in range(self.emission_dim):
             ax = row_axes[d]
             x_vals = ranges[d]
-            
             trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
-            
+            vals = Y_np[:, d]
+
+            mu_null, std_null, mu_alt, std_alt = ground_truth_fits[d]
+            null_vals = vals[y_true == 0]
+            alt_vals = vals[y_true == 1]
+
+            if len(null_vals) > 0:
+                sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[0]['fill'], label='Null Histogram', bins=30)
+            if len(alt_vals) > 0:
+                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[1]['fill'], label='Alt Histogram', bins=30)
+
+            pdf_null = stats.norm.pdf(x_vals, mu_null, std_null)
+            ax.plot(x_vals, pdf_null, color=self.colors[0]['line'], linewidth=2.2, label='Null Fit')
+            ax.axvline(mu_null, color=self.colors[0]['line'], linestyle='--', linewidth=1.5)
+            ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.4f}$", transform=trans, color=self.colors[0]['line'], fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+            ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.4f}$", transform=trans, color=self.colors[0]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            pdf_alt = stats.norm.pdf(x_vals, mu_alt, std_alt)
+            ax.plot(x_vals, pdf_alt, color=self.colors[1]['line'], linewidth=2.2, linestyle='--', label='Alt Fit')
+            ax.axvline(mu_alt, color=self.colors[1]['line'], linestyle=':', linewidth=1.5)
+            ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+            ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
+            ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
+            ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
+            ax.tick_params(axis='both', which='major', labelsize=8)
+
+        self._finalize_row_legend(row_axes, title_prefix)
+
+    def _plot_gmm_init_row(self, row_axes, ranges):
+        """Plots the pre-EM GMM initialization seed: weighted-sum-of-Gaussians curves per
+        state, derived from the k-means-based mixture seed (self.phlag.gmm_init_params)."""
+        init_weights, init_means, init_stds = self.phlag.gmm_init_params
+        title_prefix = "GMM Initialization"
+
+        for d in range(self.emission_dim):
+            ax = row_axes[d]
+            x_vals = ranges[d]
+            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+
+            for state in [0, 1]:
+                color_config = self.colors[state]
+                w = np.array(init_weights[state, d])
+                m_means = np.array(init_means[state, d])
+                m_stds = np.array(init_stds[state, d])
+                pdf_vals = np.zeros_like(x_vals)
+                for m in range(len(w)):
+                    pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
+                mu = float(np.sum(w * m_means))
+                var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
+                sigma = np.sqrt(max(1e-6, var))
+
+                ax.plot(x_vals, pdf_vals, color=color_config['line'], linewidth=2.2, label=f"{color_config['label']} Curve")
+                ax.fill_between(x_vals, pdf_vals, alpha=0.05, color=color_config['fill'])
+                ax.axvline(x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8)
+                ax.axvline(x=mu - sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6)
+                ax.axvline(x=mu + sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6)
+
+                y_pos_mean = 0.90 if state == 0 else 0.75
+                y_pos_std = 0.83 if state == 0 else 0.68
+                ax.text(mu, y_pos_mean, f"$\\mu_{state} = {mu:.4f}$", transform=trans, color=color_config['line'], fontsize=8.0, ha='center', va='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
+                ax.text(mu + sigma, y_pos_std, f"$\\sigma_{state} = {sigma:.4f}$", transform=trans, color=color_config['line'], fontsize=7.0, ha='center', va='center', bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
+
+            ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
+            ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
+            ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
+            ax.tick_params(axis='both', which='major', labelsize=8)
+
+        self._finalize_row_legend(row_axes, title_prefix)
+
+    def _plot_em_row(self, row_axes, ranges):
+        """Plots the empirical HMM-assigned histogram and EM-fitted emission curves."""
+        params = self.phlag.params
+        title_prefix = "After EM"
+        most_likely_states = self.phlag.hmm.most_likely_states(params, self.phlag.Y)
+
+        for d in range(self.emission_dim):
+            ax = row_axes[d]
+            x_vals = ranges[d]
+            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+
             # 1. Plot empirical step-histograms for Assigned State Data points
-            if plot_empirical:
-                y_state0 = np.array(self.phlag.Y[most_likely_states == 0, d])
-                y_state1 = np.array(self.phlag.Y[most_likely_states == 1, d])
-                
-                if len(y_state0) > 0:
-                    sns.histplot(
-                        y_state0, ax=ax, color=self.colors[0]['fill'], 
-                        stat="density", kde=False, alpha=0.12, 
-                        element="step", label=f"{self.colors[0]['label']} Histogram"
-                    )
-                if len(y_state1) > 0:
-                    sns.histplot(
-                        y_state1, ax=ax, color=self.colors[1]['fill'], 
-                        stat="density", kde=False, alpha=0.12, 
-                        element="step", label=f"{self.colors[1]['label']} Histogram"
-                    )
-            
+            y_state0 = np.array(self.phlag.Y[most_likely_states == 0, d])
+            y_state1 = np.array(self.phlag.Y[most_likely_states == 1, d])
+
+            if len(y_state0) > 0:
+                sns.histplot(
+                    y_state0, ax=ax, color=self.colors[0]['fill'],
+                    stat="density", kde=False, alpha=0.12,
+                    element="step", label=f"{self.colors[0]['label']} Histogram"
+                )
+            if len(y_state1) > 0:
+                sns.histplot(
+                    y_state1, ax=ax, color=self.colors[1]['fill'],
+                    stat="density", kde=False, alpha=0.12,
+                    element="step", label=f"{self.colors[1]['label']} Histogram"
+                )
+
             # 2. Plot PDF curves and Vertical Guideline Markers (Mean and +/- 1 Std)
             for state in [0, 1]:
                 color_config = self.colors[state]
-                
-                if self.phlag.args.model_design == "beta":
-                    alpha = float(params.emissions.concentration1[state, d])
-                    beta = float(params.emissions.concentration0[state, d])
-                    pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
-                    mu = alpha / (alpha + beta)
-                    sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
-                elif self.phlag.args.model_design == "gmm":
-                    w = np.array(params.emissions.mixture_weights[state, d])
-                    m_means = np.array(params.emissions.means[state, d])
-                    m_stds = np.array(params.emissions.stds[state, d])
-                    pdf_vals = np.zeros_like(x_vals)
-                    for m in range(len(w)):
-                        pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
-                    mu = float(np.sum(w * m_means))
-                    var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
-                    sigma = np.sqrt(max(1e-6, var))
-                else:
-                    mu = float(params.emissions.means[state, d])
-                    sigma = np.sqrt(np.clip(float(params.emissions.covariances[state, d, d]), a_min=1e-6, a_max=None))
-                    pdf_vals = stats.norm.pdf(x_vals, mu, sigma)
-                
+                mu, sigma, pdf_vals = get_state_mu_sigma_pdf(params, self.phlag.args.model_design, state, d, x_vals)
+
                 # Plot theoretical curve
                 ax.plot(
-                    x_vals, pdf_vals, color=color_config['line'], 
+                    x_vals, pdf_vals, color=color_config['line'],
                     linewidth=2.2, label=f"{color_config['label']} Curve"
                 )
-                
+
                 # Shading under curve
                 ax.fill_between(
-                    x_vals, pdf_vals, alpha=0.05, 
+                    x_vals, pdf_vals, alpha=0.05,
                     color=color_config['fill']
                 )
-                
+
                 # Plot Central Tendency Guideline: Mean
                 ax.axvline(
                     x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8,
                     label=None
                 )
-                
+
                 # Plot Dispersion Guidelines: +/- 1 Std bounds
                 ax.axvline(
                     x=mu - sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6,
@@ -818,11 +1284,11 @@ class PhlagPlotter:
                     x=mu + sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6,
                     label=None
                 )
-                
+
                 # Label with symbols mu and sigma next to the lines
                 y_pos_mean = 0.90 if state == 0 else 0.75
                 y_pos_std = 0.83 if state == 0 else 0.68
-                
+
                 ax.text(
                     mu, y_pos_mean, f"$\\mu_{state} = {mu:.4f}$", transform=trans, color=color_config['line'],
                     fontsize=8.0, ha='center', va='center', fontweight='bold',
@@ -833,26 +1299,13 @@ class PhlagPlotter:
                     fontsize=7.0, ha='center', va='center',
                     bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
                 )
-                
+
             ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
             ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
-            if d == 0:
-                ax.set_ylabel("Probability Density", fontsize=9, labelpad=4)
-            else:
-                ax.set_ylabel("")
+            ax.set_ylabel("Probability Density" if d == 0 else "", fontsize=9, labelpad=4)
             ax.tick_params(axis='both', which='major', labelsize=8)
-            
-            # De-duplicate legend entries to keep layout clean and readable
-            handles, labels = ax.get_legend_handles_labels()
-            unique_labels = {}
-            for handle, label in zip(handles, labels):
-                if label not in unique_labels:
-                    unique_labels[label] = handle
-                    
-            ax.legend(
-                unique_labels.values(), unique_labels.keys(), 
-                fontsize=7.5, loc='upper right', framealpha=0.9
-            )
+
+        self._finalize_row_legend(row_axes, title_prefix)
 
     def save_plot(self):
         """Saves generated plot as PNG."""
@@ -881,7 +1334,7 @@ def int_or_abbrev(val_str):
         return int(float(val_str[:-1]) * 1000000)
     return int(val_str)
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER"
     )
@@ -985,7 +1438,7 @@ def parse_arguments():
         help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
@@ -1050,7 +1503,8 @@ def parse_arguments():
             sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
 
     # Check if --plot is supplied
-    plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in sys.argv)
+    check_argv = argv if argv is not None else sys.argv[1:]
+    plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in check_argv)
     if plot_supplied and args.step_size is None:
         parser.error("argument -s/--step-size is required if --plot is supplied")
 
@@ -1087,20 +1541,16 @@ def organize_existing_test_files():
 organize_existing_test_files()
 
 
-def main():
-    import copy
+def main(argv=None):
     organize_existing_test_files()
-    args = parse_arguments()
+    args = parse_arguments(argv)
     phlag = Phlag(args)
-    
-    # Ingest baseline setup properties before fitting
-    initial_params = copy.deepcopy(phlag.params)
-    
+
     phlag.run()
     phlag.save_output()
-    
+
     if args.plot and "em" in args.plot:
-        PhlagPlotter(phlag, initial_params)
+        PhlagPlotter(phlag)
 
 
 if __name__ == "__main__":

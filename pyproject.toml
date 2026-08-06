@@ -39,8 +39,10 @@ Homepage = "https://github.com/bo1929/phlag"
 Repository = "https://github.com/bo1929/phlag"
 
 [project.scripts]
-phlag = "phlag.main:main"
+phlag = "phlag.phlag:main"
 caster = "phlag.caster:main"
+benchmark = "phlag.benchmark:main"
+phlagster = "phlag.phlagster:main"
 
 [tool.hatch.build.targets.sdist]
 exclude = [

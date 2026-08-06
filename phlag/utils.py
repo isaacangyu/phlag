@@ -140,24 +140,183 @@ def get_short_sim_name(sim_name):
     s = s.replace("_admixture_", "_")
     return s
 
+
+def get_simulation_node_name(file_path):
+    """
+    Extracts the simulation directory segment (the clade/node identifier, e.g.
+    'Strigiformes_N297_rate090-time7099554' or 'N555') directly from a caster/phlag
+    output path, by taking the path component two levels above 'caster' or 'phlag'
+    (.../<node_name>/<pattern>/caster/scores.tsv or .../<node_name>/<pattern>/phlag/report.tsv).
+    Returns None if the path doesn't match this convention.
+    """
+    import pathlib
+    parts = pathlib.Path(file_path).parts
+    for idx in range(len(parts) - 1, -1, -1):
+        if parts[idx] in ("caster", "phlag") and idx >= 2:
+            return clean_locus_name(parts[idx - 2])
+    return None
+
+
+def get_simulation_clade(caster_scores_path, sim_root=None):
+    """
+    Locates this run's mapping file (neoaves_<clade>_mapping.tsv) by matching the
+    caster/phlag output path's simulation directory segment (see get_simulation_node_name)
+    against leaf directories under the simulations root, and splits the mapping
+    filename's clade token into name and number -- e.g. 'Strigiformes:3' becomes
+    clade_name='Strigiformes', clade_number='3' (the number/letter after the colon is a
+    disambiguator distinguishing multiple simulated instances of the same named clade,
+    not part of the clade name itself; plain tokens like 'N555' have no colon, so
+    clade_number is None).
+    Returns (node_name, clade_name, clade_number); clade_name is None if no matching
+    mapping file was found.
+    """
+    import re
+    import pathlib
+    node_name = get_simulation_node_name(caster_scores_path)
+    if not node_name:
+        return None, None, None
+
+    if sim_root is None:
+        sim_root = get_data_dir() / "simulations"
+    sim_root = pathlib.Path(sim_root)
+    if not sim_root.exists():
+        return node_name, None, None
+
+    for mapping_file in sim_root.rglob("neoaves_*_mapping.tsv"):
+        if get_short_sim_name(mapping_file.parent.name) == node_name:
+            m = re.match(r'neoaves_(.+)_mapping\.tsv$', mapping_file.name)
+            if m:
+                clade_name, _, clade_number = m.group(1).partition(":")
+                return node_name, clade_name, (clade_number or None)
+    return node_name, None, None
+
+
+def resolve_fasta_from_scores_path(scores_path, sim_root=None):
+    """
+    Reverse-resolves a not-yet-computed scores.tsv-style output path back to its source
+    concat FASTA, by matching the path's simulation-directory segment (the component two
+    levels above 'caster', see get_simulation_node_name) against leaf directories under
+    the simulations root, then requiring an exact match between the path's pattern-stem
+    segment (the component directly above 'caster') and a FASTA filename in that leaf's
+    concat/ subdirectory. Does not guess -- returns None if there is no exact match,
+    including when the concat/ directory has multiple FASTAs and none match.
+    """
+    import pathlib
+    parts = pathlib.Path(scores_path).parts
+    caster_idx = None
+    for idx in range(len(parts) - 1, -1, -1):
+        if parts[idx] == "caster" and idx >= 2:
+            caster_idx = idx
+            break
+    if caster_idx is None:
+        return None
+
+    node_name = clean_locus_name(parts[caster_idx - 2])
+    pattern_stem = clean_locus_name(parts[caster_idx - 1])
+
+    if sim_root is None:
+        sim_root = get_data_dir() / "simulations"
+    sim_root = pathlib.Path(sim_root)
+    if not sim_root.exists():
+        return None
+
+    for concat_dir in sim_root.rglob("concat"):
+        leaf_dir = concat_dir.parent
+        if get_short_sim_name(leaf_dir.name) != node_name:
+            continue
+        for fasta_path in concat_dir.iterdir():
+            if fasta_path.suffix.lower() in (".fa", ".fasta") and clean_locus_name(fasta_path.stem) == pattern_stem:
+                return fasta_path
+    return None
+
+
+def get_tree_branch_length(node_names, tree_path=None):
+    """
+    Looks up the branch length of an exact node label (leaf taxon or named internal
+    node) in a newick tree file, trying each candidate in node_names in order.
+    Does not infer branch lengths via MRCA/internal-node reconstruction or fuzzy
+    matching -- only a literal label match against the tree counts.
+    Returns (matched_name, branch_length) where branch_length may be None if the
+    matched node has no recorded length, or (None, None) if no candidate matched
+    or no tree file could be resolved.
+    """
+    import pathlib
+    import dendropy
+
+    if tree_path is None:
+        candidates = [
+            get_data_dir() / "63K.tre",
+            get_repo_root() / "store" / "63K.tre",
+            get_data_dir() / "store" / "63K.tre",
+            get_repo_root() / "63K.tre",
+        ]
+        tree_path = next((c for c in candidates if c.exists()), None)
+    else:
+        tree_path = pathlib.Path(tree_path)
+
+    if not tree_path or not tree_path.exists():
+        return None, None
+
+    tree = dendropy.Tree.get(path=str(tree_path), schema="newick", preserve_underscores=True)
+    node_lengths = {}
+    for node in tree.preorder_node_iter():
+        label = node.taxon.label if node.is_leaf() and node.taxon else node.label
+        if label and label not in node_lengths:
+            node_lengths[label] = node.edge.length
+
+    for name in node_names:
+        if name in node_lengths:
+            return name, node_lengths[name]
+    return None, None
+
+ADMIXTURE_DIVERGENCE_THRESHOLD_MYR = 4.0
+
+
+def get_admixture_divergence_time(sim_name):
+    """
+    Extracts the admixture divergence time, in millions of years (Myr), from a
+    simulation name or path carrying a 'time<NUM>' token.
+    e.g. 'N482_N477_rate090-time2599554'                -> 2.599554
+         '.../admixture/high/..._rate090-time7099554'   -> 7.099554
+    Values above 1000 are read as raw years and normalized to Myr; values at or
+    below 1000 are assumed to already be in Myr.
+    Returns None when there is no 'time<NUM>' token to read.
+
+    This is the raw quantity that get_simulation_categories() buckets into its
+    'low'/'high' subcategory at ADMIXTURE_DIVERGENCE_THRESHOLD_MYR; both share
+    this function so the parsing and the threshold each live in exactly one place.
+    """
+    import re
+    m = re.search(r'time(\d+(?:\.\d+)?)', str(sim_name))
+    if not m:
+        return None
+    val = float(m.group(1))
+    return val / 1000000.0 if val > 1000 else val
+
+
 def get_simulation_categories(sim_name):
     """
     Categorizes a simulation name or path into two subdirectory levels.
     Returns (level1, level2) or () if not a recognized 10X/recombination/admixture simulation.
-    
+
+    Always prefer passing a full path over a bare node name: the bare-stub
+    fallbacks at the end map names like 'N717'/'N228' to a single fixed category,
+    but those node names are reused across several category directories on disk,
+    so a bare stub is genuinely ambiguous and the fallback will silently pick one.
+
     10X:
       up: '10X_up', '10X/up', 'Nyctibiidae', 'N497', 'N544', 'N554', 'N716' -> ('10X', 'up')
       down: '10X_down', '10X/down', 'N109', 'N498', 'N717' -> ('10X', 'down')
-      
+
     recombination:
       up: 'recombination_up', 'recombination/up' -> ('recombination', 'up')
       down: 'recombination_down', 'recombination/down', 'N252' -> ('recombination', 'down')
-      
+
     admixture:
       'admixture', or ('rate' and 'time') -> ('admixture', 'low' if time < 4.0 else 'high')
-      Time is parsed from 'time<NUM>' in sim_name (if > 1000, divided by 1e6).
+      Time is read by get_admixture_divergence_time() and compared against
+      ADMIXTURE_DIVERGENCE_THRESHOLD_MYR; an unreadable/absent time falls back to 'low'.
     """
-    import re
     s = str(sim_name)
     if "10X_down" in s or "10X/down" in s:
         return ("10X", "down")
@@ -168,13 +327,8 @@ def get_simulation_categories(sim_name):
     elif "recombination_up" in s or "recombination/up" in s:
         return ("recombination", "up")
     elif "admixture" in s or ("rate" in s and "time" in s):
-        m = re.search(r'time(\d+(?:\.\d+)?)', s)
-        if m:
-            val = float(m.group(1))
-            t_val = val / 1000000.0 if val > 1000 else val
-            sub2 = "low" if t_val < 4.0 else "high"
-        else:
-            sub2 = "low"
+        t_val = get_admixture_divergence_time(s)
+        sub2 = "low" if (t_val is None or t_val < ADMIXTURE_DIVERGENCE_THRESHOLD_MYR) else "high"
         return ("admixture", sub2)
     elif "10X" in s:
         if "down" in s or any(k in s for k in ["N109", "N498", "N717"]):
@@ -446,6 +600,30 @@ def get_phlag_output_base(base_path=None):
     if p.name.lower() == "phlag":
         return p
     return p / "phlag"
+
+
+def check_simulation_complete(leaf_dir, concat_filename="40-65.fa"):
+    """
+    Checks whether a leaf simulation directory (one containing a 'concat' subdirectory)
+    has everything needed to run caster/phlag: a concat/<concat_filename> FASTA file,
+    and exactly one population mapping file (neoaves_*_mapping.tsv, falling back to
+    *_mapping.tsv) directly inside the leaf directory.
+    Returns (is_complete: bool, reason: str, fasta_path: Path or None, mapping_path: Path or None).
+    """
+    import pathlib
+    leaf_dir = pathlib.Path(leaf_dir)
+
+    fasta_path = leaf_dir / "concat" / concat_filename
+    if not fasta_path.exists():
+        return False, f"missing concat/{concat_filename}", None, None
+
+    mapping_candidates = sorted(leaf_dir.glob("neoaves_*_mapping.tsv")) or sorted(leaf_dir.glob("*_mapping.tsv"))
+    if len(mapping_candidates) == 0:
+        return False, "no mapping file found", fasta_path, None
+    if len(mapping_candidates) > 1:
+        return False, f"ambiguous mapping files ({len(mapping_candidates)} found)", fasta_path, None
+
+    return True, "complete", fasta_path, mapping_candidates[0]
 
 
 def resolve_input_file(path_input, default_subdirs=None, default_exts=None):

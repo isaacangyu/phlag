@@ -51,6 +51,9 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Claude
+.claude/
+
 # Translations
 *.mo
 *.pot
