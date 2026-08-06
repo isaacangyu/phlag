@@ -230,44 +230,74 @@ def resolve_fasta_from_scores_path(scores_path, sim_root=None):
     return None
 
 
-def get_tree_branch_length(node_names, tree_path=None):
+def get_clade_info_path(filename):
     """
-    Looks up the branch length of an exact node label (leaf taxon or named internal
-    node) in a newick tree file, trying each candidate in node_names in order.
-    Does not infer branch lengths via MRCA/internal-node reconstruction or fuzzy
-    matching -- only a literal label match against the tree counts.
-    Returns (matched_name, branch_length) where branch_length may be None if the
-    matched node has no recorded length, or (None, None) if no candidate matched
-    or no tree file could be resolved.
+    Resolves a file under the repo's clade-info/ reference-data directory
+    (clade_cu.csv, population-information.tsv, 63K.tre), checking the repo root
+    first and the configured data dir as a fallback. Returns None if not found.
     """
     import pathlib
-    import dendropy
+    candidates = [
+        get_repo_root() / "clade-info" / filename,
+        get_data_dir() / "clade-info" / filename,
+    ]
+    return next((c for c in candidates if c.exists()), None)
 
-    if tree_path is None:
-        candidates = [
-            get_data_dir() / "63K.tre",
-            get_repo_root() / "store" / "63K.tre",
-            get_data_dir() / "store" / "63K.tre",
-            get_repo_root() / "63K.tre",
-        ]
-        tree_path = next((c for c in candidates if c.exists()), None)
-    else:
-        tree_path = pathlib.Path(tree_path)
 
-    if not tree_path or not tree_path.exists():
+def get_cu_branch_length(candidate_names, csv_path=None):
+    """
+    Looks up the coalescent-units branch length of an exact species name in
+    clade-info/clade_cu.csv, trying each candidate in candidate_names in order.
+    Does not infer via MRCA/internal-node reconstruction or fuzzy matching --
+    only a literal species-name match against the CSV counts (the CSV is
+    species/leaf-level only, so clade-level names like 'Strigiformes' will not
+    match; this mirrors the exact-match-only policy the old tree lookup used).
+    Returns (matched_name, branch_length), or (None, None) if no candidate
+    matched or the CSV could not be resolved.
+    """
+    import csv
+    import pathlib
+
+    csv_path = pathlib.Path(csv_path) if csv_path else get_clade_info_path("clade_cu.csv")
+    if not csv_path or not csv_path.exists():
         return None, None
 
-    tree = dendropy.Tree.get(path=str(tree_path), schema="newick", preserve_underscores=True)
-    node_lengths = {}
-    for node in tree.preorder_node_iter():
-        label = node.taxon.label if node.is_leaf() and node.taxon else node.label
-        if label and label not in node_lengths:
-            node_lengths[label] = node.edge.length
+    lengths = {}
+    with open(csv_path, "r", newline="") as f:
+        for row in csv.DictReader(f):
+            species = row.get("species")
+            if species and species not in lengths:
+                try:
+                    lengths[species] = float(row["cu_branch_length"])
+                except (TypeError, ValueError):
+                    lengths[species] = None
 
-    for name in node_names:
-        if name in node_lengths:
-            return name, node_lengths[name]
+    for name in candidate_names:
+        if name in lengths:
+            return name, lengths[name]
     return None, None
+
+
+def get_population_info(label, tsv_path=None):
+    """
+    Looks up a clade or species's row in clade-info/population-information.tsv
+    by exact LABEL match (this file carries both clade-level rows, e.g.
+    'Strigiformes', and species-level rows). Returns the row as a dict of
+    column name -> raw string value, or None if no exact match / the file
+    could not be resolved.
+    """
+    import csv
+    import pathlib
+
+    tsv_path = pathlib.Path(tsv_path) if tsv_path else get_clade_info_path("population-information.tsv")
+    if not tsv_path or not tsv_path.exists():
+        return None
+
+    with open(tsv_path, "r", newline="") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            if row.get("LABEL") == label:
+                return row
+    return None
 
 ADMIXTURE_DIVERGENCE_THRESHOLD_MYR = 4.0
 

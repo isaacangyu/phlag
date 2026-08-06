@@ -777,7 +777,7 @@ class Phlag:
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
-        from .utils import get_simulation_clade, get_tree_branch_length
+        from .utils import get_simulation_clade, get_cu_branch_length, get_population_info
         _, clade_name, clade_number = get_simulation_clade(self.args.caster_scores)
         headers = []
         headers.append(f"Clade: {clade_name if clade_name else 'N/A'}")
@@ -790,9 +790,9 @@ class Phlag:
             # named donor clade, not a single tree edge -- no branch length to report.
             headers.append("Branch length (CU): N/A (not applicable for admixture)")
         elif clade_name:
-            matched_name, branch_len = get_tree_branch_length([clade_name])
+            matched_name, branch_len = get_cu_branch_length([clade_name])
             if matched_name is None:
-                headers.append("Branch length (CU): N/A (node not found directly in tree)")
+                headers.append("Branch length (CU): N/A (node not found directly in clade_cu.csv)")
             elif branch_len is None:
                 headers.append(f"Branch length (CU, node '{matched_name}'): N/A (no length recorded for this node)")
             else:
@@ -800,18 +800,30 @@ class Phlag:
         else:
             headers.append("Branch length (CU): N/A")
 
-        # Self-describing ground-truth/evaluation summary. These three lines let
-        # downstream consumers (phlag.benchmark) read the anomaly fraction, the raw
-        # confusion counts and the eval-time label polarity straight out of the
-        # report, instead of re-deriving them from the locus pattern -- the fraction
-        # in particular is not a pure function of the pattern string, since it
-        # depends on where the actual window grid (sorted_positions) falls inside
-        # the anomaly intervals.
+        pop_info = get_population_info(clade_name) if clade_name else None
+        if pop_info:
+            try:
+                headers.append(f"Height (Ngen): {float(pop_info.get('HEIGHT_NGEN')):.4f}")
+            except (TypeError, ValueError):
+                headers.append("Height (Ngen): N/A")
+            try:
+                headers.append(f"Clade size: {int(float(pop_info.get('CLADE_SIZE')))}")
+            except (TypeError, ValueError):
+                headers.append("Clade size: N/A")
+        else:
+            headers.append("Height (Ngen): N/A")
+            headers.append("Clade size: N/A")
+
+        # Self-describing ground-truth/evaluation summary. These lines let downstream
+        # consumers (phlag.benchmark) read the anomaly fraction and the eval-time
+        # label polarity straight out of the report, instead of re-deriving them from
+        # the locus pattern -- the fraction in particular is not a pure function of
+        # the pattern string, since it depends on where the actual window grid
+        # (sorted_positions) falls inside the anomaly intervals.
         n_windows = int(len(y_true))
         n_anomaly = int(np.sum(y_true == 1))
         anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
         headers.append(f"Anomaly fraction: {anomaly_fraction:.6f} ({n_anomaly}/{n_windows} windows)")
-        headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
         headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
 
         headers.append("State divergence: " + emission_divergence_str)
@@ -825,6 +837,7 @@ class Phlag:
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
         headers.append(f"{metrics_str}")
+        headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
             headers.append("Topology\tState\tStatistic\tRel.err(%)")

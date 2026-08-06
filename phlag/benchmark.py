@@ -147,8 +147,8 @@ def _parse_branch_length_value(value_str):
     """
     Turns the right-hand side of a 'Branch length (CU...):' header into a float.
     Both emitted forms are handled:
-      '0.123456'                                -> 0.123456
-      'N/A (node not found directly in tree)'   -> None
+      '0.123456'                                     -> 0.123456
+      'N/A (node not found directly in clade_cu.csv)' -> None
     """
     token = (value_str or "").strip().split()
     if not token:
