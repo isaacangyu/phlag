@@ -570,12 +570,14 @@ class PhlagHMMEmissions(HMMEmissions):
         self, params: ParamsGaussianHMMEmissions, state: IntScalar, inputs=None
     ) -> tfd.Distribution:
         mean = params.means[state]
-        # Safely capture the diagonal entries from the 3x3 matrix space
-        variance_diag = jnp.diagonal(params.covariances[state])
-        # Ensure numerical stability across JAX boundaries via clipping/absolute values
-        std_dev = jnp.sqrt(jnp.clip(variance_diag, a_min=1e-6))
+        # Full state covariance (captures cross-topology correlation), with a small
+        # diagonal jitter for numerical stability/positive-definiteness -- the same
+        # role the old diagonal clip played, plus a floor beneath the M-step's own
+        # eps=1e-5 regularizer for states the M-step hasn't touched yet (e.g. the
+        # very first E-step, before any M-step has run).
+        cov = params.covariances[state] + jnp.eye(self.emission_dim) * 1e-6
 
-        return tfd.MultivariateNormalDiag(loc=mean, scale_diag=std_dev)
+        return tfd.MultivariateNormalFullCovariance(loc=mean, covariance_matrix=cov)
 
     def log_prior(self, params: ParamsGaussianHMMEmissions) -> Scalar:
         # Return 0 for now (flat prior on continuous emissions)
@@ -705,6 +707,10 @@ class PhlagHMM(HMM):
         self.emissions_m_step_state = None
         self.transitions_m_step_state = None
         self.occupancy_bias = occupancy_bias
+        # Cache for fit_em's compiled em_step closure, keyed on the identity of
+        # the (props, emissions, inputs) it was built for -- see fit_em.
+        self._jit_em_step = None
+        self._jit_em_step_key = None
 
         self.initial_component = StandardHMMInitialState(
             num_states=self.num_states, initial_probs_concentration=self.initial_probs_concentration
@@ -860,36 +866,57 @@ class PhlagHMM(HMM):
         verbose=True
     ):
         from dynamax.utils.utils import ensure_array_has_batch_dim
-        from functools import partial
-        import jax
 
         batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
         batch_inputs = ensure_array_has_batch_dim(inputs, self.inputs_shape)
 
-        @jax.jit
-        def em_step(params, m_step_state):
-            batch_stats, lls = jax.vmap(partial(self.e_step, params))(batch_emissions, batch_inputs)
-            lp = self.log_prior(params) + lls.sum()
-            params, m_step_state = self.m_step(params, props, batch_stats, m_step_state)
-            return params, m_step_state, lp
+        # Phlag.run() calls fit_em ~10 times per training run, always with the
+        # same (props, emissions/self.Y, inputs) objects. A fresh
+        # @jax.jit-decorated closure built here every call would force a full
+        # XLA retrace/recompile each time (jit's cache is keyed on the identity
+        # of the jax.jit(...) call, not on function/value equality) -- so cache
+        # the closure itself, keyed on the identity of what it closes over, and
+        # rebuild it only if fit_em is ever called with different objects.
+        #
+        # This keeps props/batch_emissions/batch_inputs as closed-over
+        # constants exactly like the original per-call closure did (rather
+        # than passing them as traced jit arguments): that distinction matters
+        # because XLA's constant-folding differs between "baked-in constant"
+        # and "runtime argument" compilation, which shifts floating-point
+        # rounding and compounds over ~275 iterative EM steps into a visibly
+        # different converged result -- confirmed empirically, so this is not
+        # a cosmetic choice.
+        cache_key = (id(props), id(emissions), id(inputs))
+        if self._jit_em_step is None or self._jit_em_step_key != cache_key:
+            @jax.jit
+            def em_step(params, m_step_state):
+                batch_stats, lls = jax.vmap(partial(self.e_step, params))(batch_emissions, batch_inputs)
+                lp = self.log_prior(params) + lls.sum()
+                params, m_step_state = self.m_step(params, props, batch_stats, m_step_state)
+                return params, m_step_state, lp
+
+            self._jit_em_step = em_step
+            self._jit_em_step_key = cache_key
+
+        em_step = self._jit_em_step
 
         log_probs = []
         m_step_state = self.initialize_m_step_state(params, props)
-        
+
         if verbose:
             # Print initial transition matrix
             tm_init = params.transitions.transition_matrix
             tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
             print(f"Initial Transition matrix: {tm_init_str}")
-        
+
         for step in range(num_iters):
             params, m_step_state, marginal_loglik = em_step(params, m_step_state)
             log_probs.append(marginal_loglik)
-            
+
             if verbose:
                 # Print transition probabilities at each iteration
                 tm = params.transitions.transition_matrix
                 tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
                 print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")
-            
+
         return params, jnp.array(log_probs)

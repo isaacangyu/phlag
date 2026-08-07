@@ -53,6 +53,7 @@ cover/
 
 # Claude
 .claude/
+CLAUDE.md
 
 # Translations
 *.mo

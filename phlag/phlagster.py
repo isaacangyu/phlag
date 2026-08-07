@@ -20,6 +20,14 @@ def parse_arguments(argv=None):
         choices=["gaussian", "gmm"],
         help="Distribution type, threaded through to both caster and phlag (default: gaussian)"
     )
+    parser.add_argument(
+        "--no-plots",
+        dest="no_plots",
+        action="store_true",
+        help="Skip every diagnostic plot in both stages (caster's scatter.png, phlag's em.png/states.png/"
+             "correlations.png) -- only scores.tsv and report.tsv are produced. dist.png is never produced "
+             "regardless of this flag.",
+    )
     return parser.parse_args(argv)
 
 
@@ -29,13 +37,18 @@ def main(argv=None):
     from . import caster
     from . import phlag as phlag_main
 
+    caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
     print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
-    scores_path = caster.main([str(args.input_file), "-d", args.dist_type])
+    scores_path = caster.main([str(args.input_file), "-d", args.dist_type] + caster_plot_args)
     if scores_path is None:
         sys.exit("Error: caster did not produce a scores file.")
 
+    # phlag's CLI requires -s/--step-size whenever --plot is passed at all, even
+    # with no plot names -- unused by the report itself (only feeds phlag's dead
+    # ASCII-histogram code path), so any placeholder value satisfies it.
+    phlag_plot_args = ["--plot", "-s", "1000"] if args.no_plots else []
     print(f"[phlagster] Running phlag on '{scores_path}' (-d {args.dist_type})...")
-    phlag_main.main([str(scores_path), "-d", args.dist_type])
+    phlag_main.main([str(scores_path), "-d", args.dist_type] + phlag_plot_args)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,24 @@ def format_rel_err(value):
     return f"{value:.4f}"
 
 
+def count_trainable_params(params, props):
+    """
+    Total scalar element count across every leaf marked trainable=True in props,
+    for a BIC parameter penalty. Counts declared array sizes (e.g. the 2x2
+    transition matrix counts as 4), not row-stochastic-constrained degrees of
+    freedom, so this is an upper bound on true DOF rather than an exact count.
+    """
+    from dynamax.parameters import ParameterProperties
+
+    is_leaf = lambda node: isinstance(node, ParameterProperties)
+
+    def _count(p, prop):
+        return int(np.prod(p.shape)) if prop.trainable else 0
+
+    counts = jax.tree_util.tree_map(_count, params, props, is_leaf=is_leaf)
+    return int(sum(jax.tree_util.tree_leaves(counts)))
+
+
 def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, cluster_topologies=False):
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -512,8 +530,8 @@ class Phlag:
         else:
             if input_path.parent.name == "caster":
                 # Find path relative to model design or phlag root if input is in a caster subfolder
-                # e.g., .../phlag/gaussian/w50k_s1k/admixture/high/Columbiformes_.../40-65/caster/scores.tsv
-                # should preserve w50k_s1k/admixture/high/Columbiformes_.../40-65 under phlag/<dist_type>/
+                # e.g., .../phlag/gaussian/w50k_s1k/admixture/high/Columbiformes_.../45-55/caster/scores.tsv
+                # should preserve w50k_s1k/admixture/high/Columbiformes_.../45-55 under phlag/<dist_type>/
                 locus_dir = input_path.parent.parent
                 parts = locus_dir.parts
                 # Check if model design or 'phlag' is in parent path parts
@@ -777,12 +795,14 @@ class Phlag:
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
-        from .utils import get_simulation_clade, get_cu_branch_length, get_population_info
+        from .utils import get_simulation_clade, get_cu_branch_length_from_population_info, get_population_info
         _, clade_name, clade_number = get_simulation_clade(self.args.caster_scores)
         headers = []
         headers.append(f"Clade: {clade_name if clade_name else 'N/A'}")
         if clade_number:
             headers.append(f"Clade number: {clade_number}")
+
+        pop_info = get_population_info(clade_name) if clade_name else None
 
         is_admixture = "admixture" in pathlib.Path(self.args.caster_scores).parts
         if is_admixture:
@@ -790,17 +810,14 @@ class Phlag:
             # named donor clade, not a single tree edge -- no branch length to report.
             headers.append("Branch length (CU): N/A (not applicable for admixture)")
         elif clade_name:
-            matched_name, branch_len = get_cu_branch_length([clade_name])
-            if matched_name is None:
-                headers.append("Branch length (CU): N/A (node not found directly in clade_cu.csv)")
-            elif branch_len is None:
-                headers.append(f"Branch length (CU, node '{matched_name}'): N/A (no length recorded for this node)")
+            branch_len = get_cu_branch_length_from_population_info(clade_name, pop_info=pop_info)
+            if branch_len is None:
+                headers.append(f"Branch length (CU): N/A (no population-information.tsv row for clade '{clade_name}')")
             else:
-                headers.append(f"Branch length (CU, node '{matched_name}'): {branch_len:.6f}")
+                headers.append(f"Branch length (CU, node '{clade_name}'): {branch_len:.6f}")
         else:
             headers.append("Branch length (CU): N/A")
 
-        pop_info = get_population_info(clade_name) if clade_name else None
         if pop_info:
             try:
                 headers.append(f"Height (Ngen): {float(pop_info.get('HEIGHT_NGEN')):.4f}")
@@ -836,6 +853,17 @@ class Phlag:
         headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
+
+        if hasattr(self, "final_em_log_prob"):
+            headers.append(f"EM final joint log-likelihood: {self.final_em_log_prob:.6f}")
+        marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
+        k_params = count_trainable_params(self.params, self.props)
+        n_obs = int(self.Y.shape[0])
+        bic = k_params * np.log(n_obs) - 2 * marginal_ll
+        headers.append(
+            f"BIC: {bic:.6f} (log-likelihood={marginal_ll:.6f}, k={k_params} trainable params, n={n_obs} windows)"
+        )
+
         headers.append(f"{metrics_str}")
         headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
         if self.ground_truth_fits:
@@ -856,14 +884,14 @@ class Phlag:
                 headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(rel_std_alt)}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
-            
+
         self.output_str += "\n" + "\n".join(headers)
-        
+
         # Add the state paths as comma-separated rows in the report
         for path in paths:
             effective_path = (1 - path) if flipped_for_eval else path
             self.output_str += "\n" + ",".join(map(str, effective_path.tolist()))
-            
+
         # Generate the visual plot if configured: states
         if self.args.plot and "states" in self.args.plot:
             try:
@@ -1045,6 +1073,10 @@ class Phlag:
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
             tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str}")
+        # log_probs is dynamax's own "joint log probability" trace for this fit_em call
+        # (log_prior(params) + sum of per-step data log-likelihoods); its last entry is
+        # the final joint log-likelihood EM converged to.
+        self.final_em_log_prob = float(log_probs[-1])
         self.compute_output()
 
     def save_output(self):
@@ -1052,6 +1084,81 @@ class Phlag:
             f.write(self.output_str)
         print(f"Saved PHLAG output report to: {self.output_file}")
 
+
+def backfill_branch_length(root_dir=None):
+    """
+    Patches the 'Branch length (CU...)' header line in every already-written
+    report.tsv under root_dir (default: the same CONNECTION_DIR-resolved phlag
+    output base that get_default_out_dir() uses) to use
+    get_cu_branch_length_from_population_info() instead of whatever it was
+    computed with before -- without touching anything else in the file (no EM
+    rerun needed, since this line never depended on the HMM/Viterbi output).
+
+    Never overwrites a line that already carries a real numeric branch length,
+    and leaves admixture reports (no single branch to report) untouched.
+    Returns a dict of counts: patched / already_resolved / admixture / unresolved / no_clade.
+    """
+    import re
+    import pathlib
+    from . import utils
+    from .benchmark import parse_report
+
+    branch_length_line_re = re.compile(r'^Branch length \(CU[^)]*\):\s*(.+?)\s*$')
+
+    if root_dir is None:
+        conn_env = os.environ.get("CONNECTION_DIR")
+        if conn_env:
+            base_dir = pathlib.Path(conn_env)
+        else:
+            base_dir = utils.get_data_dir()
+            if base_dir == utils.get_repo_root() / "caster" / "data":
+                base_dir = utils.get_repo_root() / "connection_dir"
+        root_dir = utils.get_phlag_output_base(base_dir)
+    root_dir = pathlib.Path(root_dir)
+
+    counts = {"patched": 0, "already_resolved": 0, "admixture": 0, "unresolved": 0, "no_clade": 0}
+
+    for report_path in sorted(root_dir.rglob("report.tsv")):
+        parsed = parse_report(report_path)
+        clade_name = parsed["clade_name"]
+
+        if "admixture" in report_path.parts:
+            counts["admixture"] += 1
+            continue
+        if not clade_name:
+            counts["no_clade"] += 1
+            continue
+        if parsed["branch_length_present"] and parsed["branch_length"] is not None:
+            counts["already_resolved"] += 1
+            continue
+
+        branch_len = utils.get_cu_branch_length_from_population_info(clade_name)
+        if branch_len is None:
+            counts["unresolved"] += 1
+            continue
+
+        with open(report_path, "r") as f:
+            lines = f.read().splitlines()
+
+        new_line = f"Branch length (CU, node '{clade_name}'): {branch_len:.6f}"
+        for idx, line in enumerate(lines):
+            if branch_length_line_re.match(line.strip()):
+                lines[idx] = new_line
+                break
+        else:
+            continue
+
+        with open(report_path, "w") as f:
+            f.write("\n".join(lines))
+        counts["patched"] += 1
+
+    print(
+        f"Backfilled branch lengths under {root_dir}: "
+        f"{counts['patched']} patched, {counts['already_resolved']} already resolved, "
+        f"{counts['admixture']} admixture (skipped), {counts['unresolved']} still unresolved, "
+        f"{counts['no_clade']} with no clade name."
+    )
+    return counts
 
 
 class PhlagPlotter:
@@ -1072,6 +1179,7 @@ class PhlagPlotter:
 
         # Generate the visual distribution charts
         self.plot_distributions()
+        self.plot_correlations()
 
     def extract_metadata(self):
         """Extracts genomic filename, dimension, and styles configuration."""
@@ -1103,8 +1211,7 @@ class PhlagPlotter:
             'grid.color': '#f0f0f0'
         })
 
-        # Create a 2x3 panel layout (or 2x1 if single dimension); extra width reserved for
-        # the outside-axes per-row legend.
+        # Create a 2x3 panel layout (or 2x1 if single dimension).
         fig, axes = plt.subplots(2, self.emission_dim, figsize=(5.5 * self.emission_dim, 9.5), sharey=False)
 
         if self.emission_dim == 1:
@@ -1129,29 +1236,31 @@ class PhlagPlotter:
         # Row 1: After EM (fitted emission curves and HMM-assigned empirical data)
         self._plot_em_row(axes[1], ranges)
 
+        self._finalize_legend(fig, axes)
+
         from .utils import get_locus_description
         locus_desc = get_locus_description(self.phlag.args.caster_scores)
         if locus_desc:
             fig.suptitle(f"EM Distributions | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
-            plt.tight_layout(rect=[0, 0, 0.92, 0.96])
+            plt.tight_layout(rect=[0, 0, 1, 0.93])
         else:
-            plt.tight_layout(rect=[0, 0, 0.92, 1])
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
         self.save_plot()
 
-    def _finalize_row_legend(self, row_axes, title):
-        """Collects de-duplicated handles/labels across a row's axes and places a single
-        legend outside the plot area (to the right of the row), so it never overlaps the
-        mu/sigma text annotations drawn near the curves."""
+    def _finalize_legend(self, fig, axes):
+        """Collects de-duplicated handles/labels across every axis in the figure (both
+        rows share the same Null/Alt Fit/Histogram labeling) and places a single legend
+        in the figure's upper-right corner."""
         unique = {}
-        for ax in row_axes:
+        for ax in np.array(axes).flat:
             handles, labels = ax.get_legend_handles_labels()
             for handle, label in zip(handles, labels):
                 if label and label not in unique:
                     unique[label] = handle
         if unique:
-            row_axes[-1].legend(
-                unique.values(), unique.keys(), title=title,
-                bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.,
+            fig.legend(
+                unique.values(), unique.keys(),
+                loc='upper right', bbox_to_anchor=(0.995, 0.97),
                 fontsize=7.5, framealpha=0.9
             )
 
@@ -1184,7 +1293,7 @@ class PhlagPlotter:
             ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.4f}$", transform=trans, color=self.colors[0]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
             pdf_alt = stats.norm.pdf(x_vals, mu_alt, std_alt)
-            ax.plot(x_vals, pdf_alt, color=self.colors[1]['line'], linewidth=2.2, linestyle='--', label='Alt Fit')
+            ax.plot(x_vals, pdf_alt, color=self.colors[1]['line'], linewidth=2.2, label='Alt Fit')
             ax.axvline(mu_alt, color=self.colors[1]['line'], linestyle=':', linewidth=1.5)
             ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
             ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
@@ -1193,8 +1302,6 @@ class PhlagPlotter:
             ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
             ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
             ax.tick_params(axis='both', which='major', labelsize=8)
-
-        self._finalize_row_legend(row_axes, title_prefix)
 
     def _plot_gmm_init_row(self, row_axes, ranges):
         """Plots the pre-EM GMM initialization seed: weighted-sum-of-Gaussians curves per
@@ -1219,7 +1326,7 @@ class PhlagPlotter:
                 var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
                 sigma = np.sqrt(max(1e-6, var))
 
-                ax.plot(x_vals, pdf_vals, color=color_config['line'], linewidth=2.2, label=f"{color_config['label']} Curve")
+                ax.plot(x_vals, pdf_vals, color=color_config['line'], linewidth=2.2, label=f"{color_config['label']} Fit")
                 ax.fill_between(x_vals, pdf_vals, alpha=0.05, color=color_config['fill'])
                 ax.axvline(x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8)
                 ax.axvline(x=mu - sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6)
@@ -1234,8 +1341,6 @@ class PhlagPlotter:
             ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
             ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
             ax.tick_params(axis='both', which='major', labelsize=8)
-
-        self._finalize_row_legend(row_axes, title_prefix)
 
     def _plot_em_row(self, row_axes, ranges):
         """Plots the empirical HMM-assigned histogram and EM-fitted emission curves."""
@@ -1273,7 +1378,7 @@ class PhlagPlotter:
                 # Plot theoretical curve
                 ax.plot(
                     x_vals, pdf_vals, color=color_config['line'],
-                    linewidth=2.2, label=f"{color_config['label']} Curve"
+                    linewidth=2.2, label=f"{color_config['label']} Fit"
                 )
 
                 # Shading under curve
@@ -1318,10 +1423,100 @@ class PhlagPlotter:
             ax.set_ylabel("Probability Density" if d == 0 else "", fontsize=9, labelpad=4)
             ax.tick_params(axis='both', which='major', labelsize=8)
 
-        self._finalize_row_legend(row_axes, title_prefix)
+    def _covariance_ellipse(self, mean_xy, cov2x2, n_std=1.0, **kwargs):
+        """Builds an n_std confidence-region Ellipse patch for a 2D Gaussian, via
+        eigendecomposition of its 2x2 covariance submatrix (eigenvectors give the
+        ellipse's orientation, sqrt(eigenvalues) its axis lengths)."""
+        from matplotlib.patches import Ellipse
 
-    def save_plot(self):
-        """Saves generated plot as PNG."""
+        eigenvalues, eigenvectors = np.linalg.eigh(np.array(cov2x2))
+        order = eigenvalues.argsort()[::-1]
+        eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
+        angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+        width, height = 2 * n_std * np.sqrt(np.clip(eigenvalues, a_min=0, a_max=None))
+        return Ellipse(xy=mean_xy, width=width, height=height, angle=angle, **kwargs)
+
+    def plot_correlations(self):
+        """
+        Pairwise cross-topology correlation plot: for every pair of topology
+        dimensions, scatters the HMM-assigned data and draws 1-sigma/2-sigma
+        ellipses from the fitted full covariance matrix (PhlagHMMEmissions now
+        uses MultivariateNormalFullCovariance, not just the diagonal -- see
+        hmm.py), so the correlation structure the EM fit actually captures is
+        visible instead of only implied by the independent per-dimension curves
+        in em.png. Gaussian-only: beta/gmm emissions have no cross-dimension
+        covariance to show.
+        """
+        if self.emission_dim < 2 or self.phlag.args.model_design != "gaussian":
+            return
+
+        import itertools
+
+        pairs = list(itertools.combinations(range(self.emission_dim), 2))
+        params = self.phlag.params
+        Y_np = np.array(self.phlag.Y)
+        most_likely_states = np.array(self.phlag.hmm.most_likely_states(params, self.phlag.Y))
+
+        sns.set_theme(style="whitegrid")
+        fig, axes = plt.subplots(1, len(pairs), figsize=(5.5 * len(pairs), 5.5), squeeze=False)
+        axes = axes[0]
+
+        for col_idx, (i, j) in enumerate(pairs):
+            ax = axes[col_idx]
+
+            for state in [0, 1]:
+                color_config = self.colors[state]
+                mask = most_likely_states == state
+                ax.scatter(
+                    Y_np[mask, i], Y_np[mask, j],
+                    s=8, alpha=0.25, color=color_config['fill'], linewidths=0,
+                    label=f"{color_config['label']} Windows",
+                )
+
+            for state in [0, 1]:
+                color_config = self.colors[state]
+                mean_xy = np.array(params.emissions.means[state])[[i, j]]
+                cov2x2 = np.array(params.emissions.covariances[state])[np.ix_([i, j], [i, j])]
+
+                for n_std, alpha, linestyle, sigma_label in [(1.0, 0.9, '-', '1σ'), (2.0, 0.5, '--', '2σ')]:
+                    ellipse = self._covariance_ellipse(
+                        mean_xy, cov2x2, n_std=n_std,
+                        edgecolor=color_config['line'], facecolor='none',
+                        linewidth=1.6, linestyle=linestyle, alpha=alpha,
+                        label=f"{color_config['label']} {sigma_label}",
+                    )
+                    ax.add_patch(ellipse)
+                ax.plot(mean_xy[0], mean_xy[1], marker='x', color=color_config['line'], markersize=8, markeredgewidth=2)
+
+                denom = np.sqrt(cov2x2[0, 0] * cov2x2[1, 1])
+                corr = float(cov2x2[0, 1] / denom) if denom > 0 else 0.0
+                y_text = 0.95 if state == 0 else 0.88
+                ax.text(
+                    0.03, y_text, f"$\\rho_{{{color_config['label'].lower()}}} = {corr:.3f}$",
+                    transform=ax.transAxes, color=color_config['line'], fontsize=9,
+                    fontweight='bold', va='top',
+                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1),
+                )
+
+            ax.set_title(f"{self.topology_names[i]} vs {self.topology_names[j]}", fontsize=11, fontweight='bold', pad=8)
+            ax.set_xlabel(f"{self.topology_names[i]} Score", fontsize=9, labelpad=4)
+            ax.set_ylabel(f"{self.topology_names[j]} Score", fontsize=9, labelpad=4)
+            ax.tick_params(axis='both', which='major', labelsize=8)
+
+        self._finalize_legend(fig, axes.reshape(1, -1))
+
+        from .utils import get_locus_description
+        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+        if locus_desc:
+            fig.suptitle(f"Cross-Topology Correlation (After EM) | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
+            plt.tight_layout(rect=[0, 0, 1, 0.88])
+        else:
+            plt.tight_layout(rect=[0, 0, 1, 0.92])
+
+        self.save_plot("correlations.png")
+
+    def save_plot(self, filename="em.png"):
+        """Saves the currently active matplotlib figure as PNG."""
         output_dir = getattr(self.phlag, "output_file", None)
         if output_dir:
             output_dir = output_dir.parent
@@ -1331,12 +1526,12 @@ class PhlagPlotter:
             else:
                 output_dir = pathlib.Path.cwd() / "test" / self.input_path.stem
                 output_dir.mkdir(parents=True, exist_ok=True)
-            
-        plot_file = output_dir / "em.png"
-        
+
+        plot_file = output_dir / filename
+
         plt.savefig(plot_file, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"Saved EM distributions plot to: {plot_file}")
+        print(f"Saved plot to: {plot_file}")
 
 
 def int_or_abbrev(val_str):

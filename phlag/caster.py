@@ -269,7 +269,7 @@ class CasterPlotter:
             blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
 
             if anomaly_intervals and not any(b[0] == 'n' for b in blocks):
-                # Pure interval format (e.g. 40-65)
+                # Pure interval format (e.g. 45-55)
                 alt_shaded = False
                 for start_pos, end_pos in anomaly_intervals:
                     mid_pos = (start_pos + end_pos) / 2.0

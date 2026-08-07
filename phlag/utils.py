@@ -19,8 +19,8 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
     Supported formats:
       1. Standard token sequence: e.g., 'n1n2n3n4n5n6n8a1a2a3n10n11' (12-chunk pattern)
       2. Range-token sequence: e.g., 'n1-n6,a1-a3,n10-n11' or 'n1-n6_a1-a3_n10-n11'
-      3. Percentage interval lists: e.g. '70-80,85-100' or '40-45' (marked as state 1 / anomaly)
-      4. Prepended locus pattern + interval suffix: e.g., 'n4n6n3n8n9a3a1a2n1n10n12n2_40-65'
+      3. Percentage interval lists: e.g. '37-62,80-85' or '47-52' (marked as state 1 / anomaly)
+      4. Prepended locus pattern + interval suffix: e.g., 'n4n6n3n8n9a3a1a2n1n10n12n2_45-55'
       5. Coordinate intervals: e.g. '0-3000000,3000000-4500000,4500000-6000000'
 
     Returns:
@@ -31,7 +31,7 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
     anomaly_intervals = []
     curr_pos = 0
 
-    # 0. Check if there is a trailing/standalone explicit interval range suffix (e.g. '_40-65', ';40-65', '_70-80,85-100', '70-80;85-100')
+    # 0. Check if there is a trailing/standalone explicit interval range suffix (e.g. '_45-55', ';45-55', '_37-62,80-85', '37-62;80-85')
     range_suffix_match = re.search(r'(?:^|[;_,])(\d+-\d+(?:[;_,]\d+-\d+)*)$', pattern_str)
     if range_suffix_match:
         suffix_str = range_suffix_match.group(1)
@@ -41,7 +41,7 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
             max_val = max(all_vals) if all_vals else 0
             first_start = int(coord_matches[0][0])
             
-            # Case A: Percentage intervals (0-100) (e.g. 40-65 or 70-80,85-100)
+            # Case A: Percentage intervals (0-100) (e.g. 45-55 or 37-62,80-85)
             if max_val == 100 or (first_start >= 15 and max_val <= 100):
                 span = total_span if total_span is not None and total_span > 0 else 6000000
                 for s_str, e_str in coord_matches:
@@ -299,7 +299,33 @@ def get_population_info(label, tsv_path=None):
                 return row
     return None
 
-ADMIXTURE_DIVERGENCE_THRESHOLD_MYR = 4.0
+
+def get_cu_branch_length_from_population_info(label, pop_info=None):
+    """
+    Computes a clade's own branch length in coalescent units as
+    CU = NGEN / (2 * SIZE), using its row in clade-info/population-information.tsv
+    (NGEN is that row's own branch duration in generations, not a cumulative
+    root-to-tip figure -- see get_population_info's LABEL join).
+    Pass an already-fetched pop_info dict (e.g. from get_population_info) to
+    avoid re-reading the TSV; otherwise it's looked up by label.
+    Returns None if there's no matching row, or NGEN/SIZE are missing,
+    non-numeric, or SIZE is zero.
+    """
+    if pop_info is None:
+        pop_info = get_population_info(label)
+    if not pop_info:
+        return None
+    try:
+        ngen = float(pop_info.get("NGEN"))
+        size = float(pop_info.get("SIZE"))
+    except (TypeError, ValueError):
+        return None
+    if size == 0:
+        return None
+    return ngen / (2 * size)
+
+
+ADMIXTURE_DIVERGENCE_THRESHOLD_MYR = 3.5
 
 
 def get_admixture_divergence_time(sim_name):
@@ -343,7 +369,7 @@ def get_simulation_categories(sim_name):
       down: 'recombination_down', 'recombination/down', 'N252' -> ('recombination', 'down')
 
     admixture:
-      'admixture', or ('rate' and 'time') -> ('admixture', 'low' if time < 4.0 else 'high')
+      'admixture', or ('rate' and 'time') -> ('admixture', 'low' if time < 3.5 else 'high')
       Time is read by get_admixture_divergence_time() and compared against
       ADMIXTURE_DIVERGENCE_THRESHOLD_MYR; an unreadable/absent time falls back to 'low'.
     """
@@ -382,19 +408,19 @@ def get_simulation_categories(sim_name):
 def convert_pattern_to_interval(pattern_str):
     """
     Converts a pattern string (which may be a string pattern like 'n1n2n3n4n5n6a1a2a3n8n10n11'
-    or 'n4n6n3n8n9a3a1a2n1n10n12n2_40-65') into an interval representation (e.g. '40-65').
+    or 'n4n6n3n8n9a3a1a2n1n10n12n2_45-55') into an interval representation (e.g. '45-55').
     """
     if not pattern_str:
         return ""
     import re
     s = str(pattern_str).strip()
 
-    # 1. Check for trailing explicit interval suffix e.g. '_40-65', ';40-65', '40-65'
+    # 1. Check for trailing explicit interval suffix e.g. '_45-55', ';45-55', '45-55'
     m_suffix = re.search(r'(?:^|[;_,])(\d+-\d+(?:[;_,]\d+-\d+)*)$', s)
     if m_suffix:
         return m_suffix.group(1)
 
-    # 2. Check if string is already a pure interval (e.g., '40-65', '1-6,7-9,10-11', '70-80,85-100')
+    # 2. Check if string is already a pure interval (e.g., '45-55', '1-6,7-9,10-11', '37-62,80-85')
     if re.fullmatch(r'\d+-\d+(?:[;_,]\d+-\d+)*', s):
         return s
 
@@ -430,7 +456,7 @@ def get_locus_description(file_path):
     """
     Extracts a full locus description (branch, params, change/pattern, category, window/step size)
     from a file path or filename, matching Caster's scatter plot locus format.
-    e.g. 'N482_N477_rate090-time2599554_40-65_admixture_w50k_s1k'
+    e.g. 'N482_N477_rate090-time2599554_45-55_admixture_w50k_s1k'
     """
     if not file_path:
         return ""
@@ -591,8 +617,8 @@ def get_repo_root():
 def get_data_dir():
     """
     Returns the user data output directory where scores and HMM state files should be stored.
-    Checks CONNECTION_DIR environment variable or .env file first, then defaults to /drive2/iang if present,
-    else repository 'caster/data' directory.
+    Checks CONNECTION_DIR environment variable or .env file first, then defaults to /drive2/iang if present.
+    Raises if neither is available -- there is no repo-relative fallback.
     """
     import os
     import pathlib
@@ -611,12 +637,15 @@ def get_data_dir():
 
     if conn_env:
         return pathlib.Path(conn_env)
-    
+
     drive2_dir = pathlib.Path("/drive2/iang")
     if drive2_dir.exists():
         return drive2_dir
-        
-    return get_repo_root() / "caster" / "data"
+
+    raise RuntimeError(
+        "CONNECTION_DIR is not set (env var or .env) and /drive2/iang does not exist. "
+        "Set CONNECTION_DIR to the shared data directory."
+    )
 
 
 def get_phlag_output_base(base_path=None):
@@ -632,28 +661,20 @@ def get_phlag_output_base(base_path=None):
     return p / "phlag"
 
 
-def check_simulation_complete(leaf_dir, concat_filename="40-65.fa"):
+def find_mapping_file(leaf_dir):
     """
-    Checks whether a leaf simulation directory (one containing a 'concat' subdirectory)
-    has everything needed to run caster/phlag: a concat/<concat_filename> FASTA file,
-    and exactly one population mapping file (neoaves_*_mapping.tsv, falling back to
-    *_mapping.tsv) directly inside the leaf directory.
-    Returns (is_complete: bool, reason: str, fasta_path: Path or None, mapping_path: Path or None).
+    Finds the single population mapping file (neoaves_*_mapping.tsv, falling back to
+    *_mapping.tsv) directly inside a simulation leaf directory.
+    Returns (mapping_path, None) if exactly one is found, else (None, reason).
     """
     import pathlib
     leaf_dir = pathlib.Path(leaf_dir)
-
-    fasta_path = leaf_dir / "concat" / concat_filename
-    if not fasta_path.exists():
-        return False, f"missing concat/{concat_filename}", None, None
-
     mapping_candidates = sorted(leaf_dir.glob("neoaves_*_mapping.tsv")) or sorted(leaf_dir.glob("*_mapping.tsv"))
     if len(mapping_candidates) == 0:
-        return False, "no mapping file found", fasta_path, None
+        return None, "no mapping file found"
     if len(mapping_candidates) > 1:
-        return False, f"ambiguous mapping files ({len(mapping_candidates)} found)", fasta_path, None
-
-    return True, "complete", fasta_path, mapping_candidates[0]
+        return None, f"ambiguous mapping files ({len(mapping_candidates)} found)"
+    return mapping_candidates[0], None
 
 
 def resolve_input_file(path_input, default_subdirs=None, default_exts=None):

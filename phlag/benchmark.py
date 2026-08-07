@@ -35,7 +35,15 @@ RESET = "\033[0m"
 DEFAULT_DIST_TYPE = "gaussian"
 DEFAULT_WINDOW_SIZE = 50000
 DEFAULT_STEP_SIZE = 1000
-DEFAULT_CONCAT_FILENAME = "40-65.fa"
+
+#: The current affected-fraction sweep that simulations produce under each leaf's
+#: concat/ directory: six contiguous percentage intervals centered near the middle
+#: of the genome, spanning fractions from 2% to 25%. This is the single source of
+#: truth for "default" concat pattern -- both the run loop and the stats layer use
+#: it to skip anything else that turns up under concat/ (older one-off intervals,
+#: stray pattern-token files, ...), so update this list, not the call sites, when
+#: the sweep changes.
+DEFAULT_CONCAT_PATTERNS = ["37-62", "40-60", "42-57", "45-55", "47-52", "49-51"]
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +260,7 @@ def nominal_anomaly_fraction(pattern_str):
     """
     Fallback anomaly fraction for reports written before the 'Anomaly fraction:'
     header existed: the NOMINAL portion of the genome the locus pattern marks as
-    anomalous, e.g. '40-65' -> 0.25, '40-45' -> 0.05, '70-80,85-100' -> 0.25.
+    anomalous, e.g. '37-62' -> 0.25, '47-52' -> 0.05, '49-51' -> 0.02.
 
     This is a design-level number read off the pattern alone; the measured
     fraction in the report header is the authoritative one because it also
@@ -342,7 +350,11 @@ class PanelACell:
 @dataclass
 class PanelBCell:
     """
-    One point of panel B: the macro-averaged TPR/FPR over the runs in this cell.
+    One point of panel B: the macro-averaged TPR/FPR over the runs in this
+    (column, fraction_bin, x_bin) cell -- the same x_bin (branch-length bin,
+    or admixture divergence-time bin) panel A groups by, so panel B draws one
+    connected line of points per (column, fraction_bin) subplot instead of a
+    single aggregate point.
 
     Macro (mean of each run's own rate), not micro (a rate recomputed from pooled
     confusion counts), so that panel B estimates the same quantity panel A does --
@@ -351,6 +363,7 @@ class PanelBCell:
     """
     column: str
     fraction_bin: str
+    x_bin: str
     n_runs: int
     mean_tpr: float
     mean_fpr: float
@@ -378,7 +391,7 @@ class Figure3Data:
     x_bins_by_column: Dict[str, List[str]]
     x_axis_label_by_column: Dict[str, str]
     panel_a: Dict[Tuple[str, str, str], PanelACell]
-    panel_b: Dict[Tuple[str, str], PanelBCell]
+    panel_b: Dict[Tuple[str, str, str], PanelBCell]
     errorbar: str
     dist_type: str
     window_size: int
@@ -477,7 +490,7 @@ class BenchmarkStats:
     # -- paths ------------------------------------------------------------
 
     def default_stats_dir(self):
-        """<phlag_base>/<dist_type>/w<W>_s<S>/benchmark/"""
+        """<phlag_base>/<dist_type>/w<W>_s<S>/benchmark/ -- the container for numbered per-run subfolders."""
         from .utils import get_data_dir, get_phlag_output_base
         from .caster import format_val
 
@@ -490,12 +503,30 @@ class BenchmarkStats:
             / "benchmark"
         )
 
+    def next_run_dir(self):
+        """
+        <default_stats_dir()>/<N>/, where N is one past the highest existing
+        numbered run subfolder (1 if none exist yet). Each summarize() call
+        gets its own folder instead of overwriting the previous run's tables
+        and figures, so old runs stay around for comparison.
+        """
+        root = self.default_stats_dir()
+        existing_ids = [
+            int(child.name) for child in (root.iterdir() if root.exists() else [])
+            if child.is_dir() and child.name.isdigit()
+        ]
+        next_id = max(existing_ids, default=0) + 1
+        return root / str(next_id)
+
     # -- discovery --------------------------------------------------------
 
     def collect(self):
         """
         Populates ``self.runs`` with one RunRecord per report.tsv found under the
-        expected output directory of a categorized source simulation.
+        expected output directory of a categorized source simulation, restricted to
+        the current DEFAULT_CONCAT_PATTERNS sweep. This always re-walks the output
+        tree on disk, so it picks up every finished default-pattern run that exists
+        there -- not only ones produced by a `run_all()` call earlier in this process.
         """
         from .utils import get_simulation_categories
 
@@ -540,10 +571,16 @@ class BenchmarkStats:
                 window_size=self.window_size,
                 step_size=self.step_size,
             )
-            report_paths = sorted(sim_output_dir.glob("*/phlag/report.tsv"))
+            report_paths = sorted(
+                p for p in sim_output_dir.glob("*/phlag/report.tsv")
+                if p.parent.parent.name in DEFAULT_CONCAT_PATTERNS
+            )
             if not report_paths:
                 self.n_leaf_dirs_without_output += 1
-                self.notes.append(f"[skip] {rel_leaf}: no report.tsv under {sim_output_dir}")
+                self.notes.append(
+                    f"[skip] {rel_leaf}: no default-pattern report.tsv under {sim_output_dir} "
+                    f"(patterns: {', '.join(DEFAULT_CONCAT_PATTERNS)})"
+                )
                 continue
 
             for report_path in report_paths:
@@ -653,8 +690,8 @@ class BenchmarkStats:
                 exclusions[record.exclusion] += 1
             if record.in_panel_a:
                 panel_a_groups[(record.column, record.fraction_bin, record.x_bin)].append(record)
-            if record.in_panel_b:
-                panel_b_groups[(record.column, record.fraction_bin)].append(record)
+            if record.in_panel_b and record.x_bin is not None:
+                panel_b_groups[(record.column, record.fraction_bin, record.x_bin)].append(record)
 
         panel_a = {}
         for key, records in panel_a_groups.items():
@@ -671,7 +708,7 @@ class BenchmarkStats:
 
         panel_b = {}
         for key, records in panel_b_groups.items():
-            column, fraction_bin = key
+            column, fraction_bin, x_bin = key
             tpr_mean, tpr_sd, tpr_minus, tpr_plus = summarize_values(
                 [r.tpr for r in records], self.errorbar
             )
@@ -679,7 +716,7 @@ class BenchmarkStats:
                 [r.fpr for r in records], self.errorbar
             )
             panel_b[key] = PanelBCell(
-                column=column, fraction_bin=fraction_bin, n_runs=len(records),
+                column=column, fraction_bin=fraction_bin, x_bin=x_bin, n_runs=len(records),
                 mean_tpr=tpr_mean, mean_fpr=fpr_mean,
                 sd_tpr=tpr_sd, sd_fpr=fpr_sd,
                 tpr_err_minus=tpr_minus, tpr_err_plus=tpr_plus,
@@ -811,10 +848,10 @@ class BenchmarkStats:
 
             for key in sorted(figure_data.panel_b.keys()):
                 cell = figure_data.panel_b[key]
-                emit("B", cell.column, cell.fraction_bin, "", "tpr", cell.n_runs,
+                emit("B", cell.column, cell.fraction_bin, cell.x_bin, "tpr", cell.n_runs,
                      cell.mean_tpr, cell.sd_tpr, cell.tpr_err_minus, cell.tpr_err_plus,
                      cell.run_ids)
-                emit("B", cell.column, cell.fraction_bin, "", "fpr", cell.n_runs,
+                emit("B", cell.column, cell.fraction_bin, cell.x_bin, "fpr", cell.n_runs,
                      cell.mean_fpr, cell.sd_fpr, cell.fpr_err_minus, cell.fpr_err_plus,
                      cell.run_ids)
 
@@ -860,16 +897,17 @@ class BenchmarkStats:
         print("\nPanel B cells (macro-averaged TPR/FPR):")
         for fraction_bin in figure_data.fraction_bins:
             row_cells = [
-                (column, figure_data.panel_b[(column, fraction_bin)])
+                (column, x_bin, figure_data.panel_b[(column, fraction_bin, x_bin)])
                 for column in figure_data.columns
-                if (column, fraction_bin) in figure_data.panel_b
+                for x_bin in figure_data.x_bins_by_column[column]
+                if (column, fraction_bin, x_bin) in figure_data.panel_b
             ]
             if not row_cells:
                 print(f"  fraction {fraction_bin}: EMPTY (no runs fall in this row)")
                 continue
             print(f"  fraction {fraction_bin}:")
-            for column, cell in row_cells:
-                print(f"    {column:28s} n={cell.n_runs:3d}  "
+            for column, x_bin, cell in row_cells:
+                print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
                       f"TPR={cell.mean_tpr:.4f}  FPR={cell.mean_fpr:.4f}")
 
         if self.notes:
@@ -992,6 +1030,29 @@ class BenchmarkFigurePlotter:
             fontsize=6.5, color=_INK_MUTED, ha="left", va="bottom", linespacing=1.5,
         )
 
+    def _bin_colors_for_column(self, column):
+        """
+        Assigns each of a column's x_bins (e.g. branch-length bins, or the
+        admixture low/high split) a color from the ordinal ramp, Unknown
+        always mapped to _UNKNOWN_COLOR. Shared by panel A's bars and panel
+        B's per-bin points so the same bin reads as the same color in both.
+        """
+        x_bins = self.data.x_bins_by_column[column]
+        ordered_bins = [b for b in x_bins if b != UNKNOWN_BIN]
+        ramp = _ordinal_colors(len(ordered_bins))
+        color_for_bin = {b: ramp[i] for i, b in enumerate(ordered_bins)}
+        color_for_bin[UNKNOWN_BIN] = _UNKNOWN_COLOR
+        return color_for_bin
+
+    def _width_ratios(self):
+        """
+        Column widths proportional to each column's number of x_bins, so a
+        column with fewer categories (e.g. admixture's low/high split vs. the
+        4 branch-length bins elsewhere) renders narrower instead of matching
+        width with empty space.
+        """
+        return [len(self.data.x_bins_by_column[c]) for c in self.data.columns]
+
     # -- panel A ----------------------------------------------------------
 
     def render_panel_a(self, filename="figure3_panel_a.png"):
@@ -1003,16 +1064,14 @@ class BenchmarkFigurePlotter:
             n_rows, n_cols,
             figsize=(3.3 * n_cols, 3.1 * n_rows + 0.8),
             squeeze=False,
+            gridspec_kw={"width_ratios": self._width_ratios()},
         )
 
         for row_idx, fraction_bin in enumerate(data.fraction_bins):
             for col_idx, column in enumerate(data.columns):
                 ax = axes[row_idx][col_idx]
                 x_bins = data.x_bins_by_column[column]
-                ordered_bins = [b for b in x_bins if b != UNKNOWN_BIN]
-                ramp = _ordinal_colors(len(ordered_bins))
-                color_for_bin = {b: ramp[i] for i, b in enumerate(ordered_bins)}
-                color_for_bin[UNKNOWN_BIN] = _UNKNOWN_COLOR
+                color_for_bin = self._bin_colors_for_column(column)
 
                 self._style_axes(ax)
                 ax.set_xlim(-0.7, len(x_bins) - 0.3)
@@ -1079,6 +1138,8 @@ class BenchmarkFigurePlotter:
     # -- panel B ----------------------------------------------------------
 
     def render_panel_b(self, filename="figure3_panel_b.png"):
+        from matplotlib.lines import Line2D
+
         data = self.data
         n_rows, n_cols = len(data.fraction_bins), len(data.columns)
 
@@ -1087,6 +1148,7 @@ class BenchmarkFigurePlotter:
             n_rows, n_cols,
             figsize=(3.3 * n_cols, 3.1 * n_rows + 0.8),
             squeeze=False,
+            gridspec_kw={"width_ratios": self._width_ratios()},
         )
 
         for row_idx, fraction_bin in enumerate(data.fraction_bins):
@@ -1101,24 +1163,57 @@ class BenchmarkFigurePlotter:
                 ax.plot([0, 1], [0, 1], color=_GRIDLINE, linewidth=1.0,
                         linestyle="--", zorder=1)
 
-                cell = data.panel_b.get((column, fraction_bin))
-                if cell is None or cell.n_runs == 0:
+                x_bins = data.x_bins_by_column[column]
+                color_for_bin = self._bin_colors_for_column(column)
+
+                # One point per x_bin (branch-length bin, or admixture low/high),
+                # in the same left-to-right order panel A's bars use, connected
+                # by a line -- same color mapping as panel A so a bin reads as
+                # the same color in both panels.
+                points = []
+                for x_bin in x_bins:
+                    cell = data.panel_b.get((column, fraction_bin, x_bin))
+                    if cell is None or cell.n_runs == 0:
+                        continue
+                    points.append((x_bin, cell))
+
+                if not points:
                     self._annotate_empty(ax)
                 else:
-                    ax.errorbar(
-                        cell.mean_fpr, cell.mean_tpr,
-                        xerr=[[cell.fpr_err_minus], [cell.fpr_err_plus]],
-                        yerr=[[cell.tpr_err_minus], [cell.tpr_err_plus]],
-                        fmt="o", markersize=_MARKER_SIZE, color=_SERIES_PHLAG,
-                        ecolor=_INK_SECONDARY, elinewidth=1.2,
-                        capsize=3, capthick=1.2,
-                        markeredgecolor=_SURFACE, markeredgewidth=1.5, zorder=3,
-                    )
-                    ax.annotate(
-                        f"n={cell.n_runs}",
-                        xy=(cell.mean_fpr, cell.mean_tpr),
-                        xytext=(12, -17), textcoords="offset points",
-                        fontsize=6.5, color=_INK_MUTED,
+                    if len(points) > 1:
+                        ax.plot(
+                            [c.mean_fpr for _, c in points],
+                            [c.mean_tpr for _, c in points],
+                            color=_INK_MUTED, linewidth=1.0, zorder=2,
+                        )
+                    for x_bin, cell in points:
+                        color = color_for_bin[x_bin]
+                        ax.errorbar(
+                            cell.mean_fpr, cell.mean_tpr,
+                            xerr=[[cell.fpr_err_minus], [cell.fpr_err_plus]],
+                            yerr=[[cell.tpr_err_minus], [cell.tpr_err_plus]],
+                            fmt="o", markersize=_MARKER_SIZE, color=color,
+                            ecolor=_INK_SECONDARY, elinewidth=1.2,
+                            capsize=3, capthick=1.2,
+                            markeredgecolor=_SURFACE, markeredgewidth=1.5, zorder=3,
+                        )
+                        ax.annotate(
+                            f"n={cell.n_runs}",
+                            xy=(cell.mean_fpr, cell.mean_tpr),
+                            xytext=(6, -9), textcoords="offset points",
+                            fontsize=5.5, color=_INK_MUTED,
+                        )
+
+                    legend_handles = [
+                        Line2D([0], [0], marker="o", linestyle="none",
+                               markersize=5.5, markerfacecolor=color_for_bin[x_bin],
+                               markeredgecolor=_SURFACE, markeredgewidth=0.8, label=x_bin)
+                        for x_bin in x_bins
+                    ]
+                    ax.legend(
+                        handles=legend_handles, loc="upper right",
+                        fontsize=5.5, framealpha=0.85, borderpad=0.4,
+                        handletextpad=0.4, labelspacing=0.3, borderaxespad=0.4,
                     )
 
                 if row_idx == 0:
@@ -1133,11 +1228,10 @@ class BenchmarkFigurePlotter:
                     ax.tick_params(axis="y", labelleft=False)
 
         fig.suptitle(
-            "Phlag anomaly detection: TPR vs FPR by affected gene-tree fraction",
+            "Phlag anomaly detection: TPR vs FPR by branch length and affected gene-tree fraction",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.03, 1, 0.97])
-        self._footer(fig)
+        fig.tight_layout(rect=[0, 0.01, 1, 0.97])
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1183,7 +1277,8 @@ def parse_arguments(argv=None):
         type=pathlib.Path,
         default=None,
         help="Directory for the summary tables and figures "
-             "(default: <phlag_base>/<dist-type>/w<W>_s<S>/benchmark/)",
+             "(default: <phlag_base>/<dist-type>/w<W>_s<S>/benchmark/<N>/, "
+             "N auto-incrementing per run so old runs aren't overwritten)",
     )
     parser.add_argument(
         "--errorbar",
@@ -1191,6 +1286,13 @@ def parse_arguments(argv=None):
         default="sd",
         choices=list(ERRORBAR_KINDS),
         help="Error bar shown on each aggregated cell (default: sd)",
+    )
+    parser.add_argument(
+        "change",
+        nargs="?",
+        default=None,
+        help="Short description of what's different in this run compared to earlier ones; "
+             "written to change.txt in the run's output folder",
     )
     return parser.parse_args(argv)
 
@@ -1263,35 +1365,70 @@ def run_step(cmd, label):
     return True, result.stdout
 
 
+def _fmt_metric(value):
+    return f"{value:.4f}" if value is not None else "N/A"
+
+
 def run_all(args, sim_root):
     """
-    Runs caster + phlag over every complete simulation leaf.
+    Runs phlagster (caster + phlag) over every complete simulation leaf x concat-fasta
+    combination, restricted to the current affected-fraction sweep (DEFAULT_CONCAT_PATTERNS).
+    Every default-pattern FASTA under a leaf's concat/ directory is its own unit of work.
+    Anything else found there -- older one-off intervals, stray pattern-token files -- is
+    left alone: it is neither run here nor counted by summarize().
 
-    Caster and phlag are checked and skipped independently: if
-    <...>/caster/scores.tsv already exists, caster is not re-run for that leaf
-    even if phlag still needs to run (and vice versa) -- so a leaf that's half
-    done never redoes the half that's already there. --rerun forces both
-    stages regardless of what's already on disk.
+    Caster and phlag are checked and skipped independently: if <...>/caster/scores.tsv
+    already exists for a (leaf, fasta) pair, caster is not re-run even if phlag still
+    needs to run -- so a half-done pattern never redoes the half that's already there.
+    --rerun forces both stages regardless of what's already on disk. When both stages
+    are needed, they run as a single `phlagster` invocation (in-process caster-then-phlag,
+    avoiding two separate interpreter/JAX startups); when only phlag is needed, `phlag`
+    alone is invoked directly against the existing scores.tsv.
     """
-    from .utils import check_simulation_complete
+    from .utils import find_mapping_file
 
     leaf_dirs = discover_leaf_dirs(sim_root)
 
-    processed = 0
+    work_items = []
     skipped_incomplete = 0
-    skipped_present = 0
-    failures = []
 
     for leaf_dir in leaf_dirs:
         rel_path = leaf_dir.relative_to(sim_root).as_posix()
 
-        is_complete, reason, fasta_path, mapping_path = check_simulation_complete(
-            leaf_dir, concat_filename=DEFAULT_CONCAT_FILENAME
-        )
-        if not is_complete:
-            print(f"[skip] {rel_path}: incomplete ({reason})")
+        mapping_path, mapping_reason = find_mapping_file(leaf_dir)
+        if mapping_path is None:
+            print(f"[skip] {rel_path}: incomplete ({mapping_reason})")
             skipped_incomplete += 1
             continue
+
+        concat_dir = leaf_dir / "concat"
+        fasta_paths = sorted(
+            p for p in concat_dir.glob("*.fa")
+            if p.is_file() and p.stem in DEFAULT_CONCAT_PATTERNS
+        ) if concat_dir.is_dir() else []
+        if not fasta_paths:
+            print(f"[skip] {rel_path}: incomplete (missing default-pattern concat/*.fa)")
+            skipped_incomplete += 1
+            continue
+
+        for fasta_path in fasta_paths:
+            work_items.append((leaf_dir, rel_path, fasta_path))
+
+    print(
+        f"\nBenchmark run: {len(work_items)} file(s) to process across "
+        f"{len(leaf_dirs) - skipped_incomplete} complete leaf dir(s) "
+        f"({skipped_incomplete} incomplete leaf dir(s) skipped) | "
+        f"{'rerunning all outputs' if args.rerun else 'skipping outputs that already exist'} | "
+        f"dist-type={args.dist_type}, window={DEFAULT_WINDOW_SIZE}, step={DEFAULT_STEP_SIZE}, "
+        f"patterns={','.join(DEFAULT_CONCAT_PATTERNS)}\n"
+    )
+
+    processed = 0
+    skipped_present = 0
+    failures = []
+
+    for leaf_dir, rel_path, fasta_path in work_items:
+        pattern_rel = f"{rel_path}/{fasta_path.stem}"
 
         scores_path = get_expected_scores_path(fasta_path, leaf_dir, dist_type=args.dist_type)
         report_path = get_expected_report_path(fasta_path, leaf_dir, dist_type=args.dist_type)
@@ -1299,44 +1436,52 @@ def run_all(args, sim_root):
         phlag_done = report_path.exists() and not args.rerun
 
         if caster_done and phlag_done:
-            print(f"[skip] {rel_path}: already present at {report_path.parent}")
+            print(f"[skip] {pattern_rel}: already present at {report_path.parent}")
             skipped_present += 1
             continue
 
-        print(f"[run] {rel_path}")
-
         if caster_done:
-            print(f"[skip caster] {rel_path}: scores already at {scores_path}")
-        else:
-            caster_ok, caster_out = run_step(
-                [sys.executable, "-m", "phlag.caster", str(fasta_path), "-d", args.dist_type],
-                "caster",
+            print(f"[skip caster] {pattern_rel}: scores already at {scores_path}")
+            # benchmark only ever reads report.tsv (see parse_report/get_expected_report_path),
+            # never the per-run diagnostic plots, so skip them for speed. -s is required by
+            # phlag's CLI whenever --plot is passed at all (even empty); its value is unused
+            # in that case (see phlagster.py's own --no-plots wiring).
+            phlag_ok, phlag_out = run_step(
+                [sys.executable, "-m", "phlag.phlag", str(scores_path), "-d", args.dist_type,
+                 "--plot", "-s", "1000"],
+                "phlag",
             )
-            if not caster_ok:
-                msg = f"{rel_path}: caster failed\n{caster_out}"
+            if not phlag_ok:
+                msg = f"{pattern_rel}: phlag failed\n{phlag_out}"
+                print(f"{RED}[fail] {msg}{RESET}")
+                failures.append(msg)
+                continue
+        else:
+            phlagster_ok, phlagster_out = run_step(
+                [sys.executable, "-m", "phlag.phlagster", str(fasta_path), "-d", args.dist_type, "--no-plots"],
+                "phlagster",
+            )
+            if not phlagster_ok:
+                msg = f"{pattern_rel}: phlagster failed\n{phlagster_out}"
                 print(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
             if not scores_path.exists():
-                msg = f"{rel_path}: caster reported success but scores file not found at {scores_path}"
+                msg = f"{pattern_rel}: phlagster reported success but scores file not found at {scores_path}"
+                print(f"{RED}[fail] {msg}{RESET}")
+                failures.append(msg)
+                continue
+            if not report_path.exists():
+                msg = f"{pattern_rel}: phlagster reported success but report file not found at {report_path}"
                 print(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
 
-        if phlag_done:
-            print(f"[skip phlag] {rel_path}: report already at {report_path}")
-        else:
-            phlag_ok, phlag_out = run_step(
-                [sys.executable, "-m", "phlag.phlag", str(scores_path), "-d", args.dist_type],
-                "phlag",
-            )
-            if not phlag_ok:
-                msg = f"{rel_path}: phlag failed\n{phlag_out}"
-                print(f"{RED}[fail] {msg}{RESET}")
-                failures.append(msg)
-                continue
-
-        print(f"[done] {rel_path}")
+        parsed = parse_report(report_path)
+        print(
+            f"[done] {pattern_rel}: TPR={_fmt_metric(parsed['tpr'])} "
+            f"FPR={_fmt_metric(parsed['fpr'])} F1={_fmt_metric(parsed['f1'])}"
+        )
         processed += 1
 
     print(
@@ -1365,8 +1510,12 @@ def summarize(args, sim_root):
     figure_data = stats.aggregate()
     stats.print_diagnostics(figure_data)
 
-    out_dir = pathlib.Path(args.stats_out) if args.stats_out else stats.default_stats_dir()
+    out_dir = pathlib.Path(args.stats_out) if args.stats_out else stats.next_run_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.change:
+        (out_dir / "change.txt").write_text(args.change + "\n")
+        print(f"Wrote change note:    {out_dir / 'change.txt'}")
 
     runs_path, bins_path = stats.write_tables(out_dir, figure_data)
     print(f"\nWrote per-run table:  {runs_path}")
