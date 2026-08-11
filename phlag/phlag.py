@@ -38,13 +38,7 @@ def get_topology_names(dim):
 
 def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
     """Extracts (mu, sigma, pdf_vals) for a given HMM state/dimension, branching on model_design."""
-    if model_design == "beta":
-        alpha = float(params.emissions.concentration1[state, dim])
-        beta = float(params.emissions.concentration0[state, dim])
-        pdf_vals = stats.beta.pdf(x_vals, alpha, beta)
-        mu = alpha / (alpha + beta)
-        sigma = np.sqrt(alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1)))
-    elif model_design == "gmm":
+    if model_design == "gmm":
         w = np.array(params.emissions.mixture_weights[state, dim])
         m_means = np.array(params.emissions.means[state, dim])
         m_stds = np.array(params.emissions.stds[state, dim])
@@ -428,10 +422,7 @@ class Phlag:
                 
             for fname in filenames_to_check:
                 fname_lower = os.path.basename(fname).lower()
-                if "beta" in fname_lower:
-                    self.args.model_design = "beta"
-                    break
-                elif "gmm" in fname_lower:
+                if "gmm" in fname_lower:
                     self.args.model_design = "gmm"
                     break
                 elif "gaussian" in fname_lower:
@@ -501,12 +492,7 @@ class Phlag:
         # Convert CASTER scores dictionary values into sequential matrix positions
         sorted_positions = sorted(self.pos_to_caster.keys())
         raw_caster_matrix = jnp.stack([self.pos_to_caster[pos] for pos in sorted_positions], axis=0)
-
-        if getattr(self.args, "model_design", "gaussian") == "beta":
-            raw_clipped = jnp.clip(raw_caster_matrix, a_min=1e-7)
-            self.Y = raw_clipped / raw_clipped.sum(axis=-1, keepdims=True)
-        else:
-            self.Y = raw_caster_matrix
+        self.Y = raw_caster_matrix
 
     def get_default_out_dir(self):
         input_path = pathlib.Path(self.args.caster_scores)
@@ -535,7 +521,7 @@ class Phlag:
                 locus_dir = input_path.parent.parent
                 parts = locus_dir.parts
                 # Check if model design or 'phlag' is in parent path parts
-                known_models = ["gaussian", "beta", "gmm"]
+                known_models = ["gaussian", "gmm"]
                 rel_parts = []
                 for i in range(len(parts) - 1, -1, -1):
                     if parts[i] in known_models or parts[i] == "phlag":
@@ -986,10 +972,10 @@ class Phlag:
             -jnp.log((1 - eta) / (eta))
         )
         
-        emission_parameterization_mode = self.args.emission_parameterization
         self.emission_parameterization = (
-            emission_parameterization_mode,
-        ) + tuple("free" for _ in range(NUM_STATES - 1))
+            self.args.null_emission_parameterization,
+            self.args.alt_emission_parameterization,
+        )
         
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
@@ -1010,16 +996,9 @@ class Phlag:
         data_mean = jnp.mean(self.Y, axis=0)
         data_std = jnp.std(self.Y, axis=0)
         
-        # Implement symmetry breaking: Anchor state 0 to the baseline mean,
-        # and seed state 1 slightly further along the alternative dimensions.
-        # Initialize emissions using mean and variance for each state.
-        if self.args.model_design == "beta":
-            state1_mean = jnp.clip(data_mean + data_std, a_min=1e-4, a_max=0.95)
-            state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
-            state1_init = jnp.stack([state1_mean, data_std ** 2], axis=-1)
-        else:
-            state0_init = jnp.stack([data_mean, data_std ** 2], axis=-1)
-            state1_init = jnp.stack([data_mean + data_std, data_std ** 2], axis=-1)
+        # alt variance = double null variance
+        state0_init = jnp.stack([data_mean, 2 * data_std ** 2], axis=-1)
+        state1_init = jnp.stack([data_mean, 2 * data_std ** 2], axis=-1)
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
@@ -1041,10 +1020,7 @@ class Phlag:
             )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
-        if self.args.model_design == "beta":
-            self.props.emissions.concentration1.trainable = True
-            self.props.emissions.concentration0.trainable = True
-        elif self.args.model_design == "gmm":
+        if self.args.model_design == "gmm":
             self.props.emissions.mixture_weights.trainable = True
             self.props.emissions.means.trainable = True
             self.props.emissions.stds.trainable = True
@@ -1222,12 +1198,9 @@ class PhlagPlotter:
         for d in range(self.emission_dim):
             ymin, ymax = float(np.min(self.phlag.Y[:, d])), float(np.max(self.phlag.Y[:, d]))
             ypad = (ymax - ymin) * 0.20 or 0.1
-            if self.phlag.args.model_design == "beta":
-                ranges[d] = np.linspace(max(1e-5, ymin - ypad), min(1.0 - 1e-5, ymax + ypad), 300)
-            else:
-                ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
+            ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
 
-        # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian/beta)
+        # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian)
         if self.phlag.args.model_design == "gmm":
             self._plot_gmm_init_row(axes[0], ranges)
         else:
@@ -1444,7 +1417,7 @@ class PhlagPlotter:
         uses MultivariateNormalFullCovariance, not just the diagonal -- see
         hmm.py), so the correlation structure the EM fit actually captures is
         visible instead of only implied by the independent per-dimension curves
-        in em.png. Gaussian-only: beta/gmm emissions have no cross-dimension
+        in em.png. Gaussian-only: gmm emissions have no cross-dimension
         covariance to show.
         """
         if self.emission_dim < 2 or self.phlag.args.model_design != "gaussian":
@@ -1592,15 +1565,27 @@ def parse_arguments(argv=None):
 
     hmm_group = parser.add_argument_group("HMM parameters")
     hmm_group.add_argument(
-        "-e",
-        dest="emission_parameterization",
+        "--np",
+        dest="null_emission_parameterization",
         type=str.lower,
-        default="attraction",
-        choices=["free", "attraction", "anchor"],
-        help="Parameterization of the emission probabilities of the default state (default: attraction)",
+        default="free",
+        choices=["free", "repulsion"],
+        help="""Parameterization of the null (background) state's emission distribution
+                    (default: free): free (unconstrained MLE) or repulsion (pushed away
+                    from the alt state's currently fitted distribution).""",
     )
     hmm_group.add_argument(
-        "--emission-lambda",
+        "--ap",
+        dest="alt_emission_parameterization",
+        type=str.lower,
+        default="repulsion",
+        choices=["free", "repulsion"],
+        help="""Parameterization of the alt (anomalous) state's emission distribution
+                    (default: repulsion): free (unconstrained MLE) or repulsion (pushed
+                    away from the null state's currently fitted distribution).""",
+    ) 
+    hmm_group.add_argument(
+        "--lam",
         dest="emission_lambda",
         type=float,
         default=1.0,
@@ -1611,8 +1596,8 @@ def parse_arguments(argv=None):
         dest="model_design",
         type=str.lower,
         default="gaussian",
-        choices=["gaussian", "beta", "gmm"],
-        help="Type of HMM emissions (gaussian, beta, or gmm. Default: gaussian)",
+        choices=["gaussian", "gmm"],
+        help="Type of HMM emissions (gaussian or gmm. Default: gaussian)",
     )
     hmm_group.add_argument(
         "-c",

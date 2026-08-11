@@ -175,120 +175,21 @@ def hellinger2_distance(p: Float[Array, "num_classes"], q: Float[Array, "num_cla
 def divergence_e(e_0: Float[Array, "num_classes"], e_1: Float[Array, "num_classes"]) -> Float:
     return hellinger2_distance(e_1, e_0)
 
+def gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2):
+    d = mu1.shape[0]
+    eps = 1e-6
+    Sigma_avg = 0.5 * (Sigma1 + Sigma2) + eps * jnp.eye(d)
+    diff = mu1 - mu2
+    _, logdet1 = jnp.linalg.slogdet(Sigma1 + eps * jnp.eye(d))
+    _, logdet2 = jnp.linalg.slogdet(Sigma2 + eps * jnp.eye(d))
+    _, logdet_avg = jnp.linalg.slogdet(Sigma_avg)
+    log_coef = 0.25 * logdet1 + 0.25 * logdet2 - 0.5 * logdet_avg
+    quad = diff @ jnp.linalg.solve(Sigma_avg, diff)
+    return jnp.exp(log_coef - 0.125 * quad)
 
-class ParamsBetaHMMEmissions(NamedTuple):
-    concentration1: Union[Float[Array, "num_states emission_dim"], ParameterProperties]
-    concentration0: Union[Float[Array, "num_states emission_dim"], ParameterProperties]
 
-
-class PhlagBetaHMMEmissions(HMMEmissions):
-    def __init__(
-        self,
-        num_states: int,
-        emission_dim: int,
-        parameterization: Tuple[str, ...],
-    ):
-        self.num_states = num_states
-        self.emission_dim = emission_dim
-        self.parameterization = parameterization
-
-    @property
-    def emission_shape(self) -> Tuple[int]:
-        return (self.emission_dim,)
-
-    def distribution(
-        self, params: ParamsBetaHMMEmissions, state: IntScalar, inputs=None
-    ) -> tfd.Distribution:
-        c1 = jnp.clip(params.concentration1[state], a_min=1e-5)
-        c0 = jnp.clip(params.concentration0[state], a_min=1e-5)
-        return tfd.Independent(
-            tfd.Beta(concentration1=c1, concentration0=c0),
-            reinterpreted_batch_ndims=1
-        )
-
-    def log_prior(self, params: ParamsBetaHMMEmissions) -> Scalar:
-        return 0.0
-
-    def initialize(
-        self,
-        key: PRNGKeyT = jr.PRNGKey(0),
-        method: str = "prior",
-        emission_probs: Optional[Float[Array, "num_states emission_dim 2"]] = None,
-    ) -> Tuple[ParamsBetaHMMEmissions, ParamsBetaHMMEmissions]:
-        if emission_probs is not None:
-            means = jnp.clip(emission_probs[..., 0], a_min=1e-5, a_max=1.0 - 1e-5)
-            variances = jnp.clip(emission_probs[..., 1], a_min=1e-5)
-            v = means * (1.0 - means) / variances - 1.0
-            v = jnp.clip(v, a_min=1e-2)
-            c1 = means * v
-            c0 = (1.0 - means) * v
-        else:
-            c1 = 2.0 * jnp.ones((self.num_states, self.emission_dim))
-            c0 = 2.0 * jnp.ones((self.num_states, self.emission_dim))
-
-        params = ParamsBetaHMMEmissions(concentration1=c1, concentration0=c0)
-        props = ParamsBetaHMMEmissions(
-            concentration1=ParameterProperties(constrainer=tfb.Softplus()),
-            concentration0=ParameterProperties(constrainer=tfb.Softplus())
-        )
-        return params, props
-
-    def collect_suff_stats(
-        self, params: ParamsBetaHMMEmissions, posterior: HMMPosterior, emissions: Array, inputs=None
-    ) -> dict:
-        y = jnp.clip(emissions, a_min=1e-7, a_max=1.0 - 1e-7)
-        sum_weights = jnp.sum(posterior.smoothed_probs, axis=0)
-        sum_y = jnp.einsum("tk,td->kd", posterior.smoothed_probs, y)
-        sum_y_sq = jnp.einsum("tk,td->kd", posterior.smoothed_probs, y ** 2)
-        return dict(sum_weights=sum_weights, sum_y=sum_y, sum_y_sq=sum_y_sq)
-
-    def initialize_m_step_state(
-        self, params: ParamsBetaHMMEmissions, props: ParamsBetaHMMEmissions
-    ) -> Any:
-        return None
-
-    def update_m_step_state(
-        self, params: ParamsBetaHMMEmissions, props: ParamsBetaHMMEmissions
-    ) -> Any:
-        return None
-
-    def state_divergence(self, params: ParamsBetaHMMEmissions) -> Float:
-        c1 = jnp.clip(params.concentration1, a_min=1e-5)
-        c0 = jnp.clip(params.concentration0, a_min=1e-5)
-        means = c1 / (c1 + c0)
-        total_divergence = 0.0
-        for i in range(self.num_states):
-            for j in range(i + 1, self.num_states):
-                total_divergence += jnp.sqrt(jnp.sum((means[i] - means[j]) ** 2))
-        return total_divergence
-
-    def m_step(
-        self,
-        params: ParamsBetaHMMEmissions,
-        props: ParamsBetaHMMEmissions,
-        batch_stats: dict,
-        m_step_state: Any,
-    ) -> Tuple[ParamsBetaHMMEmissions, Any]:
-        stats = pytree_sum(batch_stats, axis=0)
-        sum_weights = jnp.clip(stats["sum_weights"][:, None], a_min=1e-6)
-        sum_y = stats["sum_y"]
-        sum_y_sq = stats["sum_y_sq"]
-
-        means = jnp.clip(sum_y / sum_weights, a_min=1e-4, a_max=1.0 - 1e-4)
-        variances = jnp.clip((sum_y_sq / sum_weights) - means ** 2, a_min=1e-6)
-
-        max_var = 0.99 * means * (1.0 - means)
-        variances = jnp.clip(variances, a_max=max_var)
-
-        v = means * (1.0 - means) / variances - 1.0
-        v = jnp.clip(v, a_min=1e-2, a_max=1000.0)
-
-        c1 = jnp.clip(means * v, a_min=1e-2, a_max=1000.0)
-        c0 = jnp.clip((1.0 - means) * v, a_min=1e-2, a_max=1000.0)
-
-        params = params._replace(concentration1=c1, concentration0=c0)
-        return params, m_step_state
-
+def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
+    return 1.0 - gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
 
 class ParamsGMMHMMEmissions(NamedTuple):
     mixture_weights: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
@@ -533,6 +434,11 @@ class ParamsGaussianHMMEmissions(NamedTuple):
     covariances: Union[Float[Array, "num_states emission_dim emission_dim"], ParameterProperties]
 
 
+class EmissionParam(Enum):
+    FREE = "free"
+    REPULSION = "repulsion"
+
+
 class PhlagHMMEmissions(HMMEmissions):
     def __init__(
         self,
@@ -592,24 +498,19 @@ class PhlagHMMEmissions(HMMEmissions):
         if emission_probs is None:
             raise ValueError("emission_probs must be provided")
 
-        if emission_probs.ndim == 3 and emission_probs.shape[-1] == 2:
-            num_states, emission_dim, _ = emission_probs.shape
-            means = emission_probs[..., 0]
-            variances = emission_probs[..., 1]
-            covariances = jnp.stack(
-                [jnp.diag(variances[state]) for state in range(num_states)], axis=0
-            )
-            params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
-        elif emission_probs.ndim == 2:
-            means = emission_probs
-            num_states, emission_dim = means.shape
-            covariances = jnp.stack([jnp.eye(emission_dim) for _ in range(num_states)], axis=0)
-            params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
-        else:
+        if emission_probs.ndim != 3 or emission_probs.shape[-1] != 2:
             raise ValueError(
                 "Unsupported emission_probs shape. Expected [num_states, emission_dim, 2] "
-                "for mean/variance initialization or [num_states, emission_dim] for means only."
+                "for mean/variance initialization."
             )
+
+        num_states, emission_dim, _ = emission_probs.shape
+        means = emission_probs[..., 0]
+        variances = emission_probs[..., 1]
+        covariances = jnp.stack(
+            [jnp.diag(variances[state]) for state in range(num_states)], axis=0
+        )
+        params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
 
         props = ParamsGaussianHMMEmissions(
             means=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
@@ -635,29 +536,67 @@ class PhlagHMMEmissions(HMMEmissions):
     ) -> Any:
         return None
 
-    def m_step(
-        self,
-        params: ParamsGaussianHMMEmissions,
-        props: ParamsGaussianHMMEmissions,
-        batch_stats: dict,
-        m_step_state: Any,
-    ) -> Tuple[ParamsGaussianHMMEmissions, Any]:
+    def map_estimate_kl(self, mu_target, Sigma_target, n, xbar, Sxx):
+        d = xbar.shape[0]
+        eps = 1e-6
+        S = Sxx - n * jnp.outer(xbar, xbar)
+
+        def neg_objective(params):
+            mu, L = params
+            Sigma = L @ L.T + eps * jnp.eye(d)
+            Sigma_inv = jnp.linalg.inv(Sigma)
+            diff = xbar - mu
+            ll = -0.5 * (
+                n * jnp.linalg.slogdet(Sigma)[1]
+                + jnp.trace(Sigma_inv @ (S + n * jnp.outer(diff, diff)))
+            )
+            bc = gaussian_bhattacharyya_coefficient(mu, Sigma, mu_target, Sigma_target)
+            return -(ll - self.penalty_lambda * bc)  # repulsion: reward small BC, i.e. large Hellinger distance
+
+        grad_obj = jax.grad(neg_objective)
+        mu0 = xbar
+        L0 = jnp.linalg.cholesky(Sigma_target + eps * jnp.eye(d))
+        lr = 0.05
+
+        def step(_, carry):
+            mu, L = carry
+            g_mu, g_L = grad_obj((mu, L))
+            return (mu - lr * g_mu, L - lr * g_L)
+
+        # lax.fori_loop instead of a Python loop so the 100 gradient steps don't
+        # unroll into the jit trace of the outer EM step.
+        mu, L = lax.fori_loop(0, 100, step, (mu0, L0))
+
+        Sigma = L @ L.T + eps * jnp.eye(d)
+        return mu, Sigma
+
+    def m_step(self, params, props, batch_stats, m_step_state):
         if props.means.trainable or props.covariances.trainable:
             stats = pytree_sum(batch_stats, axis=0)
-            emission_stats = pytree_sum(batch_stats, axis=0)
-            sum_weights = stats["sum_weights"][:, None] 
-            sum_x = stats["sum_x"]                     
-            sum_xxT = stats["sum_xxT"]                 
+            sum_weights, sum_x, sum_xxT = stats["sum_weights"], stats["sum_x"], stats["sum_xxT"]
 
-            # Analytical updates for continuous targets
-            means = sum_x / (sum_weights + 1e-12)
-            mu_muT = jnp.einsum("ki,kj->kij", means, means)
-            covariances = (sum_xxT / (sum_weights[..., None] + 1e-12)) - mu_muT
-        
-            # Add regularizer matrix to guarantee positive-definiteness 
-            eps = 1e-5
-            covariances += jnp.stack([jnp.eye(self.emission_dim) * eps for _ in range(self.num_states)])
-            params = params._replace(means=means, covariances=covariances)
+            old_means, old_covariances = params.means, params.covariances
+            new_means, new_covariances = old_means, old_covariances
+
+            for s in range(self.num_states):
+                n_s = sum_weights[s]
+                xbar_s = sum_x[s] / (n_s + 1e-12)
+                Sxx_s = sum_xxT[s]
+                mode = EmissionParam(self.parameterization[s])
+
+                if mode is EmissionParam.FREE:
+                    mu_s = xbar_s
+                    Sigma_s = Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, xbar_s) + 1e-5 * jnp.eye(self.emission_dim)
+                elif mode is EmissionParam.REPULSION:
+                    other = 1 - s
+                    mu_s, Sigma_s = self.map_estimate_kl(
+                        old_means[other], old_covariances[other], n_s, xbar_s, Sxx_s
+                    )
+
+                new_means = new_means.at[s].set(mu_s)
+                new_covariances = new_covariances.at[s].set(Sigma_s)
+
+            params = params._replace(means=new_means, covariances=new_covariances)
         return params, m_step_state
 
     def state_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
@@ -718,13 +657,7 @@ class PhlagHMM(HMM):
         self.transition_component = PhlagHMMTransitions(
             num_states=self.num_states, concentration=self.transition_concentration
         )
-        if model_design == "beta":
-            self.emission_component = PhlagBetaHMMEmissions(
-                self.num_states,
-                self.emission_dim,
-                parameterization=self.emission_parameterization,
-            )
-        elif model_design == "gmm":
+        if model_design == "gmm":
             num_mixtures = kwargs.get("num_mixtures", 2)
             self.emission_component = PhlagGMMHMMEmissions(
                 self.num_states,
