@@ -10,7 +10,7 @@ readme = "README.md"
 license = "GPL-3.0-only"
 requires-python = "==3.9.*"
 authors = [
-    { name = "Ali Osman Berk Sapci" },
+    { name = "Isaac Ang" },
 ]
 keywords = ["phylogenetics", "genomics", "HMM", "coalescent", "gene-trees"]
 classifiers = [

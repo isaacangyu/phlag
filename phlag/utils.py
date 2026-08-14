@@ -610,8 +610,82 @@ def timeit(func):
 
 
 def get_repo_root():
+    import os
     import pathlib
+    override = os.environ.get("PHLAG_REPO_ROOT")
+    if override:
+        return pathlib.Path(override)
     return pathlib.Path(__file__).resolve().parent.parent
+
+
+def load_cli_config(tool_name):
+    """
+    Returns (variable_tokens, fixed_tokens) -- flat lists of raw CLI flag
+    tokens -- for tool_name ("caster" or "phlag") from config.json alongside
+    this module in phlag/. Missing file or missing tool key returns ([], []),
+    matching get_data_dir()'s tolerance for a missing .env.
+    """
+    import json
+    import pathlib
+
+    config_path = pathlib.Path(__file__).resolve().parent / "config.json"
+    if not config_path.exists():
+        return [], []
+
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return [], []
+
+    tool_config = config.get(tool_name, {})
+    return tool_config.get("variable", []), tool_config.get("fixed", [])
+
+
+def apply_cli_config(parser, argv, tool_name):
+    """
+    Parses argv with parser, with defaults sourced from config.json's
+    "variable"/"fixed" sections for tool_name (see load_cli_config).
+
+    Deliberately does NOT splice config tokens into argv before parsing --
+    "variable" flags with nargs="*" (e.g. --plot) would then greedily swallow
+    whatever token follows them, including the real positional path, if a
+    config token list happened to be placed next to it. Instead:
+      - "variable" tokens are parsed once through the same parser (with no
+        positional present -- every positional here is nargs="?", so that's
+        a valid parse on its own) and applied via parser.set_defaults(), so
+        they only take effect for flags argv doesn't already specify.
+      - "fixed" tokens are parsed the same way, but only the destinations
+        they actually set (detected via a sentinel default) are then forced
+        onto the final parsed args, overriding anything argv specified.
+
+    Positional actions (option_strings == []) are excluded from the "fixed"
+    destination set -- argparse always assigns nargs="?" positionals their
+    own default when no positional token is present, even overwriting an
+    already-sentineled namespace attribute, so they can't be sentinel-
+    detected the way optional flags can. Config should never carry a
+    positional's value anyway (paths always come from real argv).
+    """
+    import argparse
+
+    variable_tokens, fixed_tokens = load_cli_config(tool_name)
+
+    if variable_tokens:
+        variable_ns, _ = parser.parse_known_args(variable_tokens)
+        parser.set_defaults(**vars(variable_ns))
+
+    args = parser.parse_args(argv)
+
+    if fixed_tokens:
+        sentinel = object()
+        dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
+        empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
+        fixed_ns, _ = parser.parse_known_args(fixed_tokens, namespace=empty_ns)
+        for key in dests:
+            value = getattr(fixed_ns, key)
+            if value is not sentinel:
+                setattr(args, key, value)
+
+    return args
 
 
 def get_data_dir():

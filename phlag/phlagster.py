@@ -28,6 +28,22 @@ def parse_arguments(argv=None):
              "correlations.png) -- only scores.tsv and report.tsv are produced. dist.png is never produced "
              "regardless of this flag.",
     )
+    parser.add_argument(
+        "--np",
+        dest="null_emission_parameterization",
+        type=str.lower,
+        default=None,
+        choices=["free", "repulsion"],
+        help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
+    )
+    parser.add_argument(
+        "--ap",
+        dest="alt_emission_parameterization",
+        type=str.lower,
+        default=None,
+        choices=["free", "repulsion"],
+        help="Forwarded to phlag's --ap (default: whatever phlag's own default is).",
+    )
     return parser.parse_args(argv)
 
 
@@ -47,8 +63,13 @@ def main(argv=None):
     # with no plot names -- unused by the report itself (only feeds phlag's dead
     # ASCII-histogram code path), so any placeholder value satisfies it.
     phlag_plot_args = ["--plot", "-s", "1000"] if args.no_plots else []
+    emission_param_args = []
+    if args.null_emission_parameterization is not None:
+        emission_param_args += ["--np", args.null_emission_parameterization]
+    if args.alt_emission_parameterization is not None:
+        emission_param_args += ["--ap", args.alt_emission_parameterization]
     print(f"[phlagster] Running phlag on '{scores_path}' (-d {args.dist_type})...")
-    phlag_main.main([str(scores_path), "-d", args.dist_type] + phlag_plot_args)
+    phlag_main.main([str(scores_path), "-d", args.dist_type] + emission_param_args + phlag_plot_args)
 
 
 if __name__ == "__main__":

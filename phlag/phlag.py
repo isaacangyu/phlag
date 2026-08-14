@@ -56,7 +56,7 @@ def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
 
 
 def format_rel_err(value):
-    """Formats a relative-error percentage to 4 decimals."""
+    """Formats a report table numeric value to 4 decimals."""
     return f"{value:.4f}"
 
 
@@ -643,7 +643,14 @@ class Phlag:
             emission_divergence_str = ", ".join(map(str, divergence.tolist()))
         except TypeError:
             emission_divergence_str = str(float(divergence))
-            
+
+        # Bhattacharyya distance between states -- gaussian-only (depends on
+        # the full covariance matrix; beta/gmm emissions have no analog).
+        em_bhattacharyya_distance = None
+        if getattr(self.args, "model_design", "gaussian") == "gaussian":
+            em_bhattacharyya_distance = float(self.hmm.em_divergence(self.params))
+
+
         # Get the emission distributions for each state to compute log likelihoods
         log_likelihoods = []
         for state in range(self.hmm.num_states):
@@ -829,7 +836,19 @@ class Phlag:
         headers.append(f"Anomaly fraction: {anomaly_fraction:.6f} ({n_anomaly}/{n_windows} windows)")
         headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
 
+        # Source mtimes at report-generation time -- let phlag.benchmark's run_all()
+        # detect a stale report (caster.py or phlag.py/hmm.py edited since this report
+        # was written) and rerun just the stage whose source actually changed, instead
+        # of relying purely on report.tsv/scores.tsv presence.
+        _pkg_dir = pathlib.Path(__file__).parent
+        _caster_mtime = (_pkg_dir / "caster.py").stat().st_mtime
+        _phlag_mtime = max((_pkg_dir / f).stat().st_mtime for f in ("phlag.py", "hmm.py"))
+        headers.append(f"Caster source mtime: {_caster_mtime:.6f}")
+        headers.append(f"Phlag source mtime: {_phlag_mtime:.6f}")
+
         headers.append("State divergence: " + emission_divergence_str)
+        if em_bhattacharyya_distance is not None:
+            headers.append(f"EM divergence (Bhattacharyya): {em_bhattacharyya_distance:.6f}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
@@ -854,7 +873,7 @@ class Phlag:
         headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
-            headers.append("Topology\tState\tStatistic\tRel.err(%)")
+            headers.append("Topology\tState\tStatistic\tFitted\tGroundTruth\tRel.err(%)")
             for d in sorted(self.ground_truth_fits.keys()):
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
                 mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, 0, d, np.array([0.0]))
@@ -864,12 +883,33 @@ class Phlag:
                 rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt * 100 if mu_alt_gt != 0 else float('nan')
                 rel_std_alt = (std_alt_fit - std_alt_gt) / std_alt_gt * 100 if std_alt_gt != 0 else float('nan')
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
-                headers.append(f"{topo_name}\tNull\tmean\t{format_rel_err(rel_mu_null)}")
-                headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(rel_std_null)}")
-                headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(rel_mu_alt)}")
-                headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(rel_std_alt)}")
+                headers.append(f"{topo_name}\tNull\tmean\t{format_rel_err(mu_null_fit)}\t{format_rel_err(mu_null_gt)}\t{format_rel_err(rel_mu_null)}")
+                headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
+                headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(mu_alt_fit)}\t{format_rel_err(mu_alt_gt)}\t{format_rel_err(rel_mu_alt)}")
+                headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(std_alt_fit)}\t{format_rel_err(std_alt_gt)}\t{format_rel_err(rel_std_alt)}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
+
+        if self.args.model_design == "gaussian":
+            fitted_means = np.array(self.params.emissions.means)
+            fitted_covariances = np.array(self.params.emissions.covariances)
+            headers.append(f"--- Fitted parameters (bookkeeping, source mtime {_phlag_mtime:.6f}) ---")
+            for state_idx, state_name in enumerate(("Null", "Alt")):
+                mean_str = "[" + ", ".join(f"{x:.6f}" for x in fitted_means[state_idx].tolist()) + "]"
+                cov_str = "[" + ", ".join(
+                    f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in fitted_covariances[state_idx].tolist()
+                ) + "]"
+                headers.append(f"{state_name} fitted mean: {mean_str}")
+                headers.append(f"{state_name} fitted covariance: {cov_str}")
+            predicted_path = (1 - paths[0]) if flipped_for_eval else paths[0]
+            n_predicted_alt = int(np.sum(predicted_path == 1))
+            n_predicted_null = n_windows - n_predicted_alt
+            predicted_anomaly_fraction = (n_predicted_alt / n_windows) if n_windows > 0 else 0.0
+            headers.append(f"Predicted states: Null={n_predicted_null}, Alt={n_predicted_alt}")
+            headers.append(
+                f"Predicted anomaly fraction: {predicted_anomaly_fraction:.6f} "
+                f"({n_predicted_alt}/{n_windows} windows)"
+            )
 
         self.output_str += "\n" + "\n".join(headers)
 
@@ -988,17 +1028,20 @@ class Phlag:
             occupancy_bias=self.occupancy_bias,
             model_design=self.args.model_design,
             num_mixtures=getattr(self, "num_mixtures", 2),
+            repulsion_divergence=self.args.repulsion_divergence,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
-        
+
         # Compute empirical moments from CASTER data over genomic positions
         data_mean = jnp.mean(self.Y, axis=0)
-        data_std = jnp.std(self.Y, axis=0)
-        
-        # alt variance = double null variance
-        state0_init = jnp.stack([data_mean, 2 * data_std ** 2], axis=-1)
-        state1_init = jnp.stack([data_mean, 2 * data_std ** 2], axis=-1)
+        data_cov = jnp.cov(self.Y, rowvar=False)
+        data_var = jnp.diag(data_cov)
+
+        # alt variance = double null variance if --double-variance-init, else same as null
+        alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
+        state0_init = jnp.stack([data_mean, data_var], axis=-1)
+        state1_init = jnp.stack([data_mean, alt_variance_mult * data_var], axis=-1)
 
         # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
         init_emissions = jnp.stack([state0_init, state1_init], axis=0)
@@ -1017,6 +1060,11 @@ class Phlag:
                 initial_probs=INITIAL_PROBS,
                 emission_probs=init_emissions,
                 transition_matrix=initial_transition_matrix,
+            )
+            # use full for gaussian
+            full_covariances = jnp.stack([data_cov, alt_variance_mult * data_cov], axis=0)
+            self.params = self.params._replace(
+                emissions=self.params.emissions._replace(covariances=full_covariances)
             )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
@@ -1156,6 +1204,7 @@ class PhlagPlotter:
         # Generate the visual distribution charts
         self.plot_distributions()
         self.plot_correlations()
+        self.plot_topologies_3d()
 
     def extract_metadata(self):
         """Extracts genomic filename, dimension, and styles configuration."""
@@ -1488,6 +1537,82 @@ class PhlagPlotter:
 
         self.save_plot("correlations.png")
 
+    def _covariance_ellipsoid_surface(self, ax, mean, cov, color, n_std=1.0):
+        eigenvalues, eigenvectors = np.linalg.eigh(np.array(cov))
+        radii = n_std * np.sqrt(np.clip(eigenvalues, a_min=0, a_max=None))
+
+        u = np.linspace(0, 2 * np.pi, 24)
+        v = np.linspace(0, np.pi, 24)
+        x = np.outer(np.cos(u), np.sin(v))
+        y = np.outer(np.sin(u), np.sin(v))
+        z = np.outer(np.ones_like(u), np.cos(v))
+
+        sphere = np.stack([x, y, z], axis=-1)
+        transform = eigenvectors @ np.diag(radii)
+        ellipsoid = sphere @ transform.T + np.array(mean)
+
+        ax.plot_surface(
+            ellipsoid[..., 0], ellipsoid[..., 1], ellipsoid[..., 2],
+            color=color, alpha=0.15, linewidth=0, shade=True,
+        )
+
+    def plot_topologies_3d(self):
+        if self.emission_dim != 3 or self.phlag.args.model_design != "gaussian":
+            return
+
+        params = self.phlag.params
+        Y_np = np.array(self.phlag.Y)
+        y_true = np.array(self.phlag.y_true)
+        most_likely_states = np.array(self.phlag.hmm.most_likely_states(params, self.phlag.Y))
+
+        sns.set_theme(style="whitegrid")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6), subplot_kw={"projection": "3d"})
+
+        stages = [
+            ("Before EM", y_true),
+            ("After EM", most_likely_states),
+        ]
+
+        for col_idx, (stage_label, state_labels) in enumerate(stages):
+            ax = axes[col_idx]
+
+            for state in [0, 1]:
+                color_config = self.colors[state]
+                mask = state_labels == state
+
+                ax.scatter(
+                    Y_np[mask, 0], Y_np[mask, 1], Y_np[mask, 2],
+                    s=8, alpha=0.25, color=color_config['fill'], linewidths=0,
+                    label=color_config['label'],
+                )
+
+                if mask.sum() > 0:
+                    if stage_label == "After EM":
+                        mean = np.array(params.emissions.means[state])
+                        cov = np.array(params.emissions.covariances[state])
+                    else:
+                        mean = np.mean(Y_np[mask], axis=0)
+                        cov = np.cov(Y_np[mask], rowvar=False)
+
+                    self._covariance_ellipsoid_surface(ax, mean, cov, color_config['line'])
+
+            ax.set_title(stage_label, fontsize=11, fontweight='bold', pad=8)
+            ax.set_xlabel(self.topology_names[0], fontsize=8, labelpad=4)
+            ax.set_ylabel(self.topology_names[1], fontsize=8, labelpad=4)
+            ax.set_zlabel(self.topology_names[2], fontsize=8, labelpad=4)
+            ax.tick_params(axis='both', which='major', labelsize=7)
+            ax.legend(fontsize=8, loc='upper right')
+
+        from .utils import get_locus_description
+        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+        if locus_desc:
+            fig.suptitle(f"Topology Score Space (3D) | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
+            plt.tight_layout(rect=[0, 0, 1, 0.93])
+        else:
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        self.save_plot("topologies_3d.png")
+
     def save_plot(self, filename="em.png"):
         """Saves the currently active matplotlib figure as PNG."""
         output_dir = getattr(self.phlag, "output_file", None)
@@ -1578,10 +1703,10 @@ def parse_arguments(argv=None):
         "--ap",
         dest="alt_emission_parameterization",
         type=str.lower,
-        default="repulsion",
+        default="free",
         choices=["free", "repulsion"],
         help="""Parameterization of the alt (anomalous) state's emission distribution
-                    (default: repulsion): free (unconstrained MLE) or repulsion (pushed
+                    (default: free): free (unconstrained MLE) or repulsion (pushed
                     away from the null state's currently fitted distribution).""",
     ) 
     hmm_group.add_argument(
@@ -1590,6 +1715,22 @@ def parse_arguments(argv=None):
         type=float,
         default=1.0,
         help="Emission penalty regularizer parameter lambda (default: 1.0)",
+    )
+    hmm_group.add_argument(
+        "--double-variance-init",
+        dest="double_variance_init",
+        action="store_true",
+        help="Seed the alt state's initial variance at 2x the null state's (default: same variance as null).",
+    )
+    hmm_group.add_argument(
+        "--repulsion-divergence",
+        dest="repulsion_divergence",
+        type=str.lower,
+        default="hellinger",
+        choices=["hellinger", "kl"],
+        help="""Divergence measure the REPULSION emission parameterization pushes away
+                    with (default: hellinger): hellinger (Bhattacharyya-coefficient-based,
+                    bounded) or kl (closed-form Gaussian KL divergence, unbounded).""",
     )
     hmm_group.add_argument(
         "-d",
@@ -1631,7 +1772,7 @@ def parse_arguments(argv=None):
         help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
     )
 
-    args = parser.parse_args(argv)
+    args = utils.apply_cli_config(parser, argv, "phlag")
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()

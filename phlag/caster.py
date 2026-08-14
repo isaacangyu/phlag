@@ -324,7 +324,7 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Caster: Load scores and generate topology distribution and scatter plots."
     )
-    
+
     # Input FASTA or scores.tsv file
     parser.add_argument(
         "fasta_file",
@@ -418,7 +418,8 @@ def parse_arguments(argv=None):
         default=None,
         help="Optional species tree file (default: store/63K.tre)"
     )
-    return parser.parse_args(argv)
+    from .utils import apply_cli_config
+    return apply_cli_config(parser, argv, "caster")
 
 def main(argv=None):
     args = parse_arguments(argv)

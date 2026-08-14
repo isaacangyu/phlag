@@ -1,0 +1,10 @@
+{
+  "caster": {
+    "fixed": [],
+    "variable": ["-d", "gaussian", "--plot", "scores", "dist", "-w", "50k", "-s", "1k"]
+  },
+  "phlag": {
+    "fixed": [],
+    "variable": ["--np", "free", "--ap", "repulsion", "--lam", "0", "--double-variance-init", "--repulsion-divergence", "hellinger"]
+  }
+}
