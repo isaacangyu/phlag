@@ -39,9 +39,10 @@ def get_topology_names(dim):
 def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
     """Extracts (mu, sigma, pdf_vals) for a given HMM state/dimension, branching on model_design."""
     if model_design == "gmm":
-        w = np.array(params.emissions.mixture_weights[state, dim])
-        m_means = np.array(params.emissions.means[state, dim])
-        m_stds = np.array(params.emissions.stds[state, dim])
+        w = np.array(params.emissions.mixture_weights[state])
+        m_means = np.array(params.emissions.means[state, :, dim])
+        m_vars = np.array(params.emissions.covariances[state, :, dim, dim])
+        m_stds = np.sqrt(np.clip(m_vars, a_min=1e-6, a_max=None))
         pdf_vals = np.zeros_like(x_vals)
         for m in range(len(w)):
             pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
@@ -78,21 +79,35 @@ def count_trainable_params(params, props):
     return int(sum(jax.tree_util.tree_leaves(counts)))
 
 
-def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, cluster_topologies=False):
+def _cluster_mean_cov(pts, D, eps=1e-4):
+    """Mean vector and (jitter-regularized) full covariance matrix of a point cluster."""
+    mu = np.mean(pts, axis=0)
+    if len(pts) > 1:
+        cov = np.atleast_2d(np.cov(pts, rowvar=False))
+    else:
+        cov = np.zeros((D, D))
+    cov = cov + np.eye(D) * eps
+    return mu, cov
+
+
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir):
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sorted_positions = sorted(pos_to_caster.keys())
     positions_kb = np.array(sorted_positions) / 1000.0
 
-    num_mixtures_matrix = np.zeros((NUM_STATES, Y.shape[-1]), dtype=int)
+    D = Y.shape[-1]
+    num_mixtures_matrix = np.zeros((NUM_STATES, D), dtype=int)
     dim_cluster_info = {}
 
     print("\n=== K-means Clustering & Silhouette Scores ===")
 
     topology_names = ["ABBA", "BABA", "AABB"] if Y.shape[-1] == 3 else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
 
-    dims_to_iterate = [None] if cluster_topologies else list(range(Y.shape[-1]))
+    # Topologies are always clustered together (shared multivariate mixture
+    # components with full covariance across dims), never per-dimension.
+    dims_to_iterate = [None]
 
     for d in dims_to_iterate:
         if d is None:
@@ -256,9 +271,8 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             # Compute Null sub-cluster mixture parameters
             null_params = []
             if best_kn == 1:
-                mu_n = np.mean(y_sub_N, axis=0)
-                std_n = np.clip(np.std(y_sub_N, axis=0), a_min=1e-4, a_max=None)
-                null_params.append((1.0, mu_n, std_n))
+                mu_n, cov_n = _cluster_mean_cov(y_sub_N, D)
+                null_params.append((1.0, mu_n, cov_n))
             else:
                 km_n = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
                 sub_labels_n = km_n.fit_predict(y_sub_N)
@@ -266,20 +280,18 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                     pts = y_sub_N[sub_labels_n == m]
                     if len(pts) > 0:
                         w = len(pts) / len(y_sub_N)
-                        mu = np.mean(pts, axis=0)
-                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                        mu, cov = _cluster_mean_cov(pts, D)
                     else:
                         w = 1.0 / best_kn
                         mu = km_n.cluster_centers_[m]
-                        std = np.full(y_d.shape[-1], 1e-4)
-                    null_params.append((w, mu, std))
+                        cov = np.eye(D) * 1e-4
+                    null_params.append((w, mu, cov))
 
             # Compute Alt sub-cluster mixture parameters
             alt_params = []
             if best_ka == 1:
-                mu_a = np.mean(y_sub_A, axis=0)
-                std_a = np.clip(np.std(y_sub_A, axis=0), a_min=1e-4, a_max=None)
-                alt_params.append((1.0, mu_a, std_a))
+                mu_a, cov_a = _cluster_mean_cov(y_sub_A, D)
+                alt_params.append((1.0, mu_a, cov_a))
             else:
                 km_a = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
                 sub_labels_a = km_a.fit_predict(y_sub_A)
@@ -287,13 +299,12 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                     pts = y_sub_A[sub_labels_a == m]
                     if len(pts) > 0:
                         w = len(pts) / len(y_sub_A)
-                        mu = np.mean(pts, axis=0)
-                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                        mu, cov = _cluster_mean_cov(pts, D)
                     else:
                         w = 1.0 / best_ka
                         mu = km_a.cluster_centers_[m]
-                        std = np.full(y_d.shape[-1], 1e-4)
-                    alt_params.append((w, mu, std))
+                        cov = np.eye(D) * 1e-4
+                    alt_params.append((w, mu, cov))
 
             dim_cluster_info[d] = (null_params, alt_params)
 
@@ -328,10 +339,10 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             null_params = []
             alt_params = []
             if m_val == 1:
-                mu_base = np.mean(y_d, axis=0)
-                std_base = np.clip(np.std(y_d, axis=0), a_min=1e-4, a_max=None)
-                null_params.append((1.0, mu_base, std_base))
-                alt_params.append((1.0, mu_base + std_base, std_base))
+                mu_base, cov_base = _cluster_mean_cov(y_d, D)
+                std_base = np.sqrt(np.clip(np.diag(cov_base), a_min=1e-4, a_max=None))
+                null_params.append((1.0, mu_base, cov_base))
+                alt_params.append((1.0, mu_base + std_base, cov_base))
             else:
                 km = KMeans(n_clusters=m_val, random_state=42, n_init="auto")
                 labels_m = km.fit_predict(y_d)
@@ -339,50 +350,34 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                     pts = y_d[labels_m == m]
                     if len(pts) > 0:
                         w = len(pts) / len(y_d)
-                        mu = np.mean(pts, axis=0)
-                        std = np.clip(np.std(pts, axis=0), a_min=1e-4, a_max=None)
+                        mu, cov = _cluster_mean_cov(pts, D)
                     else:
                         w = 1.0 / m_val
                         mu = km.cluster_centers_[m]
-                        std = np.full(y_d.shape[-1], 1e-4)
-                    null_params.append((w, mu, std))
-                    alt_params.append((w, mu + std, std))
+                        cov = np.eye(D) * 1e-4
+                    std = np.sqrt(np.clip(np.diag(cov), a_min=1e-4, a_max=None))
+                    null_params.append((w, mu, cov))
+                    alt_params.append((w, mu + std, cov))
 
             dim_cluster_info[d] = (null_params, alt_params)
 
-    D = Y.shape[-1]
     max_m = int(np.max(num_mixtures_matrix))
-    init_means = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
-    init_stds = np.ones((NUM_STATES, D, max_m), dtype=np.float32)
-    init_weights = np.zeros((NUM_STATES, D, max_m), dtype=np.float32)
+    init_means = np.zeros((NUM_STATES, max_m, D), dtype=np.float32)
+    init_covariances = np.zeros((NUM_STATES, max_m, D, D), dtype=np.float32)
+    init_weights = np.zeros((NUM_STATES, max_m), dtype=np.float32)
 
-    if cluster_topologies:
-        null_params, alt_params = dim_cluster_info[None]
-        for s_idx, state_params in enumerate([null_params, alt_params]):
-            m_cnt = len(state_params)
-            for m_idx, (w, mu, std) in enumerate(state_params):
-                for d_idx in range(D):
-                    init_weights[s_idx, d_idx, m_idx] = w
-                    init_means[s_idx, d_idx, m_idx] = mu[d_idx]
-                    init_stds[s_idx, d_idx, m_idx] = std[d_idx]
-            for d_idx in range(D):
-                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
-                if sum_w > 0:
-                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
-    else:
-        for d_idx in range(D):
-            null_params, alt_params = dim_cluster_info[d_idx]
-            for s_idx, state_params in enumerate([null_params, alt_params]):
-                m_cnt = len(state_params)
-                for m_idx, (w, mu, std) in enumerate(state_params):
-                    init_weights[s_idx, d_idx, m_idx] = w
-                    init_means[s_idx, d_idx, m_idx] = mu[0]
-                    init_stds[s_idx, d_idx, m_idx] = std[0]
-                sum_w = np.sum(init_weights[s_idx, d_idx, :m_cnt])
-                if sum_w > 0:
-                    init_weights[s_idx, d_idx, :m_cnt] /= sum_w
+    null_params, alt_params = dim_cluster_info[None]
+    for s_idx, state_params in enumerate([null_params, alt_params]):
+        m_cnt = len(state_params)
+        for m_idx, (w, mu, cov) in enumerate(state_params):
+            init_weights[s_idx, m_idx] = w
+            init_means[s_idx, m_idx, :] = mu
+            init_covariances[s_idx, m_idx, :, :] = cov
+        sum_w = np.sum(init_weights[s_idx, :m_cnt])
+        if sum_w > 0:
+            init_weights[s_idx, :m_cnt] /= sum_w
 
-    gmm_init_params = (init_weights, init_means, init_stds)
+    gmm_init_params = (init_weights, init_means, init_covariances)
     return num_mixtures_matrix, gmm_init_params
 
 
@@ -558,16 +553,14 @@ class Phlag:
             self.pos_to_caster,
             self.args.silhouette_threshold,
             output_dir,
-            getattr(self.args, "cluster_topologies", False)
         )
-        
+
         self.num_mixtures = int(np.max(num_mixtures_matrix))
-        self.mixture_masks = np.zeros((NUM_STATES, self.Y.shape[-1], self.num_mixtures), dtype=np.float32)
+        self.mixture_masks = np.zeros((NUM_STATES, self.num_mixtures), dtype=np.float32)
         for s in range(NUM_STATES):
-            for d in range(self.Y.shape[-1]):
-                m_count = num_mixtures_matrix[s, d]
-                self.mixture_masks[s, d, :m_count] = 1.0
-                
+            m_count = num_mixtures_matrix[s, 0]
+            self.mixture_masks[s, :m_count] = 1.0
+
         self.mixture_masks = jnp.array(self.mixture_masks)
         
         print(f"\nFinal configuration: num_mixtures = {self.num_mixtures}, mixture_masks = \n{self.mixture_masks}\n")
@@ -825,7 +818,7 @@ class Phlag:
             headers.append("Clade size: N/A")
 
         # Self-describing ground-truth/evaluation summary. These lines let downstream
-        # consumers (phlag.benchmark) read the anomaly fraction and the eval-time
+        # consumers (test.benchmark) read the anomaly fraction and the eval-time
         # label polarity straight out of the report, instead of re-deriving them from
         # the locus pattern -- the fraction in particular is not a pure function of
         # the pattern string, since it depends on where the actual window grid
@@ -836,7 +829,7 @@ class Phlag:
         headers.append(f"Anomaly fraction: {anomaly_fraction:.6f} ({n_anomaly}/{n_windows} windows)")
         headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
 
-        # Source mtimes at report-generation time -- let phlag.benchmark's run_all()
+        # Source mtimes at report-generation time -- let test.benchmark's run_all()
         # detect a stale report (caster.py or phlag.py/hmm.py edited since this report
         # was written) and rerun just the stage whose source actually changed, instead
         # of relying purely on report.tsv/scores.tsv presence.
@@ -1028,7 +1021,8 @@ class Phlag:
             occupancy_bias=self.occupancy_bias,
             model_design=self.args.model_design,
             num_mixtures=getattr(self, "num_mixtures", 2),
-            repulsion_divergence=self.args.repulsion_divergence,
+            lm_damping=self.args.lm_damping,
+            repulsion_optimizer=self.args.repulsion_optimizer,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1040,15 +1034,16 @@ class Phlag:
 
         # alt variance = double null variance if --double-variance-init, else same as null
         alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
-        state0_init = jnp.stack([data_mean, data_var], axis=-1)
-        state1_init = jnp.stack([data_mean, alt_variance_mult * data_var], axis=-1)
-
-        # Shape: [num_states, emission_dim, 2] where the last axis is [mean, variance]
-        init_emissions = jnp.stack([state0_init, state1_init], axis=0)
         p0, p1 = 0.99, 0.99
         initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
-        
+
         if self.args.model_design == "gmm":
+            # Only used as a fallback seed if gmm_init_params wasn't computed
+            # (determine_optimal_mixtures normally supplies it instead, full
+            # covariance included) -- diagonal here is just a degenerate seed.
+            state0_init = jnp.stack([data_mean, data_var], axis=-1)
+            state1_init = jnp.stack([data_mean, alt_variance_mult * data_var], axis=-1)
+            init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
                 initial_probs=INITIAL_PROBS,
                 emission_probs=init_emissions,
@@ -1056,22 +1051,24 @@ class Phlag:
                 initial_gmm_params=getattr(self, "gmm_init_params", None),
             )
         else:
+            # Shape: [num_states, emission_dim, emission_dim + 1] where column 0 is
+            # the mean and the remaining emission_dim columns are the full covariance.
+            state0_init = jnp.concatenate([data_mean[:, None], data_cov], axis=-1)
+            state1_init = jnp.concatenate(
+                [data_mean[:, None], alt_variance_mult * data_cov], axis=-1
+            )
+            init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
                 initial_probs=INITIAL_PROBS,
                 emission_probs=init_emissions,
                 transition_matrix=initial_transition_matrix,
-            )
-            # use full for gaussian
-            full_covariances = jnp.stack([data_cov, alt_variance_mult * data_cov], axis=0)
-            self.params = self.params._replace(
-                emissions=self.params.emissions._replace(covariances=full_covariances)
             )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
         self.props.transitions.transition_matrix.trainable = True
         if self.args.model_design == "gmm":
             self.props.emissions.mixture_weights.trainable = True
             self.props.emissions.means.trainable = True
-            self.props.emissions.stds.trainable = True
+            self.props.emissions.covariances.trainable = True
         else:
             self.props.emissions.means.trainable = True
             self.props.emissions.covariances.trainable = True
@@ -1328,7 +1325,7 @@ class PhlagPlotter:
     def _plot_gmm_init_row(self, row_axes, ranges):
         """Plots the pre-EM GMM initialization seed: weighted-sum-of-Gaussians curves per
         state, derived from the k-means-based mixture seed (self.phlag.gmm_init_params)."""
-        init_weights, init_means, init_stds = self.phlag.gmm_init_params
+        init_weights, init_means, init_covariances = self.phlag.gmm_init_params
         title_prefix = "GMM Initialization"
 
         for d in range(self.emission_dim):
@@ -1338,9 +1335,10 @@ class PhlagPlotter:
 
             for state in [0, 1]:
                 color_config = self.colors[state]
-                w = np.array(init_weights[state, d])
-                m_means = np.array(init_means[state, d])
-                m_stds = np.array(init_stds[state, d])
+                w = np.array(init_weights[state])
+                m_means = np.array(init_means[state, :, d])
+                m_vars = np.array(init_covariances[state, :, d, d])
+                m_stds = np.sqrt(np.clip(m_vars, 1e-6, None))
                 pdf_vals = np.zeros_like(x_vals)
                 for m in range(len(w)):
                     pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
@@ -1723,14 +1721,25 @@ def parse_arguments(argv=None):
         help="Seed the alt state's initial variance at 2x the null state's (default: same variance as null).",
     )
     hmm_group.add_argument(
-        "--repulsion-divergence",
-        dest="repulsion_divergence",
+        "--repulsion-optimizer",
+        dest="repulsion_optimizer",
         type=str.lower,
-        default="hellinger",
-        choices=["hellinger", "kl"],
-        help="""Divergence measure the REPULSION emission parameterization pushes away
-                    with (default: hellinger): hellinger (Bhattacharyya-coefficient-based,
-                    bounded) or kl (closed-form Gaussian KL divergence, unbounded).""",
+        default="lm",
+        choices=["lm", "gd"],
+        help="""Optimizer the REPULSION emission parameterization's joint MAP fit
+                    uses (default: lm): lm (Levenberg-Marquardt/damped Newton, see
+                    --mu) or gd (plain fixed-step gradient descent).""",
+    )
+    hmm_group.add_argument(
+        "--mu",
+        dest="lm_damping",
+        type=float,
+        default=1.0,
+        help="""Initial damping for the --repulsion-optimizer lm path's joint MAP
+                    optimizer (default: 1.0; ignored under gd). Per-step damping
+                    still adapts (relaxes toward 0 on accepted steps, grows on
+                    rejected ones) starting from this value -- 0 starts at an
+                    undamped Newton step, not gradient descent.""",
     )
     hmm_group.add_argument(
         "-d",
@@ -1739,13 +1748,6 @@ def parse_arguments(argv=None):
         default="gaussian",
         choices=["gaussian", "gmm"],
         help="Type of HMM emissions (gaussian or gmm. Default: gaussian)",
-    )
-    hmm_group.add_argument(
-        "-c",
-        "--cluster-topologies",
-        dest="cluster_topologies",
-        action="store_true",
-        help="For GMM, cluster topologies together instead of independently",
     )
     hmm_group.add_argument(
         "-t",

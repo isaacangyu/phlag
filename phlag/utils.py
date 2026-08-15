@@ -621,14 +621,20 @@ def get_repo_root():
 def load_cli_config(tool_name):
     """
     Returns (variable_tokens, fixed_tokens) -- flat lists of raw CLI flag
-    tokens -- for tool_name ("caster" or "phlag") from config.json alongside
-    this module in phlag/. Missing file or missing tool key returns ([], []),
-    matching get_data_dir()'s tolerance for a missing .env.
+    tokens -- for tool_name ("caster" or "phlag") from test/config.json,
+    sibling to phlag/ in whichever tree this module is physically running
+    from. Deliberately resolved relative to this file rather than via
+    get_repo_root() (which honors a PHLAG_REPO_ROOT override) -- that keeps
+    config.json frozen together with the code when running from one of
+    benchmark.py's run_all() source snapshots, instead of picking up live
+    edits to the real repo's config.json mid-run. Missing file or missing
+    tool key returns ([], []), matching get_data_dir()'s tolerance for a
+    missing .env.
     """
     import json
     import pathlib
 
-    config_path = pathlib.Path(__file__).resolve().parent / "config.json"
+    config_path = pathlib.Path(__file__).resolve().parent.parent / "test" / "config.json"
     if not config_path.exists():
         return [], []
 

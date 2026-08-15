@@ -41,8 +41,11 @@ Repository = "https://github.com/bo1929/phlag"
 [project.scripts]
 phlag = "phlag.phlag:main"
 caster = "phlag.caster:main"
-benchmark = "phlag.benchmark:main"
-phlagster = "phlag.phlagster:main"
+benchmark = "test.benchmark:main"
+phlagster = "test.phlagster:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["phlag", "test"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [

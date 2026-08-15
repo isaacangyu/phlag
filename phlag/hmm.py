@@ -193,23 +193,10 @@ def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
     return 1.0 - gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
 
 
-def gaussian_kl(mu1, Sigma1, mu0, Sigma0):
-    """KL(N(mu1,Sigma1) || N(mu0,Sigma0))."""
-    d = mu1.shape[0]
-    Sigma0_inv = jnp.linalg.inv(Sigma0)
-    diff = mu0 - mu1
-    return 0.5 * (
-        jnp.trace(Sigma0_inv @ Sigma1)
-        + diff @ Sigma0_inv @ diff
-        - d
-        + jnp.linalg.slogdet(Sigma0)[1]
-        - jnp.linalg.slogdet(Sigma1)[1]
-    )
-
 class ParamsGMMHMMEmissions(NamedTuple):
-    mixture_weights: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
-    means: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
-    stds: Union[Float[Array, "num_states emission_dim num_mixtures"], ParameterProperties]
+    mixture_weights: Union[Float[Array, "num_states num_mixtures"], ParameterProperties]
+    means: Union[Float[Array, "num_states num_mixtures emission_dim"], ParameterProperties]
+    covariances: Union[Float[Array, "num_states num_mixtures emission_dim emission_dim"], ParameterProperties]
 
 
 class PhlagGMMHMMEmissions(HMMEmissions):
@@ -233,17 +220,14 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         self, params: ParamsGMMHMMEmissions, state: IntScalar, inputs=None
     ) -> tfd.Distribution:
         weights = jnp.clip(params.mixture_weights[state], a_min=1e-6)
-        weights = weights / weights.sum(axis=-1, keepdims=True)
-        means = params.means[state]
-        stds = jnp.clip(params.stds[state], a_min=1e-5)
-        
+        weights = weights / weights.sum()
+        means = params.means[state]  # [num_mixtures, emission_dim]
+        covariances = params.covariances[state] + jnp.eye(self.emission_dim) * 1e-6
+
         mix = tfd.Categorical(probs=weights)
-        comp = tfd.Normal(loc=means, scale=stds)
-        
-        return tfd.Independent(
-            tfd.MixtureSameFamily(mixture_distribution=mix, components_distribution=comp),
-            reinterpreted_batch_ndims=1
-        )
+        comp = tfd.MultivariateNormalFullCovariance(loc=means, covariance_matrix=covariances)
+
+        return tfd.MixtureSameFamily(mixture_distribution=mix, components_distribution=comp)
 
     def log_prior(self, params: ParamsGMMHMMEmissions) -> Scalar:
         return 0.0
@@ -260,33 +244,38 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         M = self.num_mixtures
         
         if initial_gmm_params is not None:
-            mixture_weights, means, stds = initial_gmm_params
+            mixture_weights, means, covariances = initial_gmm_params
             mixture_weights = jnp.array(mixture_weights, dtype=jnp.float32)
             means = jnp.array(means, dtype=jnp.float32)
-            stds = jnp.array(stds, dtype=jnp.float32)
+            covariances = jnp.array(covariances, dtype=jnp.float32)
         else:
             if emission_probs is not None:
                 state_means = emission_probs[..., 0]
                 state_vars = emission_probs[..., 1]
-                state_stds = jnp.sqrt(jnp.clip(state_vars, a_min=1e-5))
             else:
                 state_means = jnp.zeros((S, D))
-                state_stds = jnp.ones((S, D))
-                
+                state_vars = jnp.ones((S, D))
+            state_stds = jnp.sqrt(jnp.clip(state_vars, a_min=1e-5))
+
+            state_cov = jnp.stack(
+                [jnp.diag(state_vars[s]) for s in range(S)], axis=0
+            )
+
             if M == 1:
                 offsets = jnp.array([0.0])
             else:
                 offsets = jnp.linspace(-1.0, 1.0, M)
-                
-            means = state_means[:, :, None] + offsets[None, None, :] * state_stds[:, :, None] * 0.5
-            stds = jnp.stack([state_stds for _ in range(M)], axis=-1)
-            mixture_weights = jnp.ones((S, D, M)) / M
-            
-        params = ParamsGMMHMMEmissions(mixture_weights=mixture_weights, means=means, stds=stds)
+
+            # means: [S, M, D], each mixture component offset along the diagonal spread
+            means = state_means[:, None, :] + offsets[None, :, None] * state_stds[:, None, :] * 0.5
+            covariances = jnp.stack([state_cov for _ in range(M)], axis=1)  # [S, M, D, D]
+            mixture_weights = jnp.ones((S, M)) / M
+
+        params = ParamsGMMHMMEmissions(mixture_weights=mixture_weights, means=means, covariances=covariances)
         props = ParamsGMMHMMEmissions(
             mixture_weights=ParameterProperties(constrainer=tfb.SoftmaxCentered()),
             means=ParameterProperties(),
-            stds=ParameterProperties(constrainer=tfb.Softplus())
+            covariances=ParameterProperties()
         )
         return params, props
 
@@ -294,32 +283,32 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         self, params: ParamsGMMHMMEmissions, posterior: HMMPosterior, emissions: Array, inputs=None
     ) -> dict:
         T, D = emissions.shape
-        M = self.num_mixtures
-        
+
         sum_weights_list = []
-        sum_y_list = []
-        sum_y_sq_list = []
-        
+        sum_x_list = []
+        sum_xxT_list = []
+
         for s in range(self.num_states):
-            means = params.means[s]
-            stds = jnp.clip(params.stds[s], a_min=1e-5)
-            log_weights = jnp.log(jnp.clip(params.mixture_weights[s], a_min=1e-12))
-            
-            log_lik_comp = tfd.Normal(loc=means, scale=stds).log_prob(emissions[:, :, None])
-            joint_log_lik = log_lik_comp + log_weights[None, :, :]
-            
+            means = params.means[s]  # [M, D]
+            covariances = params.covariances[s] + jnp.eye(D) * 1e-6  # [M, D, D]
+            log_weights = jnp.log(jnp.clip(params.mixture_weights[s], a_min=1e-12))  # [M]
+
+            comp = tfd.MultivariateNormalFullCovariance(loc=means, covariance_matrix=covariances)
+            log_lik_comp = comp.log_prob(emissions[:, None, :])  # [T, M]
+            joint_log_lik = log_lik_comp + log_weights[None, :]
+
             comp_resp = jnp.exp(joint_log_lik - jax.scipy.special.logsumexp(joint_log_lik, axis=-1, keepdims=True))
             w_state = posterior.smoothed_probs[:, s]
-            joint_weights = comp_resp * w_state[:, None, None]
-            
-            sum_weights_list.append(jnp.sum(joint_weights, axis=0))
-            sum_y_list.append(jnp.sum(joint_weights * emissions[:, :, None], axis=0))
-            sum_y_sq_list.append(jnp.sum(joint_weights * (emissions[:, :, None] ** 2), axis=0))
-            
+            joint_weights = comp_resp * w_state[:, None]  # [T, M]
+
+            sum_weights_list.append(jnp.sum(joint_weights, axis=0))  # [M]
+            sum_x_list.append(jnp.einsum("tm,td->md", joint_weights, emissions))  # [M, D]
+            sum_xxT_list.append(jnp.einsum("tm,ti,tj->mij", joint_weights, emissions, emissions))  # [M, D, D]
+
         return dict(
             sum_weights=jnp.stack(sum_weights_list, axis=0),
-            sum_y=jnp.stack(sum_y_list, axis=0),
-            sum_y_sq=jnp.stack(sum_y_sq_list, axis=0)
+            sum_x=jnp.stack(sum_x_list, axis=0),
+            sum_xxT=jnp.stack(sum_xxT_list, axis=0)
         )
 
     def initialize_m_step_state(
@@ -333,7 +322,7 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         return None
 
     def state_divergence(self, params: ParamsGMMHMMEmissions) -> Float:
-        overall_means = jnp.sum(params.mixture_weights * params.means, axis=-1)
+        overall_means = jnp.sum(params.mixture_weights[..., None] * params.means, axis=1)
         total_divergence = 0.0
         for i in range(self.num_states):
             for j in range(i + 1, self.num_states):
@@ -348,27 +337,28 @@ class PhlagGMMHMMEmissions(HMMEmissions):
         m_step_state: Any,
     ) -> Tuple[ParamsGMMHMMEmissions, Any]:
         stats = pytree_sum(batch_stats, axis=0)
-        sum_weights = stats["sum_weights"]
-        sum_y = stats["sum_y"]
-        sum_y_sq = stats["sum_y_sq"]
-        
+        sum_weights = stats["sum_weights"]  # [S, M]
+        sum_x = stats["sum_x"]  # [S, M, D]
+        sum_xxT = stats["sum_xxT"]  # [S, M, D, D]
+
         total_weights = jnp.clip(sum_weights.sum(axis=-1, keepdims=True), a_min=1e-12)
         mixture_weights = sum_weights / total_weights
-        
+
         denom = jnp.clip(sum_weights, a_min=1e-8)
-        means = sum_y / denom
-        
-        variances = jnp.clip((sum_y_sq / denom) - means ** 2, a_min=1e-6)
-        stds = jnp.sqrt(variances)
-        
+        means = sum_x / denom[..., None]
+
+        mean_outer = jnp.einsum("smi,smj->smij", means, means)
+        covariances = sum_xxT / denom[..., None, None] - mean_outer
+        covariances = covariances + jnp.eye(self.emission_dim) * 1e-6
+
         if hasattr(self, "mixture_masks"):
             mixture_weights = mixture_weights * self.mixture_masks
             mixture_weights = mixture_weights / jnp.clip(mixture_weights.sum(axis=-1, keepdims=True), a_min=1e-12)
-            
+
         params = params._replace(
             mixture_weights=mixture_weights,
             means=means,
-            stds=stds
+            covariances=covariances
         )
         return params, m_step_state
 
@@ -462,14 +452,16 @@ class PhlagHMMEmissions(HMMEmissions):
         penalty_lambda: float,
         parameterization: Tuple[str, ...],
         concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
-        repulsion_divergence: str = "hellinger",
+        lm_damping: float = 1.0,
+        repulsion_optimizer: str = "lm",
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
         self.penalty_lambda = penalty_lambda
         self.parameterization = parameterization
         self.concentration = concentration
-        self.repulsion_divergence = repulsion_divergence
+        self.lm_damping = lm_damping
+        self.repulsion_optimizer = repulsion_optimizer
 
     def set_emission_prior_concentration(
         self, concentration: Union[Scalar, Float[Array, "num_classes"]]
@@ -510,18 +502,30 @@ class PhlagHMMEmissions(HMMEmissions):
         if emission_probs is None:
             raise ValueError("emission_probs must be provided")
 
-        if emission_probs.ndim != 3 or emission_probs.shape[-1] != 2:
+        if emission_probs.ndim != 3:
             raise ValueError(
                 "Unsupported emission_probs shape. Expected [num_states, emission_dim, 2] "
-                "for mean/variance initialization."
+                "for mean/variance initialization, or [num_states, emission_dim, emission_dim + 1] "
+                "for mean/full-covariance initialization."
             )
 
-        num_states, emission_dim, _ = emission_probs.shape
+        num_states, emission_dim, num_classes = emission_probs.shape
         means = emission_probs[..., 0]
-        variances = emission_probs[..., 1]
-        covariances = jnp.stack(
-            [jnp.diag(variances[state]) for state in range(num_states)], axis=0
-        )
+
+        if num_classes == 2:
+            variances = emission_probs[..., 1]
+            covariances = jnp.stack(
+                [jnp.diag(variances[state]) for state in range(num_states)], axis=0
+            )
+        elif num_classes == emission_dim + 1:
+            covariances = emission_probs[..., 1:]
+        else:
+            raise ValueError(
+                "Unsupported emission_probs shape. Expected [num_states, emission_dim, 2] "
+                "for mean/variance initialization, or [num_states, emission_dim, emission_dim + 1] "
+                "for mean/full-covariance initialization."
+            )
+
         params = ParamsGaussianHMMEmissions(means=means, covariances=covariances)
 
         props = ParamsGaussianHMMEmissions(
@@ -551,6 +555,7 @@ class PhlagHMMEmissions(HMMEmissions):
     def map_estimate_repulsion(self, mu_target, Sigma_target, n, xbar, Sxx):
         d = xbar.shape[0]
         eps = 1e-6
+        # precomputed before optimization
         S = Sxx - n * jnp.outer(xbar, xbar)
 
         def neg_objective(params):
@@ -559,20 +564,19 @@ class PhlagHMMEmissions(HMMEmissions):
             Sigma = L @ L.T + eps * jnp.eye(d)
             Sigma_inv = jnp.linalg.inv(Sigma)
             diff = xbar - mu
+            weighted_scatter_about_mu = S + n * jnp.outer(diff, diff)
+
             ll = -0.5 * (
                 n * jnp.linalg.slogdet(Sigma)[1]
-                + jnp.trace(Sigma_inv @ (S + n * jnp.outer(diff, diff)))
+                + jnp.trace(Sigma_inv @ weighted_scatter_about_mu)
             )
-            # ll scales with n (every term above is n-weighted), but bc/kl don't
+            # ll scales with n (every term above is n-weighted), but bc doesn't
             # scale with occupancy at all -- at a fixed penalty_lambda the
             # penalty is swamped by ll once n is more than a handful, so
             # repulsion silently degenerates to FREE for any well-populated
             # state. Scale the effective penalty by n so it stays proportionate
             # to ll regardless of occupancy.
             effective_lambda = self.penalty_lambda * n
-            if self.repulsion_divergence == "kl":
-                kl = gaussian_kl(mu, Sigma, mu_target, Sigma_target)
-                return -(ll + effective_lambda * kl)  # repulsion: reward large KL, i.e. large divergence
             bc = gaussian_bhattacharyya_coefficient(mu, Sigma, mu_target, Sigma_target)
             return -(ll - effective_lambda * bc)  # repulsion: reward small BC, i.e. large Hellinger distance
 
@@ -585,22 +589,8 @@ class PhlagHMMEmissions(HMMEmissions):
             return neg_objective(unravel(flat))
 
         grad_flat = jax.grad(flat_obj)
-        hess_flat = jax.hessian(flat_obj)
 
-        # Levenberg-Marquardt (damped Newton) instead of the earlier plain
-        # gradient descent + backtracking + grad-norm-clip scheme: solves
-        # (H + damping*I) delta = -g each step, retrying with damping *= 10
-        # (falls back toward a small gradient-descent-like step) until the
-        # step doesn't make neg_objective worse/nan, and relaxing damping
-        # (*= 0.5, floored) after an accepted step so it can speed back up
-        # toward full Newton steps when the landscape allows it. Tuned/
-        # verified against the same 10X/down/N109/40-60 leaf that reliably
-        # diverged/NaN'd under the earlier scheme -- converges cleanly for
-        # both single- and both-state REPULSION.
-        max_step_norm = 10.0
         sigma_min = 1e-2
-        max_lm_tries = 20
-        damping0 = 1.0
 
         def clamp_L(L):
             # Eigendecompose Sigma (symmetric by construction) and floor its
@@ -613,49 +603,86 @@ class PhlagHMMEmissions(HMMEmissions):
             Sigma_clamped = (eigvecs * eigvals) @ eigvecs.T
             return jnp.linalg.cholesky(Sigma_clamped)
 
-        def step(_, carry):
-            flat, damping = carry
-            g = grad_flat(flat)
-            H = hess_flat(flat)
-            obj0 = flat_obj(flat)
+        if self.repulsion_optimizer == "gd":
+            # Plain fixed-step gradient descent -- a genuinely separate route
+            # rather than a limiting case of the LM step below: damping=0
+            # there is an undamped Newton step (uses the full Hessian), and
+            # damping=inf is numerically degenerate in the (H + damping*I)
+            # solve, so neither end of that dial reaches this. Still clamps
+            # Sigma's eigenvalues each step like the LM path, since that floor
+            # guards against the same near-singular-Sigma blowup regardless of
+            # which optimizer is stepping.
+            gd_lr = 0.05
 
-            def lm_try(damping):
-                A = H + damping * jnp.eye(dim)
-                delta = jnp.linalg.solve(A, -g)
-                # Clip the step norm directly -- bounds step *magnitude*, not
-                # just objective value, the same gap plain backtracking had.
-                delta_norm = jnp.linalg.norm(delta)
-                clip_scale = jnp.minimum(1.0, max_step_norm / (delta_norm + 1e-12))
-                delta = delta * clip_scale
-                flat_new = flat + delta
-                obj_new = flat_obj(flat_new)
-                return flat_new, obj_new
+            def gd_step(_, flat):
+                mu_i, L_i = unravel(flat)
+                flat = ravel_pytree((mu_i, clamp_L(L_i)))[0]
+                g = grad_flat(flat)
+                return flat - gd_lr * g
 
-            def cond_fn(state):
-                damping, n_tries, _, obj_new = state
-                worse = jnp.logical_or(jnp.isnan(obj_new), obj_new > obj0)
-                return jnp.logical_and(worse, n_tries < max_lm_tries)
+            # lax.fori_loop instead of a Python loop so the 100 steps don't
+            # unroll into the jit trace of the outer EM step.
+            flat_final = lax.fori_loop(0, 100, gd_step, flat0)
+        else:
+            hess_flat = jax.hessian(flat_obj)
 
-            def body_fn(state):
-                damping, n_tries, _, _ = state
-                damping = damping * 10.0
-                flat_new, obj_new = lm_try(damping)
-                return (damping, n_tries + 1, flat_new, obj_new)
+            # Levenberg-Marquardt (damped Newton): solves (H + damping*I)
+            # delta = -g each step, retrying with damping *= 10 (falls back
+            # toward a small gradient-descent-like step) until the step
+            # doesn't make neg_objective worse/nan, and relaxing damping
+            # (*= 0.5, floored) after an accepted step so it can speed back up
+            # toward full Newton steps when the landscape allows it. Tuned/
+            # verified against the same 10X/down/N109/40-60 leaf that reliably
+            # diverged/NaN'd under the earlier plain-gradient-descent scheme
+            # -- converges cleanly for both single- and both-state REPULSION.
+            max_step_norm = 10.0
+            max_lm_tries = 20
+            damping0 = self.lm_damping
 
-            flat_new0, obj_new0 = lm_try(damping)
-            damping_f, _, flat_f, _ = lax.while_loop(
-                cond_fn, body_fn, (damping, 0, flat_new0, obj_new0)
-            )
-            damping_next = jnp.maximum(damping_f * 0.5, 1e-7)
+            def step(_, carry):
+                flat, damping = carry
+                g = grad_flat(flat)
+                H = hess_flat(flat)
+                obj0 = flat_obj(flat)
 
-            mu_new, L_new = unravel(flat_f)
-            L_new = clamp_L(L_new)
-            flat_clamped, _ = ravel_pytree((mu_new, L_new))
-            return (flat_clamped, damping_next)
+                def lm_try(damping):
+                    A = H + damping * jnp.eye(dim)
+                    delta = jnp.linalg.solve(A, -g)
+                    # Clip the step norm directly -- bounds step *magnitude*, not
+                    # just objective value, the same gap plain backtracking had.
+                    delta_norm = jnp.linalg.norm(delta)
+                    clip_scale = jnp.minimum(1.0, max_step_norm / (delta_norm + 1e-12))
+                    delta = delta * clip_scale
+                    flat_new = flat + delta
+                    obj_new = flat_obj(flat_new)
+                    return flat_new, obj_new
 
-        # lax.fori_loop instead of a Python loop so the 100 steps don't
-        # unroll into the jit trace of the outer EM step.
-        flat_final, _ = lax.fori_loop(0, 100, step, (flat0, damping0)) # why fixed at 100?
+                def cond_fn(state):
+                    damping, n_tries, _, obj_new = state
+                    worse = jnp.logical_or(jnp.isnan(obj_new), obj_new > obj0)
+                    return jnp.logical_and(worse, n_tries < max_lm_tries)
+
+                def body_fn(state):
+                    damping, n_tries, _, _ = state
+                    damping = damping * 10.0
+                    flat_new, obj_new = lm_try(damping)
+                    return (damping, n_tries + 1, flat_new, obj_new)
+
+                flat_new0, obj_new0 = lm_try(damping)
+                damping_f, _, flat_f, _ = lax.while_loop(
+                    cond_fn, body_fn, (damping, 0, flat_new0, obj_new0)
+                )
+                damping_next = jnp.maximum(damping_f * 0.5, 1e-7)
+
+                mu_new, L_new = unravel(flat_f)
+                L_new = clamp_L(L_new)
+                flat_clamped, _ = ravel_pytree((mu_new, L_new))
+                return (flat_clamped, damping_next)
+
+            # lax.fori_loop instead of a Python loop so the 100 steps don't
+            # unroll into the jit trace of the outer EM step.
+            flat_final, _ = lax.fori_loop(0, 100, step, (flat0, damping0)) # why fixed at 100?
+
         mu, L = unravel(flat_final)
 
         Sigma = L @ L.T + eps * jnp.eye(d)
@@ -705,11 +732,8 @@ class PhlagHMMEmissions(HMMEmissions):
         Bhattacharyya distance between states' fitted Gaussians, averaged over
         every unordered state pair. Unlike state_divergence (means only, the
         report's "State divergence" line), this folds both the mean AND the
-        full covariance difference into a single divergence number. Always
-        Bhattacharyya-based for reporting, regardless of repulsion_divergence
-        -- when that's "hellinger" (default) this is the same coefficient
-        map_estimate_repulsion optimizes against; when it's "kl" the reported
-        number and the training objective are different metrics.
+        full covariance difference into a single divergence number. Same
+        coefficient map_estimate_repulsion optimizes against.
         """
         means = params.means
         covariances = params.covariances
@@ -788,7 +812,8 @@ class PhlagHMM(HMM):
                 penalty_lambda=self.emission_lambda,
                 concentration=self.emission_concentration,
                 parameterization=self.emission_parameterization,
-                repulsion_divergence=kwargs.get("repulsion_divergence", "hellinger"),
+                lm_damping=kwargs.get("lm_damping", 1.0),
+                repulsion_optimizer=kwargs.get("repulsion_optimizer", "lm"),
             )
         super().__init__(
             num_states=self.num_states,

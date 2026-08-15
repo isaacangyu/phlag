@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 
 RED = "\033[91m"
 RESET = "\033[0m"
@@ -120,6 +121,10 @@ _RE_TRANSITION_MATRIX = re.compile(
 )
 _RE_CASTER_MTIME = re.compile(r'^Caster source mtime:\s*([\d.eE+]+)\s*$')
 _RE_PHLAG_MTIME = re.compile(r'^Phlag source mtime:\s*([\d.eE+]+)\s*$')
+_RE_BIC = re.compile(
+    r'^BIC:\s*([-\d.eE+]+)\s*\(log-likelihood=([-\d.eE+]+),\s*'
+    r'k=(\d+)\s*trainable params,\s*n=(\d+)\s*windows\)\s*$'
+)
 
 
 def _parse_branch_length_value(value_str):
@@ -167,6 +172,7 @@ def parse_report(report_path):
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
         "caster_source_mtime": None, "phlag_source_mtime": None,
+        "bic": None, "log_likelihood": None, "n_trainable_params": None,
     }
 
     with open(report_path, "r") as handle:
@@ -259,6 +265,13 @@ def parse_report(report_path):
                 parsed["phlag_source_mtime"] = float(m.group(1))
                 continue
 
+            m = _RE_BIC.match(line)
+            if m:
+                parsed["bic"] = float(m.group(1))
+                parsed["log_likelihood"] = float(m.group(2))
+                parsed["n_trainable_params"] = int(m.group(3))
+                continue
+
     if parsed["n_windows"] is None and parsed["n_path_entries"] is not None:
         parsed["n_windows"] = parsed["n_path_entries"]
 
@@ -276,7 +289,7 @@ def nominal_anomaly_fraction(pattern_str):
     accounts for where the window grid actually falls. Runs that fall back to
     this are tagged 'nominal' in runs.tsv.
     """
-    from .utils import parse_pattern_string
+    from phlag.utils import parse_pattern_string
 
     if not pattern_str:
         return None
@@ -347,6 +360,9 @@ class RunRecord:
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
     transition_alt_to_alt: Optional[float] = None
+    bic: Optional[float] = None
+    log_likelihood: Optional[float] = None
+    n_trainable_params: Optional[int] = None
 
 
 @dataclass
@@ -531,7 +547,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  errorbar="sd"):
-        from .utils import get_data_dir
+        from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
             raise ValueError(f"Unknown errorbar kind '{errorbar}' (expected one of {ERRORBAR_KINDS})")
@@ -551,8 +567,8 @@ class BenchmarkStats:
 
     def default_stats_dir(self):
         """<phlag_base>/<dist_type>/w<W>_s<S>/benchmark/ -- the container for numbered per-run subfolders."""
-        from .utils import get_data_dir, get_phlag_output_base
-        from .caster import format_val
+        from phlag.utils import get_data_dir, get_phlag_output_base
+        from phlag.caster import format_val
 
         window_str = format_val(self.window_size)
         step_str = format_val(self.step_size)
@@ -603,7 +619,7 @@ class BenchmarkStats:
         tree on disk, so it picks up every finished default-pattern run that exists
         there -- not only ones produced by a `run_all()` call earlier in this process.
         """
-        from .utils import get_simulation_categories
+        from phlag.utils import get_simulation_categories
 
         self.runs = []
         self.notes = []
@@ -700,6 +716,9 @@ class BenchmarkStats:
             record.covar_relerr_agg = sum(std_vals) / len(std_vals) if std_vals else None
 
         record.em_bhattacharyya_distance = parsed["em_bhattacharyya_distance"]
+        record.bic = parsed["bic"]
+        record.log_likelihood = parsed["log_likelihood"]
+        record.n_trainable_params = parsed["n_trainable_params"]
 
         record.transition_null_to_null = parsed["transition_null_to_null"]
         record.transition_null_to_alt = parsed["transition_null_to_alt"]
@@ -715,7 +734,7 @@ class BenchmarkStats:
         record.fraction_bin = assign_bin(record.anomaly_fraction, FRACTION_BIN_EDGES)
 
         if column == COL_ADMIXTURE:
-            from .utils import get_admixture_divergence_time, ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
+            from phlag.utils import get_admixture_divergence_time, ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
             record.x_variable = "divergence time (Myr)"
             record.x_value = get_admixture_divergence_time(leaf_dir.name)
             record.x_bin = subcategory if subcategory in ADMIXTURE_BINS else None
@@ -856,7 +875,7 @@ class BenchmarkStats:
         x_axis_label_by_column = {}
         for column in FIGURE_COLUMNS:
             if column == COL_ADMIXTURE:
-                from .utils import ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
+                from phlag.utils import ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
                 x_bins_by_column[column] = list(ADMIXTURE_BINS)
                 x_axis_label_by_column[column] = (
                     f"Divergence time (split at {ADMIXTURE_DIVERGENCE_THRESHOLD_MYR:g} Myr)"
@@ -907,6 +926,7 @@ class BenchmarkStats:
         "em_bhattacharyya_distance",
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
+        "bic", "log_likelihood", "n_trainable_params",
     ] + RELERR_RUN_COLUMNS + [
         "exclusion", "report_path",
     ]
@@ -974,6 +994,9 @@ class BenchmarkStats:
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
                     "transition_alt_to_alt": record.transition_alt_to_alt,
+                    "bic": record.bic,
+                    "log_likelihood": record.log_likelihood,
+                    "n_trainable_params": record.n_trainable_params,
                     "exclusion": record.exclusion,
                     "report_path": record.report_path,
                 }
@@ -1236,6 +1259,34 @@ class BenchmarkFigurePlotter:
         """
         return [len(self.data.x_bins_by_column[c]) for c in self.data.columns]
 
+    def _variable_y_axis(self, global_max_top, target_ticks=_N_GRIDLINES, headroom=1.10):
+        """
+        Gridline top/positions for a variable-scale bar panel (relerr,
+        em_divergence) -- unlike panel A/B's fixed [0,1] axis, these scale to
+        whatever the data's max bar is. Picks an integer step (1/2/5/10 x a
+        power of ten) instead of plain linspace(0, max*headroom, n), which
+        produces fractional (decimal) gridline labels, and rounds the top up
+        to the next multiple of that step so the tallest bar (plus its small
+        headroom margin for the "n=" run-count label above it) lands close to
+        the top gridline instead of leaving a lot of empty space above it.
+        """
+        if global_max_top <= 0:
+            return 1.0, np.array([0.0, 1.0])
+
+        raw_top = global_max_top * headroom
+        ideal_step = raw_top / max(target_ticks - 1, 1)
+        magnitude = 10 ** math.floor(math.log10(max(ideal_step, 1)))
+        for mult in (1, 2, 5, 10):
+            step = mult * magnitude
+            if step >= ideal_step:
+                break
+        y_top = math.ceil(raw_top / step) * step
+        yticks = np.arange(0, y_top + step / 2, step)
+        return y_top, yticks
+
+    def _int_yaxis(self, ax):
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _pos: f"{v:.0f}"))
+
 
     def render_panel_a(self, filename="f1.png"):
         data = self.data
@@ -1435,8 +1486,7 @@ class BenchmarkFigurePlotter:
                         cell.mean_relerr + cell.mean_relerr_err_plus,
                         cell.covar_relerr + cell.covar_relerr_err_plus,
                     )
-        y_top = global_max_top * 1.22 if global_max_top > 0 else 1.0
-        yticks = np.linspace(0.0, y_top, _N_GRIDLINES)
+        y_top, yticks = self._variable_y_axis(global_max_top)
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1455,6 +1505,7 @@ class BenchmarkFigurePlotter:
                 ax.set_xlim(-0.7, len(x_bins) - 0.3)
                 ax.set_ylim(0.0, y_top)
                 ax.set_yticks(yticks)
+                self._int_yaxis(ax)
                 ax.set_xticks(list(range(len(x_bins))))
                 ax.set_xticklabels(x_bins, rotation=30, ha="right", fontsize=7.5)
 
@@ -1557,8 +1608,7 @@ class BenchmarkFigurePlotter:
                     if cell is None or cell.n_runs == 0:
                         continue
                     global_max_top = max(global_max_top, cell.mean_distance + cell.err_plus)
-        y_top = global_max_top * 1.22 if global_max_top > 0 else 1.0
-        yticks = np.linspace(0.0, y_top, _N_GRIDLINES)
+        y_top, yticks = self._variable_y_axis(global_max_top)
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1578,6 +1628,7 @@ class BenchmarkFigurePlotter:
                 ax.set_xlim(-0.7, len(x_bins) - 0.3)
                 ax.set_ylim(0.0, y_top)
                 ax.set_yticks(yticks)
+                self._int_yaxis(ax)
                 ax.set_xticks(list(range(len(x_bins))))
                 ax.set_xticklabels(x_bins, rotation=30, ha="right", fontsize=7.5)
 
@@ -1717,8 +1768,8 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
     a FULL path rather than a bare node name, because node names such as 'N228'
     live under four different category directories at once.
     """
-    from .utils import get_data_dir, get_phlag_output_base, get_simulation_categories, get_short_sim_name
-    from .caster import format_val
+    from phlag.utils import get_data_dir, get_phlag_output_base, get_simulation_categories, get_short_sim_name
+    from phlag.caster import format_val
 
     phlag_base = get_phlag_output_base(get_data_dir())
     window_str = format_val(window_size)
@@ -1734,7 +1785,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 def get_expected_scores_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
-    from .utils import clean_locus_name
+    from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_sim_output_dir(
         fasta_path, leaf_dir, dist_type=dist_type,
@@ -1746,7 +1797,7 @@ def get_expected_scores_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 def get_expected_report_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
-    from .utils import clean_locus_name
+    from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_sim_output_dir(
         fasta_path, leaf_dir, dist_type=dist_type,
@@ -1764,19 +1815,25 @@ def run_step(cmd, label, cwd=None, env=None):
 
 
 def create_source_snapshot():
+    """
+    Copies both phlag/ (the package caster/phlag run out of) and test/ (this
+    module, phlagster.py, and config.json) into a temp dir, so a run_all()
+    call's subprocess invocations -- including the phlagster path, and
+    config.json's CLI defaults -- stay frozen against whatever the source
+    tree looked like when the run started, immune to concurrent edits.
+    """
     import os
     import tempfile
 
-    from .utils import get_repo_root
+    from phlag.utils import get_repo_root
 
-    pkg_dir = pathlib.Path(__file__).parent
+    repo_root = get_repo_root()
     snapshot_root = pathlib.Path(tempfile.mkdtemp(prefix="phlag_snapshot_"))
-    shutil.copytree(
-        pkg_dir, snapshot_root / "phlag",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".ipynb_checkpoints")
+    shutil.copytree(repo_root / "phlag", snapshot_root / "phlag", ignore=ignore)
+    shutil.copytree(repo_root / "test", snapshot_root / "test", ignore=ignore)
     snapshot_env = dict(os.environ)
-    snapshot_env["PHLAG_REPO_ROOT"] = str(get_repo_root())
+    snapshot_env["PHLAG_REPO_ROOT"] = str(repo_root)
     return snapshot_root, snapshot_env
 
 
@@ -1818,7 +1875,7 @@ def run_all(args, sim_root):
     always matches whatever that default currently is without needing to be
     kept in sync here.
     """
-    from .utils import find_mapping_file, load_cli_config
+    from phlag.utils import find_mapping_file, load_cli_config
 
     snapshot_root, snapshot_env = create_source_snapshot()
 
@@ -1893,7 +1950,7 @@ def run_all(args, sim_root):
                 continue
         else:
             phlagster_ok, phlagster_out = run_step(
-                [sys.executable, "-m", "phlag.phlagster", str(fasta_path), "-d", args.dist_type,
+                [sys.executable, "-m", "test.phlagster", str(fasta_path), "-d", args.dist_type,
                  "--no-plots"],
                 "phlagster",
                 cwd=str(snapshot_root), env=snapshot_env,
@@ -1946,7 +2003,7 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "f1"] + [
 ] + ["em_bhattacharyya_distance"] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
-]
+] + ["bic"]
 
 
 def compute_analysis(runs_path, out_path=None):
@@ -2050,7 +2107,9 @@ def summarize(args, sim_root, reuse_dir=False, start_time=None):
     args.run: explicit run number to target (from --run), e.g. to rerun
     stats/figures into an old folder after a code change without disturbing
     other runs' numbering. Same in-place/append semantics as reuse_dir, and
-    takes priority over it.
+    takes priority over it. If the given run number doesn't exist yet, it's
+    created fresh at that exact number rather than falling back to the next
+    auto-allocated one.
 
     start_time: time.perf_counter() value from when the `benchmark` command
     started (main()'s first line) -- used to record how long the run took
@@ -2065,19 +2124,28 @@ def summarize(args, sim_root, reuse_dir=False, start_time=None):
     figure_data = stats.aggregate()
     stats.print_diagnostics(figure_data)
 
-    reuse = reuse_dir or (args.run is not None)
     if args.run is not None:
         out_dir = stats.default_stats_dir() / str(args.run)
-        if not out_dir.exists():
+        if out_dir.exists():
+            reuse = True
+        else:
             print(
-                f"{RED}--run {args.run}: no existing run at {out_dir} to rerun stats on "
-                f"-- creating it fresh instead.{RESET}"
+                f"{RED}--run {args.run}: no existing run at {out_dir} "
+                f"-- creating it fresh.{RESET}"
             )
+            reuse = False
     elif reuse_dir:
         out_dir = stats.latest_run_dir() or stats.next_run_dir()
+        reuse = reuse_dir
     else:
         out_dir = stats.next_run_dir()
+        reuse = False
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    config_src = pathlib.Path(__file__).parent / "config.json"
+    if config_src.exists():
+        shutil.copy2(config_src, out_dir / "config.json")
+        print(f"Wrote config:         {out_dir / 'config.json'}")
 
     report_lines = []
     if args.change:
@@ -2125,7 +2193,7 @@ def main(argv=None):
     start_time = time.perf_counter()
     args = parse_arguments(argv)
 
-    from .utils import get_data_dir
+    from phlag.utils import get_data_dir
 
     sim_root = get_data_dir() / "simulations"
     if not sim_root.exists():

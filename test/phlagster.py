@@ -50,8 +50,8 @@ def parse_arguments(argv=None):
 def main(argv=None):
     args = parse_arguments(argv)
 
-    from . import caster
-    from . import phlag as phlag_main
+    from phlag import caster
+    from phlag import phlag as phlag_main
 
     caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
     print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
