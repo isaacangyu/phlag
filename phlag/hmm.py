@@ -1,3 +1,5 @@
+import math
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -67,7 +69,6 @@ def hmm_backward_filter(
     ],
     log_likelihoods: Float[Array, "num_timesteps num_states"],
     transition_fn: Optional[Callable[[int], Float[Array, "num_states num_states"]]] = None,
-    occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
 ) -> Tuple[Scalar, Float[Array, "num_timesteps num_states"]]:
     num_timesteps, num_states = log_likelihoods.shape
 
@@ -75,7 +76,7 @@ def hmm_backward_filter(
         """Backward filtering step."""
         log_normalizer, backward_pred_probs = carry
         A = get_trans_mat(transition_matrix, transition_fn, t - 1)
-        ll = log_likelihoods[t] + occupancy_bias
+        ll = log_likelihoods[t]
         backward_filt_probs, log_norm = _condition_on(backward_pred_probs, ll)
         log_normalizer += log_norm
         next_backward_pred_probs = _predict(backward_filt_probs, A.T)
@@ -98,14 +99,13 @@ def hmm_filter(
     ],
     log_likelihoods: Float[Array, "num_timesteps num_states"],
     transition_fn: Optional[Callable[[IntScalar], Float[Array, "num_states num_states"]]] = None,
-    occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
 ) -> HMMPosteriorFiltered:
     num_timesteps, num_states = log_likelihoods.shape
 
     def _step(carry, t):
         log_normalizer, predicted_probs = carry
         A = get_trans_mat(transition_matrix, transition_fn, t)
-        ll = log_likelihoods[t] + occupancy_bias
+        ll = log_likelihoods[t]
         filtered_probs, log_norm = _condition_on(predicted_probs, ll)
         log_normalizer += log_norm
         predicted_probs_next = _predict(filtered_probs, A)
@@ -136,16 +136,15 @@ def hmm_two_filter_smoother(
     log_likelihoods: Float[Array, "num_timesteps num_states"],
     transition_fn: Optional[Callable[[IntScalar], Float[Array, "num_states num_states"]]] = None,
     compute_trans_probs: bool = True,
-    occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
 ) -> HMMPosterior:
     post = hmm_filter(
-        initial_distribution, transition_matrix, log_likelihoods, transition_fn, occupancy_bias
+        initial_distribution, transition_matrix, log_likelihoods, transition_fn
     )
     ll = post.marginal_loglik
     filtered_probs, predicted_probs = post.filtered_probs, post.predicted_probs
 
     _, backward_pred_probs = hmm_backward_filter(
-        transition_matrix, log_likelihoods, transition_fn, occupancy_bias
+        transition_matrix, log_likelihoods, transition_fn
     )
 
     # Compute smoothed probabilities
@@ -191,6 +190,11 @@ def gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2):
 
 def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
     return 1.0 - gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
+
+
+def gaussian_hellinger_distance(mu1, Sigma1, mu2, Sigma2):
+    """Hellinger distance, bounded [0, 1]: 0 = identical distributions, 1 = fully separated."""
+    return jnp.sqrt(jnp.clip(gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2), a_min=0.0))
 
 
 class ParamsGMMHMMEmissions(NamedTuple):
@@ -451,31 +455,49 @@ class PhlagHMMEmissions(HMMEmissions):
         emission_dim: int,
         penalty_lambda: float,
         parameterization: Tuple[str, ...],
-        concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
         lm_damping: float = 1.0,
         repulsion_optimizer: str = "lm",
+        penalty_lambda_anneal: bool = False,
+        anneal_boost: float = 2.0,
+        n_iters: int = 10,
+        increment_steps: int = 5,
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
         self.penalty_lambda = penalty_lambda
         self.parameterization = parameterization
-        self.concentration = concentration
         self.lm_damping = lm_damping
         self.repulsion_optimizer = repulsion_optimizer
+        self.penalty_lambda_anneal = penalty_lambda_anneal
+        self.anneal_boost = anneal_boost
+        # t (in exp(-t/anneal_tau), see m_step) is counted in actual inner EM
+        # steps completed, not outer-loop iterations -- phlag.py's outer loop
+        # runs (i+1)*increment_steps inner steps at outer index i, so total
+        # steps over the whole run is the arithmetic-sequence sum below, not
+        # n_iters itself. tau is a third of that total.
+        total_inner_steps = increment_steps * n_iters * (n_iters + 1) // 2
+        self.anneal_tau = max(1, total_inner_steps // 3)
 
-    def set_emission_prior_concentration(
-        self, concentration: Union[Scalar, Float[Array, "num_classes"]]
-    ):
-        self.concentration = concentration
-    
-    def _ensure_concentration_shape(self, num_classes: int):
-        """Ensure concentration has correct shape for the given num_classes."""
-        if jnp.asarray(self.concentration).size == 1:
-            self.concentration = self.concentration * jnp.ones(num_classes)
-        elif jnp.asarray(self.concentration).size != num_classes:
-            raise ValueError(
-                f"Concentration size {jnp.asarray(self.concentration).size} does not match num_classes {num_classes}"
-            )
+        # "Budget mode": un-normalized, the schedule below (1 + boost*exp(-t/tau))
+        # is always >= 1, so penalty_lambda * that is always >= penalty_lambda --
+        # --lam would only ever be a floor the schedule decays toward, never
+        # its average. Instead, precompute the schedule's own time-weighted
+        # mean (weighted by how many inner EM steps run at each t, since t is
+        # held fixed for a whole outer iteration's num_inner steps) and divide
+        # it out, so effective_lambda's average over the whole run equals
+        # exactly penalty_lambda -- --lam becomes a budget spent unevenly
+        # across iterations (elevated early, reduced later) rather than a floor.
+        # Pure Python/math here (not jnp): n_iters/increment_steps/anneal_boost
+        # are all known at construction time, no need to trace this.
+        weighted_exp_sum = 0.0
+        cumulative = 0
+        for i in range(n_iters):
+            num_inner = (i + 1) * increment_steps
+            weighted_exp_sum += math.exp(-cumulative / self.anneal_tau) * num_inner
+            cumulative += num_inner
+        mean_exp = weighted_exp_sum / total_inner_steps if total_inner_steps > 0 else 0.0
+        mean_schedule = 1.0 + anneal_boost * mean_exp
+        self.anneal_budget_scale = 1.0 / mean_schedule if mean_schedule > 0 else 1.0
 
     @property
     def emission_shape(self) -> Tuple[int]:
@@ -545,14 +567,15 @@ class PhlagHMMEmissions(HMMEmissions):
     def initialize_m_step_state(
         self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
     ) -> Any:
-        return None
+        return jnp.array(0.0) if self.penalty_lambda_anneal else None
 
     def update_m_step_state(
         self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
     ) -> Any:
         return None
 
-    def map_estimate_repulsion(self, mu_target, Sigma_target, n, xbar, Sxx):
+    def map_estimate_repulsion(self, mu_target, Sigma_target, n, xbar, Sxx, penalty_lambda=None):
+        penalty_lambda = self.penalty_lambda if penalty_lambda is None else penalty_lambda
         d = xbar.shape[0]
         eps = 1e-6
         # precomputed before optimization
@@ -576,7 +599,7 @@ class PhlagHMMEmissions(HMMEmissions):
             # repulsion silently degenerates to FREE for any well-populated
             # state. Scale the effective penalty by n so it stays proportionate
             # to ll regardless of occupancy.
-            effective_lambda = self.penalty_lambda * n
+            effective_lambda = penalty_lambda * n
             bc = gaussian_bhattacharyya_coefficient(mu, Sigma, mu_target, Sigma_target)
             return -(ll - effective_lambda * bc)  # repulsion: reward small BC, i.e. large Hellinger distance
 
@@ -697,6 +720,22 @@ class PhlagHMMEmissions(HMMEmissions):
             old_means, old_covariances = params.means, params.covariances
             new_means, new_covariances = old_means, old_covariances
 
+            if self.penalty_lambda_anneal:
+                # m_step_state holds the cumulative inner-EM-step count completed
+                # before this fit_em call (held fixed for this whole call's inner
+                # loop -- see PhlagHMM.fit_em/phlag.py's outer loop, which passes
+                # that cumulative count in as outer_iter despite the name).
+                # Budget mode (see anneal_budget_scale in __init__): elevated
+                # early, reduced later, so the run-long average lands on
+                # penalty_lambda exactly -- see map_estimate_repulsion for what
+                # this multiplies.
+                t = m_step_state
+                penalty_lambda_t = self.penalty_lambda * self.anneal_budget_scale * (
+                    1.0 + self.anneal_boost * jnp.exp(-t / self.anneal_tau)
+                )
+            else:
+                penalty_lambda_t = self.penalty_lambda
+
             for s in range(self.num_states):
                 n_s = sum_weights[s]
                 xbar_s = sum_x[s] / (n_s + 1e-12)
@@ -709,7 +748,8 @@ class PhlagHMMEmissions(HMMEmissions):
                 elif mode is EmissionParam.REPULSION:
                     other = 1 - s # assumes 2 states
                     mu_s, Sigma_s = self.map_estimate_repulsion(
-                        old_means[other], old_covariances[other], n_s, xbar_s, Sxx_s
+                        old_means[other], old_covariances[other], n_s, xbar_s, Sxx_s,
+                        penalty_lambda=penalty_lambda_t,
                     )
 
                 new_means = new_means.at[s].set(mu_s)
@@ -729,11 +769,14 @@ class PhlagHMMEmissions(HMMEmissions):
 
     def em_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
         """
-        Bhattacharyya distance between states' fitted Gaussians, averaged over
-        every unordered state pair. Unlike state_divergence (means only, the
-        report's "State divergence" line), this folds both the mean AND the
-        full covariance difference into a single divergence number. Same
-        coefficient map_estimate_repulsion optimizes against.
+        Hellinger distance between states' fitted Gaussians, averaged over
+        every unordered state pair -- bounded to [0, 1], where 0 means the
+        two states are statistically identical and 1 means fully separated
+        (higher is better separation). Unlike state_divergence (means only,
+        the report's "State divergence" line), this folds both the mean AND
+        the full covariance difference into a single number. Derived from the
+        same Bhattacharyya coefficient map_estimate_repulsion optimizes
+        against (Hellinger = sqrt(1 - BC)).
         """
         means = params.means
         covariances = params.covariances
@@ -742,10 +785,10 @@ class PhlagHMMEmissions(HMMEmissions):
         num_pairs = 0
         for i in range(num_states):
             for j in range(i + 1, num_states):
-                bc = gaussian_bhattacharyya_coefficient(
+                dist = gaussian_hellinger_distance(
                     means[i], covariances[i], means[j], covariances[j]
                 )
-                total_distance += -jnp.log(jnp.clip(bc, a_min=1e-30))
+                total_distance += dist
                 num_pairs += 1
         return total_distance / num_pairs
 
@@ -763,10 +806,8 @@ class PhlagHMM(HMM):
         emission_dim: int = 1,
         emission_lambda: Scalar = 1,
         emission_parameterization: Tuple[str, ...] = None,
-        emission_concentration: Union[Scalar, Float[Array, "num_classes"]] = 1.1,
         initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]] = 1.1,
         transition_concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
-        occupancy_bias: Union[Scalar, Float[Array, "num_states"]] = 0.0,
         model_design: str = "gaussian",
         **kwargs,
     ):
@@ -778,14 +819,12 @@ class PhlagHMM(HMM):
         else:
             self.emission_parameterization = ("free",) * self.num_states
 
-        self.emission_concentration = emission_concentration
         self.initial_probs_concentration = initial_probs_concentration
         self.transition_concentration = transition_concentration
 
         self.initial_probs_m_step_state = None
         self.emissions_m_step_state = None
         self.transitions_m_step_state = None
-        self.occupancy_bias = occupancy_bias
         # Cache for fit_em's compiled em_step closure, keyed on the identity of
         # the (props, emissions, inputs) it was built for -- see fit_em.
         self._jit_em_step = None
@@ -810,10 +849,13 @@ class PhlagHMM(HMM):
                 self.num_states,
                 self.emission_dim,
                 penalty_lambda=self.emission_lambda,
-                concentration=self.emission_concentration,
                 parameterization=self.emission_parameterization,
                 lm_damping=kwargs.get("lm_damping", 1.0),
                 repulsion_optimizer=kwargs.get("repulsion_optimizer", "lm"),
+                penalty_lambda_anneal=kwargs.get("penalty_lambda_anneal", False),
+                anneal_boost=kwargs.get("anneal_boost", 2.0),
+                n_iters=kwargs.get("n_iters", 10),
+                increment_steps=kwargs.get("increment_steps", 5),
             )
         super().__init__(
             num_states=self.num_states,
@@ -889,7 +931,7 @@ class PhlagHMM(HMM):
         return self.emission_component.state_divergence(params.emissions)
 
     def em_divergence(self, params: HMMParameterSet) -> Float:
-        """Bhattacharyya distance between states -- gaussian-only, since it
+        """Hellinger distance between states -- gaussian-only, since it
         depends on emission_component.em_divergence (see PhlagHMMEmissions)."""
         return self.emission_component.em_divergence(params.emissions)
 
@@ -925,7 +967,7 @@ class PhlagHMM(HMM):
         inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
     ) -> Tuple[PyTree, Scalar]:
         args = self._inference_args(params, emissions, inputs)
-        posterior = hmm_two_filter_smoother(*args, occupancy_bias=self.occupancy_bias)
+        posterior = hmm_two_filter_smoother(*args)
 
         initial_stats = self.initial_component.collect_suff_stats(params.initial, posterior, inputs)
         transition_stats = self.transition_component.collect_suff_stats(
@@ -943,7 +985,8 @@ class PhlagHMM(HMM):
         emissions,
         inputs=None,
         num_iters=50,
-        verbose=True
+        verbose=True,
+        outer_iter=None,
     ):
         from dynamax.utils.utils import ensure_array_has_batch_dim
 
@@ -966,7 +1009,12 @@ class PhlagHMM(HMM):
         em_step = self._jit_em_step
 
         log_probs = []
-        m_step_state = self.initialize_m_step_state(params, props)
+        if outer_iter is not None:
+            m_step_state = self.initialize_m_step_state(
+                params, props, emissions_m_step_state=jnp.array(float(outer_iter))
+            )
+        else:
+            m_step_state = self.initialize_m_step_state(params, props)
 
         if verbose:
             # Print initial transition matrix

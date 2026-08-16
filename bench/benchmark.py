@@ -14,6 +14,7 @@ and ``phlag.py`` uses for ``PhlagPlotter``):
      draws it. Pure rendering -- no discovery, parsing, or aggregation.
 """
 
+import ast
 import re
 import sys
 import time
@@ -115,6 +116,9 @@ _RE_RELERR_ROW = re.compile(
 _RE_EM_DIVERGENCE = re.compile(
     r'^EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
 )
+_RE_GT_EM_DIVERGENCE = re.compile(
+    r'^Ground truth EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
+)
 _RE_TRANSITION_MATRIX = re.compile(
     r'^Final transition matrix \(after EM\):\s*'
     r'\[\[([-\d.eE+]+),\s*([-\d.eE+]+)\],\s*\[([-\d.eE+]+),\s*([-\d.eE+]+)\]\]\s*$'
@@ -125,6 +129,69 @@ _RE_BIC = re.compile(
     r'^BIC:\s*([-\d.eE+]+)\s*\(log-likelihood=([-\d.eE+]+),\s*'
     r'k=(\d+)\s*trainable params,\s*n=(\d+)\s*windows\)\s*$'
 )
+# Older reports' "--- Bookkeeping ---"/"--- Fitted parameters ..." section --
+# no longer written by phlag.py, but archived reports still carry it, and
+# it's the only way to recompute em_bd exactly for those (see parse_report).
+_RE_FITTED_MEAN = re.compile(r'^(Null|Alt) fitted mean:\s*(\[.+\])\s*$')
+_RE_FITTED_COV = re.compile(r'^(Null|Alt) fitted covariance:\s*(\[\[.+\]\])\s*$')
+
+
+def gaussian_hellinger_distance_1d(mu1, var1, mu2, var2, eps=1e-6):
+    """
+    1D Gaussian Hellinger distance -- var1/var2 are variances (std**2),
+    bounded [0, 1] (0 = identical distributions, 1 = fully separated).
+    Algebraically hmm.gaussian_hellinger_distance reduced to one dimension,
+    kept as a plain-math reimplementation here so this module doesn't need a
+    jax dependency just for this.
+    """
+    sigma_avg = 0.5 * (var1 + var2) + eps
+    log_coef = 0.25 * math.log(var1 + eps) + 0.25 * math.log(var2 + eps) - 0.5 * math.log(sigma_avg)
+    quad = (mu1 - mu2) ** 2 / sigma_avg
+    bc = math.exp(log_coef - 0.125 * quad)
+    return math.sqrt(max(1.0 - bc, 0.0))
+
+
+def gaussian_hellinger_distance_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
+    """
+    General-N Gaussian Hellinger distance (numpy), matching
+    hmm.gaussian_hellinger_distance -- used to recompute em_bd for archived
+    reports whose "EM divergence" header line predates the Hellinger-distance
+    convention, straight from the joint fitted mean/covariance bookkeeping
+    block those older reports still carry.
+    """
+    mu1 = np.asarray(mu1, dtype=float)
+    mu2 = np.asarray(mu2, dtype=float)
+    Sigma1 = np.asarray(Sigma1, dtype=float)
+    Sigma2 = np.asarray(Sigma2, dtype=float)
+    d = mu1.shape[0]
+    Sigma_avg = 0.5 * (Sigma1 + Sigma2) + eps * np.eye(d)
+    diff = mu1 - mu2
+    _, logdet1 = np.linalg.slogdet(Sigma1 + eps * np.eye(d))
+    _, logdet2 = np.linalg.slogdet(Sigma2 + eps * np.eye(d))
+    _, logdet_avg = np.linalg.slogdet(Sigma_avg)
+    log_coef = 0.25 * logdet1 + 0.25 * logdet2 - 0.5 * logdet_avg
+    quad = diff @ np.linalg.solve(Sigma_avg, diff)
+    bc = np.exp(log_coef - 0.125 * quad)
+    return float(np.sqrt(max(1.0 - bc, 0.0)))
+
+
+def hellinger_distance_from_legacy_log_bc(distance_value):
+    """
+    Converts an "EM divergence (Bhattacharyya):" header value written under
+    the original -log(BC) convention (before this repo switched to a
+    Bhattacharyya coefficient, then to a Hellinger distance) into a Hellinger
+    distance: BC = exp(-distance_value), Hellinger = sqrt(1 - BC).
+
+    NOT safe to apply automatically/generally -- a value in [0, 1] is
+    genuinely ambiguous between this legacy convention and a real Hellinger
+    distance already written by current code (they overlap in range), so
+    this is only correct when the report's provenance (e.g. source mtimes,
+    presence/absence of other header lines added or removed at known points)
+    independently confirms it predates the coefficient/Hellinger switch.
+    Only call this with that external confirmation in hand.
+    """
+    bc = math.exp(-distance_value)
+    return math.sqrt(max(1.0 - bc, 0.0))
 
 
 def _parse_branch_length_value(value_str):
@@ -168,7 +235,11 @@ def parse_report(report_path):
         "tpr": None, "fpr": None, "f1": None, "accuracy": None,
         "n_path_entries": None,
         "rel_err": {},
-        "em_bhattacharyya_distance": None,
+        "ground_truth_stats": {},
+        "fitted_null_mean": None, "fitted_null_cov": None,
+        "fitted_alt_mean": None, "fitted_alt_cov": None,
+        "em_bd": None,
+        "em_gt_bd": None,
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
         "caster_source_mtime": None, "phlag_source_mtime": None,
@@ -233,18 +304,49 @@ def parse_report(report_path):
 
             m = _RE_RELERR_ROW.match(line)
             if m:
-                topology, state, statistic, _fitted_str, _gt_str, relerr_str = m.groups()
+                topology, state, statistic, _fitted_str, gt_str, relerr_str = m.groups()
                 try:
                     value = float(relerr_str)
                 except ValueError:
                     value = None
                 if value is not None and not math.isnan(value):
                     parsed["rel_err"][(topology, state.capitalize(), statistic.lower())] = value
+                try:
+                    gt_value = float(gt_str)
+                except ValueError:
+                    gt_value = None
+                if gt_value is not None and not math.isnan(gt_value):
+                    parsed["ground_truth_stats"][(topology, state.capitalize(), statistic.lower())] = gt_value
                 continue
 
             m = _RE_EM_DIVERGENCE.match(line)
             if m:
-                parsed["em_bhattacharyya_distance"] = float(m.group(1))
+                parsed["em_bd"] = float(m.group(1))
+                continue
+
+            m = _RE_GT_EM_DIVERGENCE.match(line)
+            if m:
+                parsed["em_gt_bd"] = float(m.group(1))
+                continue
+
+            m = _RE_FITTED_MEAN.match(line)
+            if m:
+                state, vec_str = m.groups()
+                try:
+                    vec = ast.literal_eval(vec_str)
+                except (ValueError, SyntaxError):
+                    vec = None
+                parsed[f"fitted_{state.lower()}_mean"] = vec
+                continue
+
+            m = _RE_FITTED_COV.match(line)
+            if m:
+                state, mat_str = m.groups()
+                try:
+                    mat = ast.literal_eval(mat_str)
+                except (ValueError, SyntaxError):
+                    mat = None
+                parsed[f"fitted_{state.lower()}_cov"] = mat
                 continue
 
             m = _RE_TRANSITION_MATRIX.match(line)
@@ -274,6 +376,54 @@ def parse_report(report_path):
 
     if parsed["n_windows"] is None and parsed["n_path_entries"] is not None:
         parsed["n_windows"] = parsed["n_path_entries"]
+
+    # em_gt_bd: always recompute from the per-topology GroundTruth mean/std
+    # this table has always carried, rather than trusting a pre-existing
+    # "Ground truth EM divergence" header line -- that line's number could be
+    # from a report written under an earlier convention (Bhattacharyya
+    # coefficient, or -log(BC) distance, before the current Hellinger
+    # distance), and there's no reliable way to tell which just by looking at
+    # the number. Recomputing from the raw per-topology stats sidesteps that
+    # ambiguity entirely and works identically for every report era.
+    if parsed["ground_truth_stats"]:
+        topologies = sorted({topo for (topo, _state, _stat) in parsed["ground_truth_stats"]})
+        distances = []
+        for topo in topologies:
+            try:
+                mu_null = parsed["ground_truth_stats"][(topo, "Null", "mean")]
+                std_null = parsed["ground_truth_stats"][(topo, "Null", "std")]
+                mu_alt = parsed["ground_truth_stats"][(topo, "Alt", "mean")]
+                std_alt = parsed["ground_truth_stats"][(topo, "Alt", "std")]
+            except KeyError:
+                continue
+            distances.append(gaussian_hellinger_distance_1d(mu_null, std_null ** 2, mu_alt, std_alt ** 2))
+        if distances:
+            parsed["em_gt_bd"] = sum(distances) / len(distances)
+
+    # em_bd: same reasoning -- if this report still carries the "Null/Alt
+    # fitted mean/covariance" bookkeeping block, recompute straight from it
+    # instead of trusting the "EM divergence" header line's possibly-stale-
+    # convention number. Reports without that block (not just "written after
+    # it was removed" -- some older reports, predating when it was ever
+    # added, also lack it) fall through to whatever _RE_EM_DIVERGENCE parsed
+    # above.
+    if (
+        parsed["fitted_null_mean"] is not None and parsed["fitted_null_cov"] is not None
+        and parsed["fitted_alt_mean"] is not None and parsed["fitted_alt_cov"] is not None
+    ):
+        parsed["em_bd"] = gaussian_hellinger_distance_nd(
+            parsed["fitted_null_mean"], parsed["fitted_null_cov"],
+            parsed["fitted_alt_mean"], parsed["fitted_alt_cov"],
+        )
+
+    # A Hellinger distance is mathematically bounded to [0, 1] -- a header
+    # line outside that range (with slack for float error) can only be a
+    # relic of an earlier "EM divergence" convention (this report predates
+    # the Hellinger-distance one AND lacks the bookkeeping block needed to
+    # recompute it), not a valid value. Drop it rather than propagate a
+    # number that would blow up downstream error-bar/axis math.
+    if parsed["em_bd"] is not None and not (-1e-6 <= parsed["em_bd"] <= 1 + 1e-6):
+        parsed["em_bd"] = None
 
     return parsed
 
@@ -355,7 +505,8 @@ class RunRecord:
     rel_err: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
     mean_relerr_agg: Optional[float] = None
     covar_relerr_agg: Optional[float] = None
-    em_bhattacharyya_distance: Optional[float] = None
+    em_bd: Optional[float] = None
+    em_gt_bd: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -436,9 +587,9 @@ class RelErrCell:
 @dataclass
 class EmDivergenceCell:
     """
-    One grouped-bar cell of the em_divergence figure: mean Bhattacharyya
-    distance between the fitted Null/Alt states' Gaussians, over the runs
-    in this cell.
+    One grouped-bar cell of the em_divergence figure: mean Hellinger distance
+    between the fitted Null/Alt states' Gaussians, over the runs in this
+    cell.
 
     Same (column, fraction_bin, x_bin) grouping panel A/relerr use, so
     em_divergence.png lines up bucket for bucket with f1.png and relerr.png.
@@ -452,6 +603,11 @@ class EmDivergenceCell:
     err_minus: float
     err_plus: float
     run_ids: List[str] = field(default_factory=list)
+    n_gt_runs: int = 0
+    gt_mean_distance: float = 0.0
+    gt_sd_distance: float = 0.0
+    gt_err_minus: float = 0.0
+    gt_err_plus: float = 0.0
 
 
 @dataclass
@@ -715,7 +871,8 @@ class BenchmarkStats:
             record.mean_relerr_agg = sum(mean_vals) / len(mean_vals) if mean_vals else None
             record.covar_relerr_agg = sum(std_vals) / len(std_vals) if std_vals else None
 
-        record.em_bhattacharyya_distance = parsed["em_bhattacharyya_distance"]
+        record.em_bd = parsed["em_bd"]
+        record.em_gt_bd = parsed["em_gt_bd"]
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
         record.n_trainable_params = parsed["n_trainable_params"]
@@ -777,7 +934,7 @@ class BenchmarkStats:
                 else f"x value {record.x_value} outside every x bin (relerr panel only)"
             )
 
-        if record.x_bin is not None and record.em_bhattacharyya_distance is not None:
+        if record.x_bin is not None and record.em_bd is not None:
             record.in_panel_em_divergence = True
         elif not record.exclusion:
             record.exclusion = (
@@ -862,13 +1019,19 @@ class BenchmarkStats:
         for key, records in panel_em_divergence_groups.items():
             column, fraction_bin, x_bin = key
             mean_dist, sd_dist, dist_minus, dist_plus = summarize_values(
-                [r.em_bhattacharyya_distance for r in records], self.errorbar, low=0.0, high=math.inf
+                [r.em_bd for r in records], self.errorbar, low=0.0, high=1.0
+            )
+            gt_values = [r.em_gt_bd for r in records if r.em_gt_bd is not None]
+            gt_mean_dist, gt_sd_dist, gt_dist_minus, gt_dist_plus = summarize_values(
+                gt_values, self.errorbar, low=0.0, high=1.0
             )
             panel_em_divergence[key] = EmDivergenceCell(
                 column=column, fraction_bin=fraction_bin, x_bin=x_bin, n_runs=len(records),
                 mean_distance=mean_dist, sd_distance=sd_dist,
                 err_minus=dist_minus, err_plus=dist_plus,
                 run_ids=sorted(r.run_id for r in records),
+                n_gt_runs=len(gt_values), gt_mean_distance=gt_mean_dist, gt_sd_distance=gt_sd_dist,
+                gt_err_minus=gt_dist_minus, gt_err_plus=gt_dist_plus,
             )
 
         x_bins_by_column = {}
@@ -923,7 +1086,7 @@ class BenchmarkStats:
         "n_windows", "label_flipped",
         "in_panel_a", "in_panel_b", "in_panel_relerr", "in_panel_em_divergence",
         "mean_relerr_agg", "covar_relerr_agg",
-        "em_bhattacharyya_distance",
+        "em_bd", "em_gt_bd",
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
@@ -989,7 +1152,8 @@ class BenchmarkStats:
                     "in_panel_em_divergence": record.in_panel_em_divergence,
                     "mean_relerr_agg": record.mean_relerr_agg,
                     "covar_relerr_agg": record.covar_relerr_agg,
-                    "em_bhattacharyya_distance": record.em_bhattacharyya_distance,
+                    "em_bd": record.em_bd,
+                    "em_gt_bd": record.em_gt_bd,
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -1159,6 +1323,7 @@ _SERIES_PHLAG = "#2a78d6"
 
 _SERIES_RELERR_MEAN = "#2B4C7E"
 _SERIES_RELERR_COVAR = "#E05A47"
+_SERIES_GT_DIVERGENCE = "#1B998B"
 
 _BAR_WIDTH = 0.62
 _MARKER_SIZE = 8.0
@@ -1226,19 +1391,6 @@ class BenchmarkFigurePlotter:
             ha="center", va="center", fontsize=9, style="italic", color=_INK_MUTED,
         )
 
-    def _footer(self, fig):
-        data = self.data
-        fig.text(
-            0.006, 0.004,
-            f"Phlag {data.dist_type}, window {data.window_size} / step {data.step_size}  |  "
-            f"error bars: {data.errorbar} (F1/TPR/FPR clipped to [0,1]; relerr/divergence unclipped)  |  "
-            f"{data.n_reports_found} reports found, "
-            f"{data.n_runs_panel_a} in panel A, {data.n_runs_panel_b} in panel B, "
-            f"{data.n_runs_relerr} in relerr, {data.n_runs_em_divergence} in em_divergence, "
-            f"{data.n_runs_excluded} excluded",
-            fontsize=6.5, color=_INK_MUTED, ha="left", va="bottom", linespacing=1.5,
-        )
-
     def _bin_colors_for_column(self, column):
         """
         Assigns each of a column's x_bins (e.g. branch-length bins, or the
@@ -1258,31 +1410,6 @@ class BenchmarkFigurePlotter:
         width with empty space.
         """
         return [len(self.data.x_bins_by_column[c]) for c in self.data.columns]
-
-    def _variable_y_axis(self, global_max_top, target_ticks=_N_GRIDLINES, headroom=1.10):
-        """
-        Gridline top/positions for a variable-scale bar panel (relerr,
-        em_divergence) -- unlike panel A/B's fixed [0,1] axis, these scale to
-        whatever the data's max bar is. Picks an integer step (1/2/5/10 x a
-        power of ten) instead of plain linspace(0, max*headroom, n), which
-        produces fractional (decimal) gridline labels, and rounds the top up
-        to the next multiple of that step so the tallest bar (plus its small
-        headroom margin for the "n=" run-count label above it) lands close to
-        the top gridline instead of leaving a lot of empty space above it.
-        """
-        if global_max_top <= 0:
-            return 1.0, np.array([0.0, 1.0])
-
-        raw_top = global_max_top * headroom
-        ideal_step = raw_top / max(target_ticks - 1, 1)
-        magnitude = 10 ** math.floor(math.log10(max(ideal_step, 1)))
-        for mult in (1, 2, 5, 10):
-            step = mult * magnitude
-            if step >= ideal_step:
-                break
-        y_top = math.ceil(raw_top / step) * step
-        yticks = np.arange(0, y_top + step / 2, step)
-        return y_top, yticks
 
     def _int_yaxis(self, ax):
         ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _pos: f"{v:.0f}"))
@@ -1346,7 +1473,7 @@ class BenchmarkFigurePlotter:
                 else:
                     ax.tick_params(axis="x", labelbottom=False)
                 if col_idx == 0:
-                    ax.set_ylabel(f"F1   |   affected fraction {fraction_bin}", fontsize=8.5)
+                    ax.set_ylabel(f"alt proportion {fraction_bin}", fontsize=8.5)
                 else:
                     ax.tick_params(axis="y", labelleft=False)
 
@@ -1355,7 +1482,6 @@ class BenchmarkFigurePlotter:
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
         fig.tight_layout(rect=[0, 0.03, 1, 0.97])
-        self._footer(fig)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1444,7 +1570,7 @@ class BenchmarkFigurePlotter:
                 else:
                     ax.tick_params(axis="x", labelbottom=False)
                 if col_idx == 0:
-                    ax.set_ylabel(f"TPR   |   affected fraction {fraction_bin}", fontsize=8.5)
+                    ax.set_ylabel(f"TPR   |   alt proportion {fraction_bin}", fontsize=8.5)
                 else:
                     ax.tick_params(axis="y", labelleft=False)
 
@@ -1474,19 +1600,12 @@ class BenchmarkFigurePlotter:
         pair_offset = _BAR_WIDTH * 0.27
         pair_width = _BAR_WIDTH * 0.42
 
-        global_max_top = 0.0
-        for fraction_bin in data.fraction_bins:
-            for column in data.columns:
-                for x_bin in data.x_bins_by_column[column]:
-                    cell = data.panel_relerr.get((column, fraction_bin, x_bin))
-                    if cell is None or cell.n_runs == 0:
-                        continue
-                    global_max_top = max(
-                        global_max_top,
-                        cell.mean_relerr + cell.mean_relerr_err_plus,
-                        cell.covar_relerr + cell.covar_relerr_err_plus,
-                    )
-        y_top, yticks = self._variable_y_axis(global_max_top)
+        # Fixed axis -- relerr is a percentage, so a consistent 0-150 scale
+        # with every-25 gridlines makes cells comparable at a glance instead
+        # of rescaling per run. Bars/whiskers past 150 are simply clipped at
+        # the top edge.
+        y_top = 150.0
+        yticks = np.arange(0, 151, 25)
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1557,7 +1676,7 @@ class BenchmarkFigurePlotter:
                 else:
                     ax.tick_params(axis="x", labelbottom=False)
                 if col_idx == 0:
-                    ax.set_ylabel(f"Rel.err(%)   |   affected fraction {fraction_bin}", fontsize=8.5)
+                    ax.set_ylabel(f"alt proportion {fraction_bin}", fontsize=8.5)
                 else:
                     ax.tick_params(axis="y", labelleft=False)
 
@@ -1580,7 +1699,6 @@ class BenchmarkFigurePlotter:
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
         fig.tight_layout(rect=[0, 0.03, 1, 0.93])
-        self._footer(fig)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1590,25 +1708,28 @@ class BenchmarkFigurePlotter:
 
     def render_em_divergence(self, filename="em_divergence.png"):
         """
-        Same grid as f1.png/relerr.png: one bar per x_bin, colored the same
-        way f1.png colors its bars. Bar height is the mean Bhattacharyya
-        distance between the fitted Null/Alt states' Gaussians
-        (hmm.PhlagHMMEmissions.em_divergence) -- higher means the two states
-        pulled further apart. This is state separation, not detection
-        performance or fit quality, and (unlike F1) is not bounded to [0,1].
+        Same grid as f1.png/relerr.png: one paired bar per x_bin. The left
+        (bin-colored, same ramp as f1.png) bar is the mean Hellinger distance
+        between the fitted Null/Alt states' Gaussians
+        (hmm.PhlagHMMEmissions.em_divergence) -- bounded [0, 1], where 0 means
+        the two states are statistically identical and 1 means fully
+        separated (higher is better separation). This is state separation,
+        not detection performance or fit quality.
+
+        The right (fixed teal) bar is the same distance computed directly on
+        the ground-truth Null/Alt split instead of the fitted states -- the
+        per-topology marginal average described at RunRecord.em_gt_bd -- so a
+        cell where the model's fitted states are less separated than the
+        ground truth's inherent separation (fitted bar shorter than ground
+        truth) is visible at a glance, not just inferable from F1.
         """
+        import matplotlib.patches as mpatches
+
         data = self.data
         n_rows, n_cols = len(data.fraction_bins), len(data.columns)
 
-        global_max_top = 0.0
-        for fraction_bin in data.fraction_bins:
-            for column in data.columns:
-                for x_bin in data.x_bins_by_column[column]:
-                    cell = data.panel_em_divergence.get((column, fraction_bin, x_bin))
-                    if cell is None or cell.n_runs == 0:
-                        continue
-                    global_max_top = max(global_max_top, cell.mean_distance + cell.err_plus)
-        y_top, yticks = self._variable_y_axis(global_max_top)
+        pair_offset = _BAR_WIDTH * 0.27
+        pair_width = _BAR_WIDTH * 0.42
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1626,9 +1747,8 @@ class BenchmarkFigurePlotter:
 
                 self._style_axes(ax)
                 ax.set_xlim(-0.7, len(x_bins) - 0.3)
-                ax.set_ylim(0.0, y_top)
-                ax.set_yticks(yticks)
-                self._int_yaxis(ax)
+                ax.set_ylim(0.0, 1.18)
+                ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
                 ax.set_xticks(list(range(len(x_bins))))
                 ax.set_xticklabels(x_bins, rotation=30, ha="right", fontsize=7.5)
 
@@ -1640,17 +1760,32 @@ class BenchmarkFigurePlotter:
                     drew_any = True
 
                     ax.bar(
-                        pos, cell.mean_distance, width=_BAR_WIDTH,
+                        pos - pair_offset, cell.mean_distance, width=pair_width,
                         color=color_for_bin[x_bin],
-                        edgecolor=_SURFACE, linewidth=1.2, zorder=2,
+                        edgecolor=_SURFACE, linewidth=1.0, zorder=2,
                     )
                     ax.errorbar(
-                        pos, cell.mean_distance,
+                        pos - pair_offset, cell.mean_distance,
                         yerr=[[cell.err_minus], [cell.err_plus]],
                         fmt="none", ecolor=_INK_SECONDARY,
-                        elinewidth=1.2, capsize=3, capthick=1.2, zorder=3,
+                        elinewidth=1.0, capsize=2.5, capthick=1.0, zorder=3,
                     )
                     top = cell.mean_distance + cell.err_plus
+
+                    if cell.n_gt_runs > 0:
+                        ax.bar(
+                            pos + pair_offset, cell.gt_mean_distance, width=pair_width,
+                            color=_SERIES_GT_DIVERGENCE,
+                            edgecolor=_SURFACE, linewidth=1.0, zorder=2,
+                        )
+                        ax.errorbar(
+                            pos + pair_offset, cell.gt_mean_distance,
+                            yerr=[[cell.gt_err_minus], [cell.gt_err_plus]],
+                            fmt="none", ecolor=_INK_SECONDARY,
+                            elinewidth=1.0, capsize=2.5, capthick=1.0, zorder=3,
+                        )
+                        top = max(top, cell.gt_mean_distance + cell.gt_err_plus)
+
                     ax.text(
                         pos, top * 1.03, f"n={cell.n_runs}",
                         ha="center", va="bottom", fontsize=6.5, color=_INK_MUTED,
@@ -1666,16 +1801,23 @@ class BenchmarkFigurePlotter:
                 else:
                     ax.tick_params(axis="x", labelbottom=False)
                 if col_idx == 0:
-                    ax.set_ylabel(f"Bhattacharyya distance   |   affected fraction {fraction_bin}", fontsize=8.5)
+                    ax.set_ylabel(f"alt proportion {fraction_bin}", fontsize=8.5)
                 else:
                     ax.tick_params(axis="y", labelleft=False)
 
+        fitted_proxy = mpatches.Patch(color=_SERIES_PHLAG, alpha=0.85, label="Fitted (Null/Alt EM states, bin-colored)")
+        gt_proxy = mpatches.Patch(color=_SERIES_GT_DIVERGENCE, label="Ground truth (Null/Alt split)")
+        fig.legend(
+            handles=[fitted_proxy, gt_proxy],
+            loc="upper right", bbox_to_anchor=(0.995, 0.97),
+            fontsize=7.5, framealpha=0.9,
+        )
+
         fig.suptitle(
-            "Phlag EM state separation: Bhattacharyya distance between fitted Null/Alt states",
+            "Phlag EM state separation: Hellinger distance, fitted vs. ground truth",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.03, 1, 0.97])
-        self._footer(fig)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.93])
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1816,7 +1958,7 @@ def run_step(cmd, label, cwd=None, env=None):
 
 def create_source_snapshot():
     """
-    Copies both phlag/ (the package caster/phlag run out of) and test/ (this
+    Copies both phlag/ (the package caster/phlag run out of) and bench/ (this
     module, phlagster.py, and config.json) into a temp dir, so a run_all()
     call's subprocess invocations -- including the phlagster path, and
     config.json's CLI defaults -- stay frozen against whatever the source
@@ -1831,7 +1973,7 @@ def create_source_snapshot():
     snapshot_root = pathlib.Path(tempfile.mkdtemp(prefix="phlag_snapshot_"))
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".ipynb_checkpoints")
     shutil.copytree(repo_root / "phlag", snapshot_root / "phlag", ignore=ignore)
-    shutil.copytree(repo_root / "test", snapshot_root / "test", ignore=ignore)
+    shutil.copytree(repo_root / "bench", snapshot_root / "bench", ignore=ignore)
     snapshot_env = dict(os.environ)
     snapshot_env["PHLAG_REPO_ROOT"] = str(repo_root)
     return snapshot_root, snapshot_env
@@ -1950,7 +2092,7 @@ def run_all(args, sim_root):
                 continue
         else:
             phlagster_ok, phlagster_out = run_step(
-                [sys.executable, "-m", "test.phlagster", str(fasta_path), "-d", args.dist_type,
+                [sys.executable, "-m", "bench.phlagster", str(fasta_path), "-d", args.dist_type,
                  "--no-plots"],
                 "phlagster",
                 cwd=str(snapshot_root), env=snapshot_env,
@@ -2000,7 +2142,7 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "f1"] + [
     for topo in TOPOLOGY_NAMES
     for state in RELERR_STATES
     for stat in RELERR_STATISTICS
-] + ["em_bhattacharyya_distance"] + [
+] + ["em_bd", "em_gt_bd"] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
 ] + ["bic"]
@@ -2053,7 +2195,7 @@ def compute_analysis(runs_path, out_path=None):
     if out_path is None:
         out_path = runs_path.parent / "analysis.tsv"
     out_path = pathlib.Path(out_path)
-    analysis_df.to_csv(out_path, sep="\t", index=False)
+    analysis_df.to_csv(out_path, sep="\t", index=False, float_format="%.6g")
     return analysis_df, out_path
 
 

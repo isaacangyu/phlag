@@ -57,8 +57,8 @@ def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
 
 
 def format_rel_err(value):
-    """Formats a report table numeric value to 4 decimals."""
-    return f"{value:.4f}"
+    """Formats a report table numeric value to 6 significant figures."""
+    return f"{value:.6g}"
 
 
 def count_trainable_params(params, props):
@@ -777,7 +777,7 @@ class Phlag:
         accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
         f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
 
-        metrics_str = f"TPR: {tpr:.4f}, FPR: {fpr:.4f}, F1: {f1:.4f}, Accuracy: {accuracy:.4f}"
+        metrics_str = f"TPR: {tpr:.6g}, FPR: {fpr:.6g}, F1: {f1:.6g}, Accuracy: {accuracy:.6g}"
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -800,13 +800,13 @@ class Phlag:
             if branch_len is None:
                 headers.append(f"Branch length (CU): N/A (no population-information.tsv row for clade '{clade_name}')")
             else:
-                headers.append(f"Branch length (CU, node '{clade_name}'): {branch_len:.6f}")
+                headers.append(f"Branch length (CU, node '{clade_name}'): {branch_len:.6g}")
         else:
             headers.append("Branch length (CU): N/A")
 
         if pop_info:
             try:
-                headers.append(f"Height (Ngen): {float(pop_info.get('HEIGHT_NGEN')):.4f}")
+                headers.append(f"Height (Ngen): {float(pop_info.get('HEIGHT_NGEN')):.6g}")
             except (TypeError, ValueError):
                 headers.append("Height (Ngen): N/A")
             try:
@@ -818,7 +818,7 @@ class Phlag:
             headers.append("Clade size: N/A")
 
         # Self-describing ground-truth/evaluation summary. These lines let downstream
-        # consumers (test.benchmark) read the anomaly fraction and the eval-time
+        # consumers (bench.benchmark) read the anomaly fraction and the eval-time
         # label polarity straight out of the report, instead of re-deriving them from
         # the locus pattern -- the fraction in particular is not a pure function of
         # the pattern string, since it depends on where the actual window grid
@@ -826,10 +826,10 @@ class Phlag:
         n_windows = int(len(y_true))
         n_anomaly = int(np.sum(y_true == 1))
         anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
-        headers.append(f"Anomaly fraction: {anomaly_fraction:.6f} ({n_anomaly}/{n_windows} windows)")
+        headers.append(f"Anomaly fraction: {anomaly_fraction:.6g} ({n_anomaly}/{n_windows} windows)")
         headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
 
-        # Source mtimes at report-generation time -- let test.benchmark's run_all()
+        # Source mtimes at report-generation time -- let bench.benchmark's run_all()
         # detect a stale report (caster.py or phlag.py/hmm.py edited since this report
         # was written) and rerun just the stage whose source actually changed, instead
         # of relying purely on report.tsv/scores.tsv presence.
@@ -841,36 +841,51 @@ class Phlag:
 
         headers.append("State divergence: " + emission_divergence_str)
         if em_bhattacharyya_distance is not None:
-            headers.append(f"EM divergence (Bhattacharyya): {em_bhattacharyya_distance:.6f}")
+            headers.append(f"EM divergence (Bhattacharyya): {em_bhattacharyya_distance:.6g}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
-            tm_before_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in self.initial_transition_matrix.tolist())
+            tm_before_str = ", ".join(f"[{', '.join(f'{x:.6g}' for x in row)}]" for row in self.initial_transition_matrix.tolist())
             headers.append(f"Initial transition matrix (before EM): [{tm_before_str}]")
-        tm_after_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in transition_matrix_np.tolist())
+        tm_after_str = ", ".join(f"[{', '.join(f'{x:.6g}' for x in row)}]" for row in transition_matrix_np.tolist())
         headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
 
         if hasattr(self, "final_em_log_prob"):
-            headers.append(f"EM final joint log-likelihood: {self.final_em_log_prob:.6f}")
+            headers.append(f"EM final joint log-likelihood: {self.final_em_log_prob:.6g}")
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
-            f"BIC: {bic:.6f} (log-likelihood={marginal_ll:.6f}, k={k_params} trainable params, n={n_obs} windows)"
+            f"BIC: {bic:.6g} (log-likelihood={marginal_ll:.6g}, k={k_params} trainable params, n={n_obs} windows)"
         )
 
         headers.append(f"{metrics_str}")
-        headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
             headers.append("Topology\tState\tStatistic\tFitted\tGroundTruth\tRel.err(%)")
+            # State index 0/1 is an arbitrary EM cluster label, not a fixed
+            # Null/Alt identity -- flipped_for_eval (established above from
+            # which orientation matches y_true) says which physical state
+            # behaves like Null vs Alt, so route each into the ground-truth
+            # comparison it actually corresponds to instead of assuming
+            # state 0 is always Null.
+            null_state, alt_state = (1, 0) if flipped_for_eval else (0, 1)
+            # Per-topology (marginal, univariate) ground-truth Hellinger
+            # distance, averaged across topologies -- the ground-truth split
+            # only gives per-topology mean/std (no cross-topology covariance),
+            # so unlike the fitted EM divergence (joint over all topologies at
+            # once) this is an average of marginals. Same measure
+            # hmm.PhlagHMMEmissions.em_divergence uses (bounded [0, 1], 0 =
+            # statistically identical, 1 = fully separated), so the two
+            # numbers are on a comparable scale.
+            gt_divergences = []
             for d in sorted(self.ground_truth_fits.keys()):
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
-                mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, 0, d, np.array([0.0]))
-                mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, 1, d, np.array([0.0]))
+                mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, null_state, d, np.array([0.0]))
+                mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, alt_state, d, np.array([0.0]))
                 rel_mu_null = (mu_null_fit - mu_null_gt) / mu_null_gt * 100 if mu_null_gt != 0 else float('nan')
                 rel_std_null = (std_null_fit - std_null_gt) / std_null_gt * 100 if std_null_gt != 0 else float('nan')
                 rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt * 100 if mu_alt_gt != 0 else float('nan')
@@ -880,29 +895,18 @@ class Phlag:
                 headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
                 headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(mu_alt_fit)}\t{format_rel_err(mu_alt_gt)}\t{format_rel_err(rel_mu_alt)}")
                 headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(std_alt_fit)}\t{format_rel_err(std_alt_gt)}\t{format_rel_err(rel_std_alt)}")
+                hellinger_gt = hmm.gaussian_hellinger_distance(
+                    jnp.array([mu_null_gt]), jnp.array([[std_null_gt ** 2]]),
+                    jnp.array([mu_alt_gt]), jnp.array([[std_alt_gt ** 2]]),
+                )
+                gt_divergences.append(float(hellinger_gt))
+            if gt_divergences:
+                headers.append(f"Ground truth EM divergence (Bhattacharyya): {sum(gt_divergences) / len(gt_divergences):.6g}")
         for idx, l in enumerate(path_likelihoods):
-            headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6f}")
+            headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6g}")
 
-        if self.args.model_design == "gaussian":
-            fitted_means = np.array(self.params.emissions.means)
-            fitted_covariances = np.array(self.params.emissions.covariances)
-            headers.append(f"--- Fitted parameters (bookkeeping, source mtime {_phlag_mtime:.6f}) ---")
-            for state_idx, state_name in enumerate(("Null", "Alt")):
-                mean_str = "[" + ", ".join(f"{x:.6f}" for x in fitted_means[state_idx].tolist()) + "]"
-                cov_str = "[" + ", ".join(
-                    f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in fitted_covariances[state_idx].tolist()
-                ) + "]"
-                headers.append(f"{state_name} fitted mean: {mean_str}")
-                headers.append(f"{state_name} fitted covariance: {cov_str}")
-            predicted_path = (1 - paths[0]) if flipped_for_eval else paths[0]
-            n_predicted_alt = int(np.sum(predicted_path == 1))
-            n_predicted_null = n_windows - n_predicted_alt
-            predicted_anomaly_fraction = (n_predicted_alt / n_windows) if n_windows > 0 else 0.0
-            headers.append(f"Predicted states: Null={n_predicted_null}, Alt={n_predicted_alt}")
-            headers.append(
-                f"Predicted anomaly fraction: {predicted_anomaly_fraction:.6f} "
-                f"({n_predicted_alt}/{n_windows} windows)"
-            )
+        headers.append("--- Bookkeeping ---")
+        headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
 
         self.output_str += "\n" + "\n".join(headers)
 
@@ -994,35 +998,30 @@ class Phlag:
     def initialize_hmm(self):
         # Prior hyperparameters
         self.emission_lambda = self.args.emission_lambda
-        self.gamma = 1.1
         self.nu = 1.1
-        eta = 0.5
-        
+
         # Generic Dirichlet structure setup for continuous emission tracking
         self.psi = jnp.ones((NUM_STATES, NUM_STATES)) + PSI_EPS
-        self.occupancy_bias = jnp.zeros(NUM_STATES)
-        self.occupancy_bias = self.occupancy_bias.at[-1].set(
-            -jnp.log((1 - eta) / (eta))
-        )
-        
+
         self.emission_parameterization = (
             self.args.null_emission_parameterization,
             self.args.alt_emission_parameterization,
         )
-        
+
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
             self.Y.shape[-1],
             emission_lambda=self.emission_lambda,
-            emission_concentration=self.gamma,
             emission_parameterization=self.emission_parameterization,
             initial_probs_concentration=self.nu,
             transition_concentration=self.psi,
-            occupancy_bias=self.occupancy_bias,
             model_design=self.args.model_design,
             num_mixtures=getattr(self, "num_mixtures", 2),
             lm_damping=self.args.lm_damping,
             repulsion_optimizer=self.args.repulsion_optimizer,
+            penalty_lambda_anneal=self.args.annealing,
+            n_iters=self.args.n_iters,
+            increment_steps=self.args.increment_steps,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1082,6 +1081,7 @@ class Phlag:
         tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
         tqdm.write(f"Initial Transition matrix: {tm_init_str}")
 
+        cumulative_inner_steps = 0
         for i in tqdm(range(self.n_iters)):
             num_inner = (i + 1) * self.increment_steps
             self.params, log_probs = self.hmm.fit_em(
@@ -1090,7 +1090,14 @@ class Phlag:
                 self.Y,
                 num_iters=num_inner,
                 verbose=False,
+                # Annealing's decay clock runs on actual EM steps completed,
+                # not outer-loop index -- since num_inner grows every outer
+                # iteration (arithmetic sequence), an outer index of e.g. 3
+                # doesn't mean the same "amount of training" regardless of
+                # where it falls in the schedule.
+                outer_iter=cumulative_inner_steps if self.args.annealing else None,
             )
+            cumulative_inner_steps += num_inner
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
             tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str}")
@@ -1161,7 +1168,7 @@ def backfill_branch_length(root_dir=None):
         with open(report_path, "r") as f:
             lines = f.read().splitlines()
 
-        new_line = f"Branch length (CU, node '{clade_name}'): {branch_len:.6f}"
+        new_line = f"Branch length (CU, node '{clade_name}'): {branch_len:.6g}"
         for idx, line in enumerate(lines):
             if branch_length_line_re.match(line.strip()):
                 lines[idx] = new_line
@@ -1729,6 +1736,22 @@ def parse_arguments(argv=None):
         help="""Optimizer the REPULSION emission parameterization's joint MAP fit
                     uses (default: lm): lm (Levenberg-Marquardt/damped Newton, see
                     --mu) or gd (plain fixed-step gradient descent).""",
+    )
+    hmm_group.add_argument(
+        "--annealing",
+        dest="annealing",
+        action="store_true",
+        help="""Anneal the REPULSION emission parameterization's penalty lambda across
+                    outer EM iterations, "budget mode": the schedule
+                    penalty_lambda * (1 + 2*exp(-t/tau)) starts elevated and decays as t
+                    grows (t = inner EM steps completed so far, not the outer iteration
+                    index -- inner steps per outer iteration grow as an arithmetic
+                    sequence, so this tracks actual training progress; tau is a third of
+                    the run's total inner steps), then the whole schedule is rescaled so
+                    its time-weighted average across the run equals exactly the base
+                    --lam value -- --lam is a budget spent unevenly (more early, less
+                    late), not a floor the schedule decays toward (default: off, fixed
+                    --lam throughout).""",
     )
     hmm_group.add_argument(
         "--mu",

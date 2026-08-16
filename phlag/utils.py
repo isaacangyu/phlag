@@ -621,7 +621,7 @@ def get_repo_root():
 def load_cli_config(tool_name):
     """
     Returns (variable_tokens, fixed_tokens) -- flat lists of raw CLI flag
-    tokens -- for tool_name ("caster" or "phlag") from test/config.json,
+    tokens -- for tool_name ("caster" or "phlag") from bench/config.json,
     sibling to phlag/ in whichever tree this module is physically running
     from. Deliberately resolved relative to this file rather than via
     get_repo_root() (which honors a PHLAG_REPO_ROOT override) -- that keeps
@@ -634,7 +634,7 @@ def load_cli_config(tool_name):
     import json
     import pathlib
 
-    config_path = pathlib.Path(__file__).resolve().parent.parent / "test" / "config.json"
+    config_path = pathlib.Path(__file__).resolve().parent.parent / "bench" / "config.json"
     if not config_path.exists():
         return [], []
 

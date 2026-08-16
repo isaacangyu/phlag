@@ -5,6 +5,6 @@
   },
   "phlag": {
     "fixed": [],
-    "variable": ["--np", "free", "--ap", "repulsion", "--lam", "1", "--annealing", "--double-variance-init", "--repulsion-optimizer", "lm"]
+    "variable": ["--np", "free", "--ap", "repulsion", "--lam", "1", "--annealing", "--repulsion-optimizer", "lm"]
   }
 }
