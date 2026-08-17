@@ -6,5 +6,9 @@
   "phlag": {
     "fixed": [],
     "variable": ["--np", "free", "--ap", "repulsion", "--lam", "1", "--annealing", "--repulsion-optimizer", "lm"]
+  },
+  "benchmark": {
+    "fixed": [],
+    "variable": ["--base", "gaussian/repulsion/w50k_s1k"]
   }
 }

@@ -458,7 +458,7 @@ class PhlagHMMEmissions(HMMEmissions):
         lm_damping: float = 1.0,
         repulsion_optimizer: str = "lm",
         penalty_lambda_anneal: bool = False,
-        anneal_boost: float = 2.0,
+        anneal_boost: float = 1.0,
         n_iters: int = 10,
         increment_steps: int = 5,
     ):
@@ -567,7 +567,11 @@ class PhlagHMMEmissions(HMMEmissions):
     def initialize_m_step_state(
         self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
     ) -> Any:
-        return jnp.array(0.0) if self.penalty_lambda_anneal else None
+        # (annealing clock t, cumulative LM step-norm clip activations,
+        # cumulative LM attempts taken) -- t is only read when
+        # penalty_lambda_anneal is on, but the clip counters are always
+        # tracked so fit_em can surface gradient-clip diagnostics regardless.
+        return (jnp.array(0.0), jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32))
 
     def update_m_step_state(
         self, params: ParamsGaussianHMMEmissions, props: ParamsGaussianHMMEmissions
@@ -646,6 +650,10 @@ class PhlagHMMEmissions(HMMEmissions):
             # lax.fori_loop instead of a Python loop so the 100 steps don't
             # unroll into the jit trace of the outer EM step.
             flat_final = lax.fori_loop(0, 100, gd_step, flat0)
+            # Plain GD has no step-norm clip -- the concept doesn't apply to
+            # this path, so it contributes no clip activations or attempts.
+            clip_count = jnp.array(0, dtype=jnp.int32)
+            clip_attempts = jnp.array(0, dtype=jnp.int32)
         else:
             hess_flat = jax.hessian(flat_obj)
 
@@ -663,7 +671,7 @@ class PhlagHMMEmissions(HMMEmissions):
             damping0 = self.lm_damping
 
             def step(_, carry):
-                flat, damping = carry
+                flat, damping, clip_count, clip_attempts = carry
                 g = grad_flat(flat)
                 H = hess_flat(flat)
                 obj0 = flat_obj(flat)
@@ -675,43 +683,52 @@ class PhlagHMMEmissions(HMMEmissions):
                     # just objective value, the same gap plain backtracking had.
                     delta_norm = jnp.linalg.norm(delta)
                     clip_scale = jnp.minimum(1.0, max_step_norm / (delta_norm + 1e-12))
+                    clipped = (clip_scale < 1.0).astype(jnp.int32)
                     delta = delta * clip_scale
                     flat_new = flat + delta
                     obj_new = flat_obj(flat_new)
-                    return flat_new, obj_new
+                    return flat_new, obj_new, clipped
 
                 def cond_fn(state):
-                    damping, n_tries, _, obj_new = state
+                    damping, n_tries, _, obj_new, _ = state
                     worse = jnp.logical_or(jnp.isnan(obj_new), obj_new > obj0)
                     return jnp.logical_and(worse, n_tries < max_lm_tries)
 
                 def body_fn(state):
-                    damping, n_tries, _, _ = state
+                    damping, n_tries, _, _, clip_acc = state
                     damping = damping * 10.0
-                    flat_new, obj_new = lm_try(damping)
-                    return (damping, n_tries + 1, flat_new, obj_new)
+                    flat_new, obj_new, clipped = lm_try(damping)
+                    return (damping, n_tries + 1, flat_new, obj_new, clip_acc + clipped)
 
-                flat_new0, obj_new0 = lm_try(damping)
-                damping_f, _, flat_f, _ = lax.while_loop(
-                    cond_fn, body_fn, (damping, 0, flat_new0, obj_new0)
+                flat_new0, obj_new0, clipped0 = lm_try(damping)
+                damping_f, n_tries_f, flat_f, _, clip_acc_f = lax.while_loop(
+                    cond_fn, body_fn,
+                    (damping, jnp.array(0, dtype=jnp.int32), flat_new0, obj_new0, clipped0),
                 )
                 damping_next = jnp.maximum(damping_f * 0.5, 1e-7)
 
                 mu_new, L_new = unravel(flat_f)
                 L_new = clamp_L(L_new)
                 flat_clamped, _ = ravel_pytree((mu_new, L_new))
-                return (flat_clamped, damping_next)
+                # n_tries_f counts only the while_loop's retries -- +1 accounts
+                # for the initial lm_try that seeded its carry before any
+                # retry ran, so every step contributes at least one attempt.
+                return (flat_clamped, damping_next, clip_count + clip_acc_f, clip_attempts + n_tries_f + 1)
 
             # lax.fori_loop instead of a Python loop so the 100 steps don't
             # unroll into the jit trace of the outer EM step.
-            flat_final, _ = lax.fori_loop(0, 100, step, (flat0, damping0)) # why fixed at 100?
+            flat_final, _, clip_count, clip_attempts = lax.fori_loop(
+                0, 100, step,
+                (flat0, damping0, jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32)),
+            ) # why fixed at 100?
 
         mu, L = unravel(flat_final)
 
         Sigma = L @ L.T + eps * jnp.eye(d)
-        return mu, Sigma
+        return mu, Sigma, clip_count, clip_attempts
 
     def m_step(self, params, props, batch_stats, m_step_state):
+        t, clip_count, clip_attempts = m_step_state
         if props.means.trainable or props.covariances.trainable:
             stats = pytree_sum(batch_stats, axis=0)
             sum_weights, sum_x, sum_xxT = stats["sum_weights"], stats["sum_x"], stats["sum_xxT"]
@@ -721,15 +738,14 @@ class PhlagHMMEmissions(HMMEmissions):
             new_means, new_covariances = old_means, old_covariances
 
             if self.penalty_lambda_anneal:
-                # m_step_state holds the cumulative inner-EM-step count completed
-                # before this fit_em call (held fixed for this whole call's inner
+                # t holds the cumulative inner-EM-step count completed before
+                # this fit_em call (held fixed for this whole call's inner
                 # loop -- see PhlagHMM.fit_em/phlag.py's outer loop, which passes
                 # that cumulative count in as outer_iter despite the name).
                 # Budget mode (see anneal_budget_scale in __init__): elevated
                 # early, reduced later, so the run-long average lands on
                 # penalty_lambda exactly -- see map_estimate_repulsion for what
                 # this multiplies.
-                t = m_step_state
                 penalty_lambda_t = self.penalty_lambda * self.anneal_budget_scale * (
                     1.0 + self.anneal_boost * jnp.exp(-t / self.anneal_tau)
                 )
@@ -747,15 +763,18 @@ class PhlagHMMEmissions(HMMEmissions):
                     Sigma_s = Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, xbar_s) + 1e-5 * jnp.eye(self.emission_dim)
                 elif mode is EmissionParam.REPULSION:
                     other = 1 - s # assumes 2 states
-                    mu_s, Sigma_s = self.map_estimate_repulsion(
+                    mu_s, Sigma_s, clip_count_s, clip_attempts_s = self.map_estimate_repulsion(
                         old_means[other], old_covariances[other], n_s, xbar_s, Sxx_s,
                         penalty_lambda=penalty_lambda_t,
                     )
+                    clip_count = clip_count + clip_count_s
+                    clip_attempts = clip_attempts + clip_attempts_s
 
                 new_means = new_means.at[s].set(mu_s)
                 new_covariances = new_covariances.at[s].set(Sigma_s)
 
             params = params._replace(means=new_means, covariances=new_covariances)
+        m_step_state = (t, clip_count, clip_attempts)
         return params, m_step_state
 
     def state_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
@@ -853,7 +872,6 @@ class PhlagHMM(HMM):
                 lm_damping=kwargs.get("lm_damping", 1.0),
                 repulsion_optimizer=kwargs.get("repulsion_optimizer", "lm"),
                 penalty_lambda_anneal=kwargs.get("penalty_lambda_anneal", False),
-                anneal_boost=kwargs.get("anneal_boost", 2.0),
                 n_iters=kwargs.get("n_iters", 10),
                 increment_steps=kwargs.get("increment_steps", 5),
             )
@@ -1010,8 +1028,16 @@ class PhlagHMM(HMM):
 
         log_probs = []
         if outer_iter is not None:
+            # Clip counters always start fresh for this fit_em call (matches
+            # the non-annealed branch below) -- only the annealing clock t is
+            # explicitly seeded from outer_iter.
             m_step_state = self.initialize_m_step_state(
-                params, props, emissions_m_step_state=jnp.array(float(outer_iter))
+                params, props,
+                emissions_m_step_state=(
+                    jnp.array(float(outer_iter)),
+                    jnp.array(0, dtype=jnp.int32),
+                    jnp.array(0, dtype=jnp.int32),
+                ),
             )
         else:
             m_step_state = self.initialize_m_step_state(params, props)
@@ -1032,4 +1058,14 @@ class PhlagHMM(HMM):
                 tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
                 print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")
 
-        return params, jnp.array(log_probs)
+        # Gradient clip diagnostics only exist for gaussian/REPULSION fits --
+        # PhlagGMMHMMEmissions.m_step passes emissions_m_step_state through
+        # untouched (always None), so there's nothing to report for gmm.
+        _, _, emissions_m_step_state = m_step_state
+        if isinstance(self.emission_component, PhlagHMMEmissions):
+            _, clip_count, clip_attempts = emissions_m_step_state
+            clip_count, clip_attempts = int(clip_count), int(clip_attempts)
+        else:
+            clip_count, clip_attempts = 0, 0
+
+        return params, jnp.array(log_probs), clip_count, clip_attempts

@@ -412,6 +412,15 @@ def parse_arguments(argv=None):
         help="Distribution type for output directory structure (default: gaussian)"
     )
     parser.add_argument(
+        "--output-base",
+        dest="output_base",
+        default=None,
+        help="Override the '<dist-type>/w<W>_s<S>' output-path prefix with an "
+             "arbitrary relative path (e.g. 'gaussian/repulsion/w50k_s1k'), for "
+             "writing into a relocated/variant-specific output tree instead of "
+             "the default one"
+    )
+    parser.add_argument(
         "--tree",
         dest="tree_file",
         type=pathlib.Path,
@@ -457,10 +466,16 @@ def main(argv=None):
         # Resolve existing scores.tsv
         from .utils import parse_filename_to_dir_structure, get_phlag_output_base
         phlag_base = get_phlag_output_base(data_dir)
+        # --output-base replaces the usual '<dist-type>/w<W>_s<S>' prefix
+        # wholesale -- it already carries whatever variant/window/step
+        # structure the caller wants, so window_str/step_str aren't
+        # re-appended on top of it.
+        dist_prefix = pathlib.Path(args.output_base) if args.output_base else pathlib.Path(args.dist_type)
+        sim_base = phlag_base / args.output_base if args.output_base else phlag_base / args.dist_type / f"w{window_str}_s{step_str}"
         parsed = parse_filename_to_dir_structure(clean_stem)
         if parsed:
             rel_dir = parsed["relative_dir"]
-            final_output_path = phlag_base / args.dist_type / rel_dir / "caster" / "scores.tsv"
+            final_output_path = phlag_base / dist_prefix / rel_dir / "caster" / "scores.tsv"
         else:
             parts = args.fasta_file.parts
             is_sim = False
@@ -469,21 +484,21 @@ def main(argv=None):
                 if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
                     sim_dir = sim_dir.parent
                 sim_name = sim_dir.name
-                
+
                 from .utils import get_simulation_categories, get_short_sim_name
                 cats = get_simulation_categories(args.fasta_file)
                 short_sim = get_short_sim_name(sim_name)
                 pattern_stem = clean_stem
                 if cats:
-                    final_output_path = phlag_base / args.dist_type / f"w{window_str}_s{step_str}" / cats[0] / cats[1] / short_sim / pattern_stem / "caster" / "scores.tsv"
+                    final_output_path = sim_base / cats[0] / cats[1] / short_sim / pattern_stem / "caster" / "scores.tsv"
                 else:
-                    final_output_path = phlag_base / args.dist_type / f"w{window_str}_s{step_str}" / short_sim / pattern_stem / "caster" / "scores.tsv"
+                    final_output_path = sim_base / short_sim / pattern_stem / "caster" / "scores.tsv"
                 is_sim = True
-            
+
             if not is_sim:
                 pattern_stem = clean_stem
                 final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-                final_output_path = phlag_base / args.dist_type / f"w{window_str}_s{step_str}" / pattern_stem / "caster" / final_output_name
+                final_output_path = sim_base / pattern_stem / "caster" / final_output_name
 
     is_fasta = not (input_str.endswith('.tsv') or args.fasta_file.name == 'scores.tsv')
     if is_fasta or not final_output_path.exists():

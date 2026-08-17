@@ -21,6 +21,13 @@ def parse_arguments(argv=None):
         help="Distribution type, threaded through to both caster and phlag (default: gaussian)"
     )
     parser.add_argument(
+        "--output-base",
+        dest="output_base",
+        default=None,
+        help="Forwarded to both caster's and phlag's --output-base (default: unset, "
+             "uses the normal '<dist-type>/w<W>_s<S>' output-path prefix).",
+    )
+    parser.add_argument(
         "--no-plots",
         dest="no_plots",
         action="store_true",
@@ -53,9 +60,11 @@ def main(argv=None):
     from phlag import caster
     from phlag import phlag as phlag_main
 
+    output_base_args = ["--output-base", args.output_base] if args.output_base else []
+
     caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
     print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
-    scores_path = caster.main([str(args.input_file), "-d", args.dist_type] + caster_plot_args)
+    scores_path = caster.main([str(args.input_file), "-d", args.dist_type] + output_base_args + caster_plot_args)
     if scores_path is None:
         sys.exit("Error: caster did not produce a scores file.")
 
@@ -69,7 +78,7 @@ def main(argv=None):
     if args.alt_emission_parameterization is not None:
         emission_param_args += ["--ap", args.alt_emission_parameterization]
     print(f"[phlagster] Running phlag on '{scores_path}' (-d {args.dist_type})...")
-    phlag_main.main([str(scores_path), "-d", args.dist_type] + emission_param_args + phlag_plot_args)
+    phlag_main.main([str(scores_path), "-d", args.dist_type] + output_base_args + emission_param_args + phlag_plot_args)
 
 
 if __name__ == "__main__":

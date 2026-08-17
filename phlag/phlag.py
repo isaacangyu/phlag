@@ -27,6 +27,11 @@ PSI_EPS = 0.001
 NUM_STATES = 2
 BETA_PRIME = 0.0025
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
+# Chosen independently of any observed run's data: clipping engaging on more
+# than a quarter of all LM step attempts over a fit means the optimizer is
+# being bottlenecked by the step-norm safety cap rather than occasionally
+# catching a rare bad step.
+GRADIENT_CLIP_UNSAFE_RATE_THRESHOLD = 0.25
 
 
 def get_topology_names(dim):
@@ -492,9 +497,14 @@ class Phlag:
     def get_default_out_dir(self):
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
+        # --output-base replaces the usual '<model-design>/w<W>_s<S>' prefix
+        # wholesale -- it already carries whatever variant/window/step
+        # structure the caller wants.
+        output_base = getattr(self.args, "output_base", None)
+        dist_prefix = pathlib.PurePosixPath(output_base) if output_base else pathlib.PurePosixPath(dist_type)
         from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base
         parsed = parse_filename_to_dir_structure(input_path.stem)
-        
+
         conn_env = os.environ.get("CONNECTION_DIR")
         if conn_env:
             base_dir = pathlib.Path(conn_env)
@@ -502,12 +512,12 @@ class Phlag:
             base_dir = get_data_dir()
             if base_dir == get_repo_root() / "caster" / "data":
                 base_dir = get_repo_root() / "connection_dir"
-        
+
         phlag_base = get_phlag_output_base(base_dir)
-        
+
         if parsed:
             rel_dir = parsed["relative_dir"]
-            out_dir = phlag_base / dist_type / rel_dir / "phlag"
+            out_dir = phlag_base / dist_prefix / rel_dir / "phlag"
         else:
             if input_path.parent.name == "caster":
                 # Find path relative to model design or phlag root if input is in a caster subfolder
@@ -515,28 +525,39 @@ class Phlag:
                 # should preserve w50k_s1k/admixture/high/Columbiformes_.../45-55 under phlag/<dist_type>/
                 locus_dir = input_path.parent.parent
                 parts = locus_dir.parts
-                # Check if model design or 'phlag' is in parent path parts
-                known_models = ["gaussian", "gmm"]
-                rel_parts = []
-                for i in range(len(parts) - 1, -1, -1):
-                    if parts[i] in known_models or parts[i] == "phlag":
-                        rel_parts = list(parts[i+1:])
-                        break
+                # Check if model design, an --output-base segment, or 'phlag' is
+                # in parent path parts -- an --output-base override can contain
+                # several segments (e.g. 'gaussian/repulsion/w50k_s1k'), so match
+                # on its full token sequence, not just its first segment.
+                if output_base:
+                    base_parts = tuple(pathlib.PurePosixPath(output_base).parts)
+                    rel_parts = []
+                    for i in range(len(parts) - len(base_parts), -1, -1):
+                        if tuple(parts[i:i + len(base_parts)]) == base_parts:
+                            rel_parts = list(parts[i + len(base_parts):])
+                            break
+                else:
+                    known_models = ["gaussian", "gmm"]
+                    rel_parts = []
+                    for i in range(len(parts) - 1, -1, -1):
+                        if parts[i] in known_models or parts[i] == "phlag":
+                            rel_parts = list(parts[i+1:])
+                            break
                 if rel_parts:
                     sub_path = pathlib.Path(*rel_parts)
-                    out_dir = phlag_base / dist_type / sub_path / "phlag"
+                    out_dir = phlag_base / dist_prefix / sub_path / "phlag"
                 else:
                     from .utils import get_simulation_categories, get_short_sim_name
                     cats = get_simulation_categories(locus_dir.name)
                     pattern_name = get_short_sim_name(locus_dir.name)
                     cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                    out_dir = phlag_base / dist_type / cat_prefix / pattern_name / "phlag"
+                    out_dir = phlag_base / dist_prefix / cat_prefix / pattern_name / "phlag"
             else:
                 from .utils import get_simulation_categories, get_short_sim_name
                 cats = get_simulation_categories(input_path.stem)
                 pattern_name = get_short_sim_name(input_path.stem)
                 cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                out_dir = phlag_base / dist_type / cat_prefix / pattern_name / "phlag"
+                out_dir = phlag_base / dist_prefix / cat_prefix / pattern_name / "phlag"
         return out_dir
 
     def determine_optimal_mixtures(self):
@@ -637,11 +658,11 @@ class Phlag:
         except TypeError:
             emission_divergence_str = str(float(divergence))
 
-        # Bhattacharyya distance between states -- gaussian-only (depends on
+        # Hellinger distance between states -- gaussian-only (depends on
         # the full covariance matrix; beta/gmm emissions have no analog).
-        em_bhattacharyya_distance = None
+        em_hellinger_distance = None
         if getattr(self.args, "model_design", "gaussian") == "gaussian":
-            em_bhattacharyya_distance = float(self.hmm.em_divergence(self.params))
+            em_hellinger_distance = float(self.hmm.em_divergence(self.params))
 
 
         # Get the emission distributions for each state to compute log likelihoods
@@ -777,7 +798,7 @@ class Phlag:
         accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
         f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
 
-        metrics_str = f"TPR: {tpr:.6g}, FPR: {fpr:.6g}, F1: {f1:.6g}, Accuracy: {accuracy:.6g}"
+        metrics_str = f"TPR: {tpr:.6g}, FPR: {fpr:.6g}, Precision: {precision:.6g}, F1: {f1:.6g}, Accuracy: {accuracy:.6g}"
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -840,8 +861,8 @@ class Phlag:
         headers.append(f"Phlag source mtime: {_phlag_mtime:.6f}")
 
         headers.append("State divergence: " + emission_divergence_str)
-        if em_bhattacharyya_distance is not None:
-            headers.append(f"EM divergence (Bhattacharyya): {em_bhattacharyya_distance:.6g}")
+        if em_hellinger_distance is not None:
+            headers.append(f"EM divergence (Hellinger): {em_hellinger_distance:.6g}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
@@ -861,6 +882,13 @@ class Phlag:
         headers.append(
             f"BIC: {bic:.6g} (log-likelihood={marginal_ll:.6g}, k={k_params} trainable params, n={n_obs} windows)"
         )
+        if hasattr(self, "clip_activation_count") and self.clip_activation_attempts > 0:
+            clip_rate = self.clip_activation_count / self.clip_activation_attempts
+            clip_unsafe = clip_rate > GRADIENT_CLIP_UNSAFE_RATE_THRESHOLD
+            headers.append(
+                f"Gradient clip activations: {self.clip_activation_count} "
+                f"(rate: {clip_rate:.6g}, unsafe: {clip_unsafe})"
+            )
 
         headers.append(f"{metrics_str}")
         if self.ground_truth_fits:
@@ -901,7 +929,7 @@ class Phlag:
                 )
                 gt_divergences.append(float(hellinger_gt))
             if gt_divergences:
-                headers.append(f"Ground truth EM divergence (Bhattacharyya): {sum(gt_divergences) / len(gt_divergences):.6g}")
+                headers.append(f"Ground truth EM divergence (Hellinger): {sum(gt_divergences) / len(gt_divergences):.6g}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6g}")
 
@@ -1082,9 +1110,11 @@ class Phlag:
         tqdm.write(f"Initial Transition matrix: {tm_init_str}")
 
         cumulative_inner_steps = 0
+        self.clip_activation_count = 0
+        self.clip_activation_attempts = 0
         for i in tqdm(range(self.n_iters)):
             num_inner = (i + 1) * self.increment_steps
-            self.params, log_probs = self.hmm.fit_em(
+            self.params, log_probs, clip_count, clip_attempts = self.hmm.fit_em(
                 self.params,
                 self.props,
                 self.Y,
@@ -1098,6 +1128,8 @@ class Phlag:
                 outer_iter=cumulative_inner_steps if self.args.annealing else None,
             )
             cumulative_inner_steps += num_inner
+            self.clip_activation_count += clip_count
+            self.clip_activation_attempts += clip_attempts
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
             tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str}")
@@ -1771,6 +1803,15 @@ def parse_arguments(argv=None):
         default="gaussian",
         choices=["gaussian", "gmm"],
         help="Type of HMM emissions (gaussian or gmm. Default: gaussian)",
+    )
+    hmm_group.add_argument(
+        "--output-base",
+        dest="output_base",
+        default=None,
+        help="Override the '<model-design>/w<W>_s<S>' output-path prefix with an "
+             "arbitrary relative path (e.g. 'gaussian/repulsion/w50k_s1k'), for "
+             "writing into a relocated/variant-specific output tree instead of "
+             "the default one",
     )
     hmm_group.add_argument(
         "-t",

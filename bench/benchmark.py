@@ -86,6 +86,20 @@ FRACTION_BIN_EDGES = [
 ]
 FRACTION_BINS = [label for label, _, _ in FRACTION_BIN_EDGES]
 
+# 6 equal-width bins spanning a Hellinger distance's full [0, 1] range (unlike
+# FRACTION_BIN_EDGES above, which only covers a data-relevant sub-range) --
+# the low edge of the first bin sits fractionally below 0 so a distance of
+# exactly 0.0 (fitted states statistically identical) still lands in a bin.
+HD_BIN_EDGES = [
+    ("[0,0.167]", -1e-9, 1 / 6),
+    ("(0.167,0.333]", 1 / 6, 2 / 6),
+    ("(0.333,0.5]", 2 / 6, 3 / 6),
+    ("(0.5,0.667]", 3 / 6, 4 / 6),
+    ("(0.667,0.833]", 4 / 6, 5 / 6),
+    ("(0.833,1]", 5 / 6, 1.0),
+]
+HD_BINS = [label for label, _, _ in HD_BIN_EDGES]
+
 BIN_EDGE_TOL = 0.002
 
 ERRORBAR_KINDS = ("sd", "sem", "ci95")
@@ -109,14 +123,24 @@ _RE_METRICS = re.compile(
     r'^TPR:\s*([-\d.eE+]+),\s*FPR:\s*([-\d.eE+]+),\s*'
     r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+)\s*$'
 )
+_RE_METRICS_WITH_PRECISION = re.compile(
+    r'^TPR:\s*([-\d.eE+]+),\s*FPR:\s*([-\d.eE+]+),\s*Precision:\s*([-\d.eE+]+),\s*'
+    r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+)\s*$'
+)
 _RE_RELERR_ROW = re.compile(
     r'^(\w+)\t(Null|Alt)\t(mean|std)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
     re.IGNORECASE,
 )
 _RE_EM_DIVERGENCE = re.compile(
+    r'^EM divergence \(Hellinger\):\s*([-\d.eE+]+)\s*$'
+)
+_RE_EM_DIVERGENCE_LEGACY = re.compile(
     r'^EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_GT_EM_DIVERGENCE = re.compile(
+    r'^Ground truth EM divergence \(Hellinger\):\s*([-\d.eE+]+)\s*$'
+)
+_RE_GT_EM_DIVERGENCE_LEGACY = re.compile(
     r'^Ground truth EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_TRANSITION_MATRIX = re.compile(
@@ -125,13 +149,16 @@ _RE_TRANSITION_MATRIX = re.compile(
 )
 _RE_CASTER_MTIME = re.compile(r'^Caster source mtime:\s*([\d.eE+]+)\s*$')
 _RE_PHLAG_MTIME = re.compile(r'^Phlag source mtime:\s*([\d.eE+]+)\s*$')
+_RE_CLIP_ACTIVATIONS = re.compile(
+    r'^Gradient clip activations:\s*(\d+)\s*\(rate:\s*([-\d.eE+]+),\s*unsafe:\s*(True|False)\)\s*$'
+)
 _RE_BIC = re.compile(
     r'^BIC:\s*([-\d.eE+]+)\s*\(log-likelihood=([-\d.eE+]+),\s*'
     r'k=(\d+)\s*trainable params,\s*n=(\d+)\s*windows\)\s*$'
 )
 # Older reports' "--- Bookkeeping ---"/"--- Fitted parameters ..." section --
 # no longer written by phlag.py, but archived reports still carry it, and
-# it's the only way to recompute em_bd exactly for those (see parse_report).
+# it's the only way to recompute em_hd exactly for those (see parse_report).
 _RE_FITTED_MEAN = re.compile(r'^(Null|Alt) fitted mean:\s*(\[.+\])\s*$')
 _RE_FITTED_COV = re.compile(r'^(Null|Alt) fitted covariance:\s*(\[\[.+\]\])\s*$')
 
@@ -154,7 +181,7 @@ def gaussian_hellinger_distance_1d(mu1, var1, mu2, var2, eps=1e-6):
 def gaussian_hellinger_distance_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
     """
     General-N Gaussian Hellinger distance (numpy), matching
-    hmm.gaussian_hellinger_distance -- used to recompute em_bd for archived
+    hmm.gaussian_hellinger_distance -- used to recompute em_hd for archived
     reports whose "EM divergence" header line predates the Hellinger-distance
     convention, straight from the joint fitted mean/covariance bookkeeping
     block those older reports still carry.
@@ -232,18 +259,19 @@ def parse_report(report_path):
         "n_windows": None,
         "tp": None, "fp": None, "fn": None, "tn": None,
         "label_flipped": None,
-        "tpr": None, "fpr": None, "f1": None, "accuracy": None,
+        "tpr": None, "fpr": None, "precision": None, "f1": None, "accuracy": None,
         "n_path_entries": None,
         "rel_err": {},
         "ground_truth_stats": {},
         "fitted_null_mean": None, "fitted_null_cov": None,
         "fitted_alt_mean": None, "fitted_alt_cov": None,
-        "em_bd": None,
-        "em_gt_bd": None,
+        "em_hd": None,
+        "em_gt_hd": None,
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
         "caster_source_mtime": None, "phlag_source_mtime": None,
         "bic": None, "log_likelihood": None, "n_trainable_params": None,
+        "clip_activation_count": None, "clip_activation_rate": None, "clip_unsafe": None,
     }
 
     with open(report_path, "r") as handle:
@@ -255,6 +283,15 @@ def parse_report(report_path):
             if _RE_STATE_PATH.match(line):
                 parsed["n_path_entries"] = line.count(",") + 1
                 break
+
+            m = _RE_METRICS_WITH_PRECISION.match(line)
+            if m:
+                parsed["tpr"] = float(m.group(1))
+                parsed["fpr"] = float(m.group(2))
+                parsed["precision"] = float(m.group(3))
+                parsed["f1"] = float(m.group(4))
+                parsed["accuracy"] = float(m.group(5))
+                continue
 
             m = _RE_METRICS.match(line)
             if m:
@@ -319,14 +356,21 @@ def parse_report(report_path):
                     parsed["ground_truth_stats"][(topology, state.capitalize(), statistic.lower())] = gt_value
                 continue
 
-            m = _RE_EM_DIVERGENCE.match(line)
+            m = _RE_EM_DIVERGENCE.match(line) or _RE_EM_DIVERGENCE_LEGACY.match(line)
             if m:
-                parsed["em_bd"] = float(m.group(1))
+                parsed["em_hd"] = float(m.group(1))
                 continue
 
-            m = _RE_GT_EM_DIVERGENCE.match(line)
+            m = _RE_GT_EM_DIVERGENCE.match(line) or _RE_GT_EM_DIVERGENCE_LEGACY.match(line)
             if m:
-                parsed["em_gt_bd"] = float(m.group(1))
+                parsed["em_gt_hd"] = float(m.group(1))
+                continue
+
+            m = _RE_CLIP_ACTIVATIONS.match(line)
+            if m:
+                parsed["clip_activation_count"] = int(m.group(1))
+                parsed["clip_activation_rate"] = float(m.group(2))
+                parsed["clip_unsafe"] = (m.group(3) == "True")
                 continue
 
             m = _RE_FITTED_MEAN.match(line)
@@ -377,7 +421,14 @@ def parse_report(report_path):
     if parsed["n_windows"] is None and parsed["n_path_entries"] is not None:
         parsed["n_windows"] = parsed["n_path_entries"]
 
-    # em_gt_bd: always recompute from the per-topology GroundTruth mean/std
+    # precision: reports written before the "Precision:" field existed still
+    # carry tp/fp in the "Confusion:" line, which is all precision needs --
+    # backfill it here instead of leaving it null for every older report.
+    if parsed["precision"] is None and parsed["tp"] is not None and parsed["fp"] is not None:
+        denom = parsed["tp"] + parsed["fp"]
+        parsed["precision"] = (parsed["tp"] / denom) if denom > 0 else 0.0
+
+    # em_gt_hd: always recompute from the per-topology GroundTruth mean/std
     # this table has always carried, rather than trusting a pre-existing
     # "Ground truth EM divergence" header line -- that line's number could be
     # from a report written under an earlier convention (Bhattacharyya
@@ -398,9 +449,9 @@ def parse_report(report_path):
                 continue
             distances.append(gaussian_hellinger_distance_1d(mu_null, std_null ** 2, mu_alt, std_alt ** 2))
         if distances:
-            parsed["em_gt_bd"] = sum(distances) / len(distances)
+            parsed["em_gt_hd"] = sum(distances) / len(distances)
 
-    # em_bd: same reasoning -- if this report still carries the "Null/Alt
+    # em_hd: same reasoning -- if this report still carries the "Null/Alt
     # fitted mean/covariance" bookkeeping block, recompute straight from it
     # instead of trusting the "EM divergence" header line's possibly-stale-
     # convention number. Reports without that block (not just "written after
@@ -411,7 +462,7 @@ def parse_report(report_path):
         parsed["fitted_null_mean"] is not None and parsed["fitted_null_cov"] is not None
         and parsed["fitted_alt_mean"] is not None and parsed["fitted_alt_cov"] is not None
     ):
-        parsed["em_bd"] = gaussian_hellinger_distance_nd(
+        parsed["em_hd"] = gaussian_hellinger_distance_nd(
             parsed["fitted_null_mean"], parsed["fitted_null_cov"],
             parsed["fitted_alt_mean"], parsed["fitted_alt_cov"],
         )
@@ -422,8 +473,8 @@ def parse_report(report_path):
     # the Hellinger-distance one AND lacks the bookkeeping block needed to
     # recompute it), not a valid value. Drop it rather than propagate a
     # number that would blow up downstream error-bar/axis math.
-    if parsed["em_bd"] is not None and not (-1e-6 <= parsed["em_bd"] <= 1 + 1e-6):
-        parsed["em_bd"] = None
+    if parsed["em_hd"] is not None and not (-1e-6 <= parsed["em_hd"] <= 1 + 1e-6):
+        parsed["em_hd"] = None
 
     return parsed
 
@@ -489,6 +540,7 @@ class RunRecord:
     fraction_bin: Optional[str] = None
     tpr: Optional[float] = None
     fpr: Optional[float] = None
+    precision: Optional[float] = None
     f1: Optional[float] = None
     accuracy: Optional[float] = None
     tp: Optional[int] = None
@@ -501,12 +553,14 @@ class RunRecord:
     in_panel_b: bool = False
     in_panel_relerr: bool = False
     in_panel_em_divergence: bool = False
+    in_panel_hd_alt: bool = False
+    hd_bin: Optional[str] = None
     exclusion: str = ""
     rel_err: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
     mean_relerr_agg: Optional[float] = None
     covar_relerr_agg: Optional[float] = None
-    em_bd: Optional[float] = None
-    em_gt_bd: Optional[float] = None
+    em_hd: Optional[float] = None
+    em_gt_hd: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -514,6 +568,9 @@ class RunRecord:
     bic: Optional[float] = None
     log_likelihood: Optional[float] = None
     n_trainable_params: Optional[int] = None
+    clip_activation_count: Optional[int] = None
+    clip_activation_rate: Optional[float] = None
+    clip_unsafe: Optional[bool] = None
 
 
 @dataclass
@@ -611,6 +668,22 @@ class EmDivergenceCell:
 
 
 @dataclass
+class HdAltCell:
+    """
+    One cell of the hd-by-alt-proportion heatmaps: mean F1 and mean proxy
+    AUC (= (tpr + (1 - fpr)) / 2, the single-operating-point ROC-AUC
+    estimate -- no per-window posterior scores exist to sweep a real
+    threshold) over the runs in this (pattern, hd_bin) cell.
+    """
+    pattern: str
+    hd_bin: str
+    n_runs: int
+    mean_f1: float
+    mean_auc: float
+    run_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
 class Figure3Data:
     """
     The complete, already-aggregated contents of the two Figure-3 panels.
@@ -628,6 +701,7 @@ class Figure3Data:
     panel_b: Dict[Tuple[str, str, str], PanelBCell]
     panel_relerr: Dict[Tuple[str, str, str], RelErrCell]
     panel_em_divergence: Dict[Tuple[str, str, str], EmDivergenceCell]
+    panel_hd_alt: Dict[Tuple[str, str], HdAltCell]
     errorbar: str
     dist_type: str
     window_size: int
@@ -637,6 +711,7 @@ class Figure3Data:
     n_runs_panel_b: int = 0
     n_runs_relerr: int = 0
     n_runs_em_divergence: int = 0
+    n_runs_hd_alt: int = 0
     n_runs_excluded: int = 0
     exclusions: Dict[str, int] = field(default_factory=dict)
 
@@ -702,7 +777,7 @@ class BenchmarkStats:
 
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                 errorbar="sd"):
+                 errorbar="sd", base=None):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -713,6 +788,10 @@ class BenchmarkStats:
         self.window_size = window_size
         self.step_size = step_size
         self.errorbar = errorbar
+        # Relative path (from the phlag output root) to use in place of the
+        # usual <dist_type>/w<W>_s<S> prefix -- see --base, for output that
+        # has been relocated under a differently-structured tree.
+        self.base = base
 
         self.runs = []
         self.notes = []
@@ -722,18 +801,16 @@ class BenchmarkStats:
 
 
     def default_stats_dir(self):
-        """<phlag_base>/<dist_type>/w<W>_s<S>/benchmark/ -- the container for numbered per-run subfolders."""
+        """<phlag_base>/<base or dist_type/w<W>_s<S>>/benchmark/ -- the container for run subfolders."""
         from phlag.utils import get_data_dir, get_phlag_output_base
         from phlag.caster import format_val
 
+        phlag_base = get_phlag_output_base(get_data_dir())
+        if self.base is not None:
+            return phlag_base / self.base / "benchmark"
         window_str = format_val(self.window_size)
         step_str = format_val(self.step_size)
-        return (
-            get_phlag_output_base(get_data_dir())
-            / self.dist_type
-            / f"w{window_str}_s{step_str}"
-            / "benchmark"
-        )
+        return phlag_base / self.dist_type / f"w{window_str}_s{step_str}" / "benchmark"
 
     def next_run_dir(self):
         """
@@ -767,14 +844,20 @@ class BenchmarkStats:
         return root / str(max(existing_ids))
 
 
-    def collect(self):
+    def collect(self, base_override=None):
         """
         Populates ``self.runs`` with one RunRecord per report.tsv found under the
         expected output directory of a categorized source simulation, restricted to
         the current DEFAULT_CONCAT_PATTERNS sweep. This always re-walks the output
         tree on disk, so it picks up every finished default-pattern run that exists
         there -- not only ones produced by a `run_all()` call earlier in this process.
+
+        base_override: defaults to self.base, but callers resummarizing a specific
+        run's own private raw/ output (see run_all's leaf_base_override) pass that
+        instead, so this reads the exact same tree run_all() just wrote to rather
+        than the shared general one self.base points at.
         """
+        base_override = self.base if base_override is None else base_override
         from phlag.utils import get_simulation_categories
 
         self.runs = []
@@ -813,6 +896,7 @@ class BenchmarkStats:
                 dist_type=self.dist_type,
                 window_size=self.window_size,
                 step_size=self.step_size,
+                base_override=base_override,
             )
             report_paths = sorted(
                 p for p in sim_output_dir.glob("*/phlag/report.tsv")
@@ -827,15 +911,60 @@ class BenchmarkStats:
                 continue
 
             for report_path in report_paths:
+                pattern = report_path.parent.parent.name
                 self.runs.append(
-                    self._build_record(report_path, leaf_dir, rel_leaf, category, subcategory, column)
+                    self._build_record(report_path, leaf_dir.name, rel_leaf, category, subcategory, column, pattern)
                 )
 
         return self.runs
 
-    def _build_record(self, report_path, leaf_dir, rel_leaf, category, subcategory, column):
+    def collect_from_reports_archive(self, reports_dir):
+        """
+        Populates ``self.runs`` from a previously-archived reports/ snapshot
+        (see ``save_reports``) -- ``reports_dir/<category>/<subcategory>/<leaf>/<pattern>.tsv``
+        -- instead of re-walking the live simulations/ output tree. Used to
+        resummarize an existing --run folder's own frozen inputs without
+        picking up whatever now happens to be at the live expected-output
+        path, which may have changed (rerun, overwritten by a concurrent
+        session, etc.) since that run was made.
+        """
+        self.runs = []
+        self.notes = []
+        self.n_leaf_dirs_uncategorized = 0
+        self.n_leaf_dirs_without_output = 0
+
+        if not reports_dir.exists():
+            self.notes.append(f"reports archive not found at '{reports_dir}' -- nothing to summarize")
+            self.n_leaf_dirs = 0
+            return self.runs
+
+        leaf_keys = set()
+        for report_path in sorted(reports_dir.glob("*/*/*/*.tsv")):
+            leaf_name = report_path.parent.name
+            subcategory = report_path.parent.parent.name
+            category = report_path.parent.parent.parent.name
+            pattern = report_path.stem
+            rel_leaf = f"{category}/{subcategory}/{leaf_name}"
+            leaf_keys.add((category, subcategory, leaf_name))
+
+            column = CATEGORY_TO_COLUMN.get((category, subcategory))
+            if column is None:
+                self.n_leaf_dirs_uncategorized += 1
+                self.notes.append(
+                    f"[skip] {rel_leaf}/{pattern}: category ('{category}', '{subcategory}') "
+                    f"has no Figure-3 column in CATEGORY_TO_COLUMN"
+                )
+                continue
+
+            self.runs.append(
+                self._build_record(report_path, leaf_name, rel_leaf, category, subcategory, column, pattern)
+            )
+
+        self.n_leaf_dirs = len(leaf_keys)
+        return self.runs
+
+    def _build_record(self, report_path, leaf_name, rel_leaf, category, subcategory, column, pattern):
         """Parses one report.tsv and bins it. Never raises on a malformed report."""
-        pattern = report_path.parent.parent.name
         record = RunRecord(
             run_id=f"{rel_leaf}::{pattern}",
             source_leaf=rel_leaf,
@@ -857,6 +986,7 @@ class BenchmarkStats:
         record.branch_length = parsed["branch_length"]
         record.tpr = parsed["tpr"]
         record.fpr = parsed["fpr"]
+        record.precision = parsed["precision"]
         record.f1 = parsed["f1"]
         record.accuracy = parsed["accuracy"]
         record.tp, record.fp = parsed["tp"], parsed["fp"]
@@ -871,11 +1001,14 @@ class BenchmarkStats:
             record.mean_relerr_agg = sum(mean_vals) / len(mean_vals) if mean_vals else None
             record.covar_relerr_agg = sum(std_vals) / len(std_vals) if std_vals else None
 
-        record.em_bd = parsed["em_bd"]
-        record.em_gt_bd = parsed["em_gt_bd"]
+        record.em_hd = parsed["em_hd"]
+        record.em_gt_hd = parsed["em_gt_hd"]
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
         record.n_trainable_params = parsed["n_trainable_params"]
+        record.clip_activation_count = parsed["clip_activation_count"]
+        record.clip_activation_rate = parsed["clip_activation_rate"]
+        record.clip_unsafe = parsed["clip_unsafe"]
 
         record.transition_null_to_null = parsed["transition_null_to_null"]
         record.transition_null_to_alt = parsed["transition_null_to_alt"]
@@ -893,7 +1026,7 @@ class BenchmarkStats:
         if column == COL_ADMIXTURE:
             from phlag.utils import get_admixture_divergence_time, ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
             record.x_variable = "divergence time (Myr)"
-            record.x_value = get_admixture_divergence_time(leaf_dir.name)
+            record.x_value = get_admixture_divergence_time(leaf_name)
             record.x_bin = subcategory if subcategory in ADMIXTURE_BINS else None
             if record.x_bin is None and record.x_value is not None:
                 record.x_bin = (
@@ -934,13 +1067,26 @@ class BenchmarkStats:
                 else f"x value {record.x_value} outside every x bin (relerr panel only)"
             )
 
-        if record.x_bin is not None and record.em_bd is not None:
+        if record.x_bin is not None and record.em_hd is not None:
             record.in_panel_em_divergence = True
         elif not record.exclusion:
             record.exclusion = (
                 "no EM divergence line in report (em_divergence panel only)"
                 if record.x_bin is not None
                 else f"x value {record.x_value} outside every x bin (em_divergence panel only)"
+            )
+
+        # hd-by-alt-proportion heatmaps: keyed on pattern (always present,
+        # restricted to DEFAULT_CONCAT_PATTERNS by collect()) x hd_bin, not
+        # the branch-length/admixture x_bin the other panels use.
+        record.hd_bin = assign_bin(record.em_hd, HD_BIN_EDGES)
+        if record.hd_bin is not None and record.f1 is not None:
+            record.in_panel_hd_alt = True
+        elif not record.exclusion:
+            record.exclusion = (
+                "no EM divergence line in report (hd_alt panel only)"
+                if record.hd_bin is None
+                else "no F1 in report (hd_alt panel only)"
             )
 
         return record
@@ -952,6 +1098,7 @@ class BenchmarkStats:
         panel_b_groups = defaultdict(list)
         panel_relerr_groups = defaultdict(list)
         panel_em_divergence_groups = defaultdict(list)
+        panel_hd_alt_groups = defaultdict(list)
         exclusions = defaultdict(int)
 
         for record in self.runs:
@@ -965,6 +1112,8 @@ class BenchmarkStats:
                 panel_relerr_groups[(record.column, record.fraction_bin, record.x_bin)].append(record)
             if record.in_panel_em_divergence:
                 panel_em_divergence_groups[(record.column, record.fraction_bin, record.x_bin)].append(record)
+            if record.in_panel_hd_alt:
+                panel_hd_alt_groups[(record.pattern, record.hd_bin)].append(record)
 
         panel_a = {}
         for key, records in panel_a_groups.items():
@@ -1019,9 +1168,9 @@ class BenchmarkStats:
         for key, records in panel_em_divergence_groups.items():
             column, fraction_bin, x_bin = key
             mean_dist, sd_dist, dist_minus, dist_plus = summarize_values(
-                [r.em_bd for r in records], self.errorbar, low=0.0, high=1.0
+                [r.em_hd for r in records], self.errorbar, low=0.0, high=1.0
             )
-            gt_values = [r.em_gt_bd for r in records if r.em_gt_bd is not None]
+            gt_values = [r.em_gt_hd for r in records if r.em_gt_hd is not None]
             gt_mean_dist, gt_sd_dist, gt_dist_minus, gt_dist_plus = summarize_values(
                 gt_values, self.errorbar, low=0.0, high=1.0
             )
@@ -1032,6 +1181,20 @@ class BenchmarkStats:
                 run_ids=sorted(r.run_id for r in records),
                 n_gt_runs=len(gt_values), gt_mean_distance=gt_mean_dist, gt_sd_distance=gt_sd_dist,
                 gt_err_minus=gt_dist_minus, gt_err_plus=gt_dist_plus,
+            )
+
+        panel_hd_alt = {}
+        for key, records in panel_hd_alt_groups.items():
+            pattern, hd_bin = key
+            mean_f1 = sum(r.f1 for r in records) / len(records)
+            # Proxy AUC: no per-window posterior scores exist to sweep a real
+            # ROC threshold, so this is the standard single-operating-point
+            # estimate from the confusion matrix already on hand.
+            mean_auc = sum((r.tpr + (1.0 - r.fpr)) / 2.0 for r in records) / len(records)
+            panel_hd_alt[key] = HdAltCell(
+                pattern=pattern, hd_bin=hd_bin, n_runs=len(records),
+                mean_f1=mean_f1, mean_auc=mean_auc,
+                run_ids=sorted(r.run_id for r in records),
             )
 
         x_bins_by_column = {}
@@ -1056,6 +1219,7 @@ class BenchmarkStats:
             panel_b=panel_b,
             panel_relerr=panel_relerr,
             panel_em_divergence=panel_em_divergence,
+            panel_hd_alt=panel_hd_alt,
             errorbar=self.errorbar,
             dist_type=self.dist_type,
             window_size=self.window_size,
@@ -1065,6 +1229,7 @@ class BenchmarkStats:
             n_runs_panel_b=sum(1 for r in self.runs if r.in_panel_b),
             n_runs_relerr=sum(1 for r in self.runs if r.in_panel_relerr),
             n_runs_em_divergence=sum(1 for r in self.runs if r.in_panel_em_divergence),
+            n_runs_hd_alt=sum(1 for r in self.runs if r.in_panel_hd_alt),
             n_runs_excluded=sum(exclusions.values()),
             exclusions=dict(exclusions),
         )
@@ -1082,14 +1247,16 @@ class BenchmarkStats:
         "anomaly_fraction", "anomaly_fraction_source", "fraction_bin",
         "x_variable", "x_value", "x_bin", "branch_length_cu",
         "clade_name", "clade_number",
-        "tpr", "fpr", "f1", "accuracy", "tp", "fp", "fn", "tn",
+        "tpr", "fpr", "precision", "f1", "accuracy", "tp", "fp", "fn", "tn",
         "n_windows", "label_flipped",
         "in_panel_a", "in_panel_b", "in_panel_relerr", "in_panel_em_divergence",
+        "in_panel_hd_alt", "hd_bin",
         "mean_relerr_agg", "covar_relerr_agg",
-        "em_bd", "em_gt_bd",
+        "em_hd", "em_gt_hd",
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
+        "clip_activation_count", "clip_activation_rate", "clip_unsafe",
     ] + RELERR_RUN_COLUMNS + [
         "exclusion", "report_path",
     ]
@@ -1141,6 +1308,7 @@ class BenchmarkStats:
                     "clade_name": record.clade_name,
                     "clade_number": record.clade_number,
                     "tpr": record.tpr, "fpr": record.fpr,
+                    "precision": record.precision,
                     "f1": record.f1, "accuracy": record.accuracy,
                     "tp": record.tp, "fp": record.fp,
                     "fn": record.fn, "tn": record.tn,
@@ -1150,10 +1318,12 @@ class BenchmarkStats:
                     "in_panel_b": record.in_panel_b,
                     "in_panel_relerr": record.in_panel_relerr,
                     "in_panel_em_divergence": record.in_panel_em_divergence,
+                    "in_panel_hd_alt": record.in_panel_hd_alt,
+                    "hd_bin": record.hd_bin,
                     "mean_relerr_agg": record.mean_relerr_agg,
                     "covar_relerr_agg": record.covar_relerr_agg,
-                    "em_bd": record.em_bd,
-                    "em_gt_bd": record.em_gt_bd,
+                    "em_hd": record.em_hd,
+                    "em_gt_hd": record.em_gt_hd,
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -1161,6 +1331,9 @@ class BenchmarkStats:
                     "bic": record.bic,
                     "log_likelihood": record.log_likelihood,
                     "n_trainable_params": record.n_trainable_params,
+                    "clip_activation_count": record.clip_activation_count,
+                    "clip_activation_rate": record.clip_activation_rate,
+                    "clip_unsafe": record.clip_unsafe,
                     "exclusion": record.exclusion,
                     "report_path": record.report_path,
                 }
@@ -1210,7 +1383,7 @@ class BenchmarkStats:
 
             for key in sorted(figure_data.panel_em_divergence.keys()):
                 cell = figure_data.panel_em_divergence[key]
-                emit("EM_DIVERGENCE", cell.column, cell.fraction_bin, cell.x_bin, "bhattacharyya_distance",
+                emit("EM_DIVERGENCE", cell.column, cell.fraction_bin, cell.x_bin, "hellinger_distance",
                      cell.n_runs, cell.mean_distance, cell.sd_distance,
                      cell.err_minus, cell.err_plus, cell.run_ids)
 
@@ -1222,8 +1395,11 @@ class BenchmarkStats:
             figure_data = self.aggregate()
 
         print("\n=== Benchmark summary ===")
-        print(f"Configuration: dist-type={self.dist_type}, window={self.window_size}, "
-              f"step={self.step_size}, errorbar={self.errorbar}")
+        if self.base is not None:
+            print(f"Configuration: base={self.base}, errorbar={self.errorbar}")
+        else:
+            print(f"Configuration: dist-type={self.dist_type}, window={self.window_size}, "
+                  f"step={self.step_size}, errorbar={self.errorbar}")
         print(f"Source tree: {self.sim_root}")
         print(f"Leaf simulation dirs walked: {self.n_leaf_dirs} "
               f"({self.n_leaf_dirs_uncategorized} uncategorized, "
@@ -1287,7 +1463,7 @@ class BenchmarkStats:
                 print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
                       f"mean={cell.mean_relerr:.4f}  covar={cell.covar_relerr:.4f}")
 
-        print("\nEm divergence cells (mean Bhattacharyya distance between fitted Null/Alt states):")
+        print("\nEm divergence cells (mean Hellinger distance between fitted Null/Alt states):")
         for fraction_bin in figure_data.fraction_bins:
             row_cells = [
                 (column, x_bin, figure_data.panel_em_divergence[(column, fraction_bin, x_bin)])
@@ -1414,6 +1590,24 @@ class BenchmarkFigurePlotter:
     def _int_yaxis(self, ax):
         ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _pos: f"{v:.0f}"))
 
+    def _add_provenance_footer(self, fig, n_total):
+        """
+        Bottom-left: N=<n_total>, the count of runs actually plotted in this
+        figure (not the full discovered run set -- see each render_* call
+        site for which Figure3Data n_runs_* field that is). Bottom-right: the
+        base+run output path (self.out_dir) this figure was written into, so
+        a saved PNG is traceable back to its source tables without relying on
+        the filename alone.
+        """
+        fig.text(
+            0.005, 0.003, f"N={n_total}",
+            ha="left", va="bottom", fontsize=7, color=_INK_MUTED,
+        )
+        fig.text(
+            0.995, 0.003, str(self.out_dir),
+            ha="right", va="bottom", fontsize=7, color=_INK_MUTED,
+        )
+
 
     def render_panel_a(self, filename="f1.png"):
         data = self.data
@@ -1481,7 +1675,8 @@ class BenchmarkFigurePlotter:
             "Phlag anomaly detection: F1 by branch length and alternative sequence fraction",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.03, 1, 0.97])
+        fig.tight_layout(rect=[0, 0.045, 1, 0.97])
+        self._add_provenance_footer(fig, data.n_runs_panel_a)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1578,7 +1773,8 @@ class BenchmarkFigurePlotter:
             "Phlag anomaly detection: TPR vs FPR by branch length and alternative sequence fraction",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.01, 1, 0.97])
+        fig.tight_layout(rect=[0, 0.035, 1, 0.97])
+        self._add_provenance_footer(fig, data.n_runs_panel_b)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1698,7 +1894,8 @@ class BenchmarkFigurePlotter:
             "Phlag EM fit quality: mean |relative error(%)| of fitted mean/covariance vs. ground truth",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.03, 1, 0.93])
+        fig.tight_layout(rect=[0, 0.045, 1, 0.93])
+        self._add_provenance_footer(fig, data.n_runs_relerr)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1718,7 +1915,7 @@ class BenchmarkFigurePlotter:
 
         The right (fixed teal) bar is the same distance computed directly on
         the ground-truth Null/Alt split instead of the fitted states -- the
-        per-topology marginal average described at RunRecord.em_gt_bd -- so a
+        per-topology marginal average described at RunRecord.em_gt_hd -- so a
         cell where the model's fitted states are less separated than the
         ground truth's inherent separation (fitted bar shorter than ground
         truth) is visible at a glance, not just inferable from F1.
@@ -1817,7 +2014,8 @@ class BenchmarkFigurePlotter:
             "Phlag EM state separation: Hellinger distance, fitted vs. ground truth",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
-        fig.tight_layout(rect=[0, 0.03, 1, 0.93])
+        fig.tight_layout(rect=[0, 0.045, 1, 0.93])
+        self._add_provenance_footer(fig, data.n_runs_em_divergence)
 
         out_path = self.out_dir / filename
         fig.savefig(out_path, dpi=200)
@@ -1825,14 +2023,119 @@ class BenchmarkFigurePlotter:
         return out_path
 
 
+    def _render_hd_alt_heatmap(self, metric_attr, title, filename):
+        """
+        Shared drawing code for the two hd-by-alt-proportion heatmaps: a
+        HD_BINS x DEFAULT_CONCAT_PATTERNS grid, cells colored by the mean of
+        ``metric_attr`` (an HdAltCell field) over the runs in that cell.
+        Empty cells (no runs landed there) are left blank, not zero.
+        """
+        data = self.data
+        rows = HD_BINS
+        cols = DEFAULT_CONCAT_PATTERNS
+
+        grid = np.full((len(rows), len(cols)), np.nan)
+        n_runs_grid = np.zeros((len(rows), len(cols)), dtype=int)
+        for r, hd_bin in enumerate(rows):
+            for c, pattern in enumerate(cols):
+                cell = data.panel_hd_alt.get((pattern, hd_bin))
+                if cell is not None and cell.n_runs > 0:
+                    grid[r, c] = getattr(cell, metric_attr)
+                    n_runs_grid[r, c] = cell.n_runs
+
+        self._apply_theme()
+        fig, ax = plt.subplots(figsize=(1.15 * len(cols) + 2.0, 1.0 * len(rows) + 1.8))
+
+        cmap = matplotlib.colormaps["Blues"].copy()
+        cmap.set_bad(color=_GRIDLINE)
+        masked = np.ma.masked_invalid(grid)
+        im = ax.imshow(masked, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
+
+        for r in range(len(rows)):
+            for c in range(len(cols)):
+                if np.isnan(grid[r, c]):
+                    continue
+                value = grid[r, c]
+                label_color = _SURFACE if value > 0.55 else _INK_PRIMARY
+                ax.text(
+                    c, r - 0.12, f"{value:.2f}",
+                    ha="center", va="center", fontsize=9, color=label_color,
+                )
+                ax.text(
+                    c, r + 0.22, f"n={n_runs_grid[r, c]}",
+                    ha="center", va="center", fontsize=6.5, color=label_color,
+                )
+
+        ax.set_xticks(range(len(cols)))
+        ax.set_xticklabels(cols, rotation=30, ha="right", fontsize=8)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels(rows, fontsize=8)
+        ax.set_xlabel("alt proportion (concat pattern)", fontsize=9)
+        ax.set_ylabel("Hellinger distance (fitted Null/Alt separation)", fontsize=9)
+        for side in ax.spines.values():
+            side.set_visible(False)
+        ax.set_xticks(np.arange(-0.5, len(cols), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(rows), 1), minor=True)
+        ax.grid(which="minor", color=_SURFACE, linewidth=2)
+        ax.tick_params(which="minor", length=0)
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.outline.set_visible(False)
+        cbar.ax.tick_params(labelsize=7.5, color=_BASELINE)
+
+        ax.set_title(title, fontsize=11.5, color=_INK_PRIMARY, pad=10)
+        fig.tight_layout(rect=[0, 0.06, 1, 1])
+        self._add_provenance_footer(fig, data.n_runs_hd_alt)
+
+        out_path = self.out_dir / filename
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return out_path
+
+    def render_hd_alt_f1(self, filename="hd_alt_proportion_f1.png"):
+        """
+        Hellinger distance (6 equal bins over [0, 1]) x alt proportion (the 6
+        DEFAULT_CONCAT_PATTERNS values) heatmap, colored by mean F1.
+        """
+        return self._render_hd_alt_heatmap(
+            "mean_f1", "Mean F1 by Hellinger distance x alt proportion", filename
+        )
+
+    def render_hd_alt_auc(self, filename="hd_alt_proportion_auc.png"):
+        """
+        Same grid as hd_alt_proportion_f1.png, colored by proxy AUC
+        (= (tpr + (1 - fpr)) / 2 per run, averaged per cell) instead of F1 --
+        see HdAltCell for why this is a proxy rather than a real
+        threshold-swept ROC AUC.
+        """
+        return self._render_hd_alt_heatmap(
+            "mean_auc", "Mean proxy AUC by Hellinger distance x alt proportion", filename
+        )
+
     def render(self):
         """Renders all figures; returns the list of written PNG paths."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
         return [
             self.render_panel_a(), self.render_panel_b(),
             self.render_relerr(), self.render_em_divergence(),
+            self.render_hd_alt_f1(), self.render_hd_alt_auc(),
         ]
 
+
+
+def _parse_skip_arg(value):
+    """--skip's argparse `type`: one comma-separated string (e.g. 'caster,phlag')
+    instead of nargs="+" -- a bare multi-token nargs="+" flag greedily swallows
+    whatever follows it, which collides with the positional `change` argument
+    whenever it comes after --skip on the command line."""
+    stages = [s.strip() for s in value.split(",") if s.strip()]
+    valid = {"caster", "phlag"}
+    invalid = [s for s in stages if s not in valid]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"invalid choice(s) {invalid} (choose from 'caster', 'phlag')"
+        )
+    return stages
 
 
 def parse_arguments(argv=None):
@@ -1844,13 +2147,13 @@ def parse_arguments(argv=None):
     parser.add_argument(
         "--skip",
         dest="skip",
-        nargs="+",
+        type=_parse_skip_arg,
         default=[],
-        choices=["caster", "phlag"],
-        help="Reuse existing output instead of rerunning, for the named stage(s) "
-             "(default: rerun everything -- config.json flags can change what a stage "
-             "does without touching any source file, so existing output is never "
-             "assumed to still be current unless you say so here)",
+        help="Reuse existing output instead of rerunning, for the named stage(s), "
+             "comma-separated (e.g. 'caster,phlag') (default: rerun everything -- "
+             "config.json flags can change what a stage does without touching any "
+             "source file, so existing output is never assumed to still be current "
+             "unless you say so here)",
     )
     parser.add_argument(
         "-d",
@@ -1862,14 +2165,33 @@ def parse_arguments(argv=None):
              f"outputs when summarizing (default: {DEFAULT_DIST_TYPE})",
     )
     parser.add_argument(
+        "--base",
+        dest="base",
+        type=str,
+        default=None,
+        help="Override the <dist-type>/w<W>_s<S> prefix (the segment between "
+             "<phlag_base> and 'benchmark/') with an arbitrary relative path, "
+             "e.g. 'gaussian/repulsion/w50k_s1k' for a variant-specific output "
+             "tree. Forwarded to caster/phlag as --output-base, so generation "
+             "reads and writes that tree same as the default one -- the root "
+             "<phlag_base>/<base> itself must already exist, though (errors "
+             "out rather than creating it).",
+    )
+    parser.add_argument(
         "--run",
         dest="run",
-        type=int,
+        type=str,
         default=None,
-        help="Rerun summary stats into an existing numbered run folder "
-             "(<phlag_base>/<dist-type>/w<W>_s<S>/benchmark/<run>/) instead of "
-             "allocating a new one -- tables/figures are overwritten in place "
-             "and the change message is appended to that folder's report.txt",
+        help="Rerun summary stats into a run folder given as a path relative to "
+             "<phlag_base>/<dist-type>/w<W>_s<S>/benchmark/ (or "
+             "<phlag_base>/<base>/benchmark/ if --base is given) (e.g. "
+             "'annealing' or 'repulsion/base') instead of allocating a new "
+             "numbered one -- tables/figures are overwritten in place and the "
+             "change message is appended to that folder's report.txt. Created "
+             "fresh if it doesn't exist yet; if it already exists and has its "
+             "own reports/ archive, resummarizes from that frozen snapshot "
+             "instead of the live simulations/ output tree (nothing is "
+             "rewritten there).",
     )
     parser.add_argument(
         "--errorbar",
@@ -1885,7 +2207,8 @@ def parse_arguments(argv=None):
         help="Short description of what's different in this run compared to earlier ones; "
              "written to report.txt in the run's output folder, alongside how long the run took",
     )
-    return parser.parse_args(argv)
+    from phlag.utils import apply_cli_config
+    return apply_cli_config(parser, argv, "benchmark")
 
 
 def discover_leaf_dirs(sim_root):
@@ -1900,7 +2223,8 @@ def discover_leaf_dirs(sim_root):
 
 
 def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
-                                window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
+                                window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                                base_override=None):
     """
     Where caster/phlag output for ``leaf_dir`` lands under one pinned
     (dist_type, window, step) configuration.
@@ -1909,41 +2233,52 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
     FASTA or the leaf directory itself, and need not exist; it must, however, be
     a FULL path rather than a bare node name, because node names such as 'N228'
     live under four different category directories at once.
+
+    ``base_override``: a path (relative to the phlag output root) to use in
+    place of the usual ``<dist_type>/w<W>_s<S>`` prefix -- for locating output
+    that has been relocated under a differently-structured tree (see --base).
     """
     from phlag.utils import get_data_dir, get_phlag_output_base, get_simulation_categories, get_short_sim_name
     from phlag.caster import format_val
 
     phlag_base = get_phlag_output_base(get_data_dir())
-    window_str = format_val(window_size)
-    step_str = format_val(step_size)
     cats = get_simulation_categories(str(sim_path))
     short_sim = get_short_sim_name(leaf_dir.name)
 
-    base = phlag_base / dist_type / f"w{window_str}_s{step_str}"
+    if base_override is not None:
+        base = phlag_base / base_override
+    else:
+        window_str = format_val(window_size)
+        step_str = format_val(step_size)
+        base = phlag_base / dist_type / f"w{window_str}_s{step_str}"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
 
 
 def get_expected_scores_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
-                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
+                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                             base_override=None):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_sim_output_dir(
         fasta_path, leaf_dir, dist_type=dist_type,
         window_size=window_size, step_size=step_size,
+        base_override=base_override,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "caster" / "scores.tsv"
 
 
 def get_expected_report_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
-                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
+                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                             base_override=None):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_sim_output_dir(
         fasta_path, leaf_dir, dist_type=dist_type,
         window_size=window_size, step_size=step_size,
+        base_override=base_override,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "phlag" / "report.tsv"
@@ -1994,7 +2329,7 @@ def _group_cli_tokens(tokens):
     return lines
 
 
-def run_all(args, sim_root):
+def run_all(args, sim_root, leaf_base_override):
     """
     Runs phlagster (caster + phlag) over every complete simulation leaf x concat-fasta
     combination, restricted to the current affected-fraction sweep (DEFAULT_CONCAT_PATTERNS).
@@ -2016,6 +2351,14 @@ def run_all(args, sim_root):
     through to phlag's own emission-parameterization default, so the sweep
     always matches whatever that default currently is without needing to be
     kept in sync here.
+
+    leaf_base_override: where caster/phlag actually write, in place of the
+    shared --base tree -- this run's own private <out_dir>/raw/ (see
+    resolve_run_dir/main()), so concurrent benchmark invocations targeting
+    the same --base (e.g. two named configs that only differ in phlag flags)
+    never read/write the same scores.tsv or report.tsv. Every leaf-level path
+    below uses this instead of args.base; args.base only still selects which
+    <base>/benchmark/ tree this run's own folder lives under.
     """
     from phlag.utils import find_mapping_file, load_cli_config
 
@@ -2052,9 +2395,11 @@ def run_all(args, sim_root):
     phlag_variable, _ = load_cli_config("phlag")
 
     print(
+        f"Benchmark run {args.run}\n"
         f"\n{len(work_items)} file(s) to process\n"
         f"{'skipping ' + ', '.join(args.skip) if args.skip else 'rerunning all outputs'}\n"
         f"dist-type={args.dist_type}, window={DEFAULT_WINDOW_SIZE}, step={DEFAULT_STEP_SIZE}\n"
+        f"raw caster/phlag output: {leaf_base_override} (private to this run)\n"
         "caster variable args:\n" + "\n".join(_group_cli_tokens(caster_variable)) + "\n"
         "phlag variable args:\n" + "\n".join(_group_cli_tokens(phlag_variable))
     )
@@ -2063,11 +2408,13 @@ def run_all(args, sim_root):
     skipped_present = 0
     failures = []
 
+    output_base_args = ["--output-base", leaf_base_override]
+
     for leaf_dir, rel_path, fasta_path in work_items:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
 
-        scores_path = get_expected_scores_path(fasta_path, leaf_dir, dist_type=args.dist_type)
-        report_path = get_expected_report_path(fasta_path, leaf_dir, dist_type=args.dist_type)
+        scores_path = get_expected_scores_path(fasta_path, leaf_dir, dist_type=args.dist_type, base_override=leaf_base_override)
+        report_path = get_expected_report_path(fasta_path, leaf_dir, dist_type=args.dist_type, base_override=leaf_base_override)
 
         caster_done = scores_path.exists() and "caster" in args.skip
         phlag_done = report_path.exists() and "phlag" in args.skip
@@ -2080,8 +2427,8 @@ def run_all(args, sim_root):
         if caster_done:
             print(f"[skip caster] {pattern_rel}: scores already at {scores_path}")
             phlag_ok, phlag_out = run_step(
-                [sys.executable, "-m", "phlag.phlag", str(scores_path), "-d", args.dist_type,
-                 "--plot", "-s", "1000"],
+                [sys.executable, "-m", "phlag.phlag", str(scores_path), "-d", args.dist_type]
+                + output_base_args + ["--plot", "-s", "1000"],
                 "phlag",
                 cwd=str(snapshot_root), env=snapshot_env,
             )
@@ -2092,8 +2439,8 @@ def run_all(args, sim_root):
                 continue
         else:
             phlagster_ok, phlagster_out = run_step(
-                [sys.executable, "-m", "bench.phlagster", str(fasta_path), "-d", args.dist_type,
-                 "--no-plots"],
+                [sys.executable, "-m", "bench.phlagster", str(fasta_path), "-d", args.dist_type]
+                + output_base_args + ["--no-plots"],
                 "phlagster",
                 cwd=str(snapshot_root), env=snapshot_env,
             )
@@ -2137,15 +2484,15 @@ def run_all(args, sim_root):
     return processed, skipped_incomplete, skipped_present, failures
 
 
-ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "f1"] + [
+ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1"] + [
     f"relerr_{topo}_{state}_{stat}"
     for topo in TOPOLOGY_NAMES
     for state in RELERR_STATES
     for stat in RELERR_STATISTICS
-] + ["em_bd", "em_gt_bd"] + [
+] + ["em_hd", "em_gt_hd"] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
-] + ["bic"]
+] + ["bic"] + ["clip_activation_count", "clip_activation_rate"]
 
 
 def compute_analysis(runs_path, out_path=None):
@@ -2210,8 +2557,25 @@ def save_reports(stats, out_dir):
     <leaf> is the basename of the leaf directory under simulations/ (e.g. an
     admixture pair's directory name, or a plain node id for recombination/10X)
     -- not the "Clade" header value, which can be shared by several leaves.
+
+    Hard invariant, not just a convention: this never silently overwrites an
+    already-populated reports/ archive. summarize() should only ever call
+    this for a genuinely fresh out_dir (first population) -- every path that
+    reuses an existing, already-archived run is supposed to read that archive
+    instead (see collect_from_reports_archive) rather than get here. If this
+    is reached anyway with existing files already in place, that invariant
+    has been violated somewhere upstream -- abort loudly instead of clobbering
+    real data, so the violation gets fixed rather than silently masked.
     """
     reports_dir = out_dir / "reports"
+    if reports_dir.exists() and any(reports_dir.rglob("*.tsv")):
+        sys.exit(
+            f"{RED}Error: {reports_dir} already has archived reports, but "
+            f"save_reports() was about to overwrite it (not resummarizing "
+            f"from the existing archive). Refusing to clobber -- this "
+            f"indicates a bug in how the run/reuse path was selected, not a "
+            f"normal condition.{RESET}"
+        )
     n_saved = 0
     for record in stats.runs:
         src = pathlib.Path(record.report_path)
@@ -2236,36 +2600,33 @@ def _format_duration(seconds):
     return f"{secs}s"
 
 
-def summarize(args, sim_root, reuse_dir=False, start_time=None):
+def resolve_run_dir(stats, args):
     """
-    Aggregates every finished run into the Figure-3 panels and writes them out.
+    Resolves which <default_stats_dir()>/<run>/ this invocation targets --
+    called from main() before run_all() runs, so caster/phlag can be pointed
+    directly at this run's own private raw/ area (see run_all's
+    leaf_base_override) instead of ever touching the shared general output
+    tree outside benchmark/. Returns (out_dir, reuse).
 
-    reuse_dir: True when the preceding run_all() processed nothing new (no
-    reruns, no new reports) -- in that case there's nothing to compare against
-    a fresh numbered folder for, so the latest existing run dir is modified in
-    place (tables/figures overwritten, report.txt appended to) instead of
-    allocating a new one. Falls back to a fresh dir if none exist yet.
+    args.run: explicit run folder to target (from --run), given as a path
+    relative to default_stats_dir() (e.g. 'annealing' or 'repulsion/base'),
+    e.g. to rerun stats/figures into a named folder after a code change
+    without disturbing other runs' numbering. If the given path doesn't exist
+    yet, it's created fresh at that exact path rather than falling back to
+    the next auto-allocated numbered one; reuse=True when it already exists
+    (tables/figures overwritten in place, report.txt appended to -- and if it
+    already has its own reports/ archive, see save_reports, that archive is
+    read instead of the live simulations/ output tree, e.g. `--run 10 --skip
+    caster phlag` resummarizes run 10's own frozen inputs rather than
+    silently picking up whatever now happens to sit at the live output path).
 
-    args.run: explicit run number to target (from --run), e.g. to rerun
-    stats/figures into an old folder after a code change without disturbing
-    other runs' numbering. Same in-place/append semantics as reuse_dir, and
-    takes priority over it. If the given run number doesn't exist yet, it's
-    created fresh at that exact number rather than falling back to the next
-    auto-allocated one.
-
-    start_time: time.perf_counter() value from when the `benchmark` command
-    started (main()'s first line) -- used to record how long the run took
-    in report.txt alongside the change note.
+    args.run absent: always a fresh next_run_dir(), reuse=False. Earlier this
+    fell back to reusing the latest run dir in place when run_all() found
+    nothing new to process -- that decision could only be made AFTER running
+    caster/phlag, which is no longer compatible with resolving out_dir (and
+    therefore leaf_base_override) upfront. Pass --run explicitly to reuse or
+    append to a specific folder instead of relying on that auto-detection.
     """
-    stats = BenchmarkStats(
-        sim_root=sim_root,
-        dist_type=args.dist_type,
-        errorbar=args.errorbar,
-    )
-    stats.collect()
-    figure_data = stats.aggregate()
-    stats.print_diagnostics(figure_data)
-
     if args.run is not None:
         out_dir = stats.default_stats_dir() / str(args.run)
         if out_dir.exists():
@@ -2276,12 +2637,49 @@ def summarize(args, sim_root, reuse_dir=False, start_time=None):
                 f"-- creating it fresh.{RESET}"
             )
             reuse = False
-    elif reuse_dir:
-        out_dir = stats.latest_run_dir() or stats.next_run_dir()
-        reuse = reuse_dir
     else:
         out_dir = stats.next_run_dir()
         reuse = False
+    return out_dir, reuse
+
+
+def summarize(args, sim_root, stats, out_dir, reuse, leaf_base_override, start_time=None):
+    """
+    Aggregates every finished run into the Figure-3 panels and writes them out.
+
+    stats, out_dir, reuse: resolved by main() via resolve_run_dir() before
+    run_all() executes (out_dir has to be known upfront now, to tell run_all()
+    where its private raw/ output goes -- see leaf_base_override below).
+
+    leaf_base_override: same value passed to run_all() -- where this run's
+    own caster/phlag output actually landed (<out_dir>/raw/), read from here
+    via stats.collect() instead of the shared general --base tree, unless
+    resummarizing from an already-archived reports/ snapshot (see below).
+
+    start_time: time.perf_counter() value from when the `benchmark` command
+    started (main()'s first line) -- used to record how long the run took
+    in report.txt alongside the change note.
+    """
+
+    # Any reuse of an existing run folder that already has its own archived
+    # reports/ snapshot (see save_reports) resummarizes from that frozen
+    # snapshot instead of re-reading this run's raw/ tree -- e.g. a `--skip
+    # caster phlag` rerun means recomputing ITS tables/figures from what was
+    # frozen when the run was first made, not from whatever raw/ contains
+    # now. save_reports() below additionally refuses outright to overwrite
+    # an existing non-empty archive, as a hard backstop in case this check is
+    # ever wrong.
+    archive_dir = out_dir / "reports"
+    archive_has_content = archive_dir.exists() and any(archive_dir.rglob("*.tsv"))
+    from_archive = reuse and archive_has_content
+    if from_archive:
+        print(f"Resummarizing from archived reports at {archive_dir} (live tree not touched).")
+        stats.collect_from_reports_archive(archive_dir)
+    else:
+        stats.collect(base_override=leaf_base_override)
+    figure_data = stats.aggregate()
+    stats.print_diagnostics(figure_data)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config_src = pathlib.Path(__file__).parent / "config.json"
@@ -2313,8 +2711,11 @@ def summarize(args, sim_root, reuse_dir=False, start_time=None):
     _analysis_df, analysis_path = compute_analysis(runs_path)
     print(f"Wrote analysis table: {analysis_path}")
 
-    reports_dir, n_reports_saved = save_reports(stats, out_dir)
-    print(f"Saved {n_reports_saved} report(s) to: {reports_dir}")
+    if from_archive:
+        print(f"Reports archive untouched (read-only resummarize): {archive_dir}")
+    else:
+        reports_dir, n_reports_saved = save_reports(stats, out_dir)
+        print(f"Saved {n_reports_saved} report(s) to: {reports_dir}")
 
     if (
         figure_data.n_runs_panel_a == 0 and figure_data.n_runs_panel_b == 0
@@ -2331,18 +2732,87 @@ def summarize(args, sim_root, reuse_dir=False, start_time=None):
     return figure_data
 
 
+def normalize_base_arg(base):
+    """
+    --base is meant to be a path relative to <phlag_base> (e.g.
+    'gaussian/repulsion/w50k_s1k') -- a bare relative string is returned
+    unchanged. But --base is also commonly given as a path copied straight
+    out of a file browser/IDE, which is either fully absolute (starting with
+    $CONNECTION_DIR) or repo-relative through the 'store' symlink (which
+    points at $CONNECTION_DIR) -- pathlib silently discards the intended
+    <phlag_base> prefix when joined with an absolute string, so left
+    unhandled this produces a --base that resolves to the wrong tree
+    entirely (get_expected_sim_output_dir looks for output nowhere near
+    where it actually is, so it never appears "already done" regardless of
+    --skip). Detect both forms and re-express them relative to <phlag_base>.
+
+    Also strips a redundant trailing 'benchmark' segment, since --base
+    naturally gets pointed AT the benchmark/ folder itself (that's the
+    directory being looked at) rather than its parent -- default_stats_dir()
+    always appends 'benchmark' on its own, so a --base that already ends in
+    it would double it up and break output-path discovery the same way.
+    """
+    if base is None:
+        return None
+
+    p = pathlib.Path(base)
+    is_store_relative = p.parts and p.parts[0] == "store"
+    if not p.is_absolute() and not is_store_relative:
+        return base
+
+    from phlag.utils import get_data_dir, get_phlag_output_base, get_repo_root
+
+    resolved = (get_repo_root() / p).resolve() if is_store_relative else p.resolve()
+    phlag_base = get_phlag_output_base(get_data_dir()).resolve()
+
+    try:
+        rel = resolved.relative_to(phlag_base)
+    except ValueError:
+        sys.exit(
+            f"Error: --base '{base}' resolves to {resolved}, which is outside "
+            f"the phlag output tree ({phlag_base}) -- pass a path relative to it instead."
+        )
+
+    if rel.name == "benchmark":
+        rel = rel.parent
+
+    rel_str = rel.as_posix()
+    print(f"--base: resolved '{base}' to '{rel_str}' (relative to {phlag_base}).")
+    return rel_str
+
+
 def main(argv=None):
     start_time = time.perf_counter()
     args = parse_arguments(argv)
+    args.base = normalize_base_arg(args.base)
 
-    from phlag.utils import get_data_dir
+    from phlag.utils import get_data_dir, get_phlag_output_base
 
     sim_root = get_data_dir() / "simulations"
     if not sim_root.exists():
         sys.exit(f"Error: simulations directory not found at '{sim_root}'")
 
-    processed, _skipped_incomplete, _skipped_present, _failures = run_all(args, sim_root)
-    summarize(args, sim_root, reuse_dir=(processed == 0), start_time=start_time)
+    if args.base is not None:
+        base_dir = get_phlag_output_base(get_data_dir()) / args.base
+        if not base_dir.exists():
+            sys.exit(f"Error: --base dir not found at '{base_dir}' -- it must already exist.")
+
+    stats = BenchmarkStats(
+        sim_root=sim_root,
+        dist_type=args.dist_type,
+        errorbar=args.errorbar,
+        base=args.base,
+    )
+    out_dir, reuse = resolve_run_dir(stats, args)
+    phlag_base = get_phlag_output_base(get_data_dir())
+    # This run's own private raw/ output area -- caster/phlag write here
+    # instead of the shared general --base tree, so concurrent benchmark
+    # invocations (e.g. two named configs under the same --base) never race
+    # on the same scores.tsv/report.tsv. See run_all/summarize.
+    leaf_base_override = (out_dir / "raw").relative_to(phlag_base).as_posix()
+
+    run_all(args, sim_root, leaf_base_override)
+    summarize(args, sim_root, stats, out_dir, reuse, leaf_base_override, start_time=start_time)
 
 
 if __name__ == "__main__":
