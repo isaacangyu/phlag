@@ -458,7 +458,7 @@ class PhlagHMMEmissions(HMMEmissions):
         lm_damping: float = 1.0,
         repulsion_optimizer: str = "lm",
         penalty_lambda_anneal: bool = False,
-        anneal_boost: float = 1.0,
+        anneal_boost: float = 2.0,
         n_iters: int = 10,
         increment_steps: int = 5,
     ):
@@ -476,7 +476,7 @@ class PhlagHMMEmissions(HMMEmissions):
         # steps over the whole run is the arithmetic-sequence sum below, not
         # n_iters itself. tau is a third of that total.
         total_inner_steps = increment_steps * n_iters * (n_iters + 1) // 2
-        self.anneal_tau = max(1, total_inner_steps // 3)
+        self.anneal_tau = max(1, total_inner_steps // 6)
 
         # "Budget mode": un-normalized, the schedule below (1 + boost*exp(-t/tau))
         # is always >= 1, so penalty_lambda * that is always >= penalty_lambda --
@@ -788,14 +788,17 @@ class PhlagHMMEmissions(HMMEmissions):
 
     def em_divergence(self, params: ParamsGaussianHMMEmissions) -> Float:
         """
-        Hellinger distance between states' fitted Gaussians, averaged over
-        every unordered state pair -- bounded to [0, 1], where 0 means the
-        two states are statistically identical and 1 means fully separated
-        (higher is better separation). Unlike state_divergence (means only,
-        the report's "State divergence" line), this folds both the mean AND
-        the full covariance difference into a single number. Derived from the
-        same Bhattacharyya coefficient map_estimate_repulsion optimizes
-        against (Hellinger = sqrt(1 - BC)).
+        Squared Hellinger distance between states' fitted Gaussians, averaged
+        over every unordered state pair -- bounded to [0, 1], where 0 means
+        the two states are statistically identical and 1 means fully
+        separated (higher is better separation). Unlike state_divergence
+        (means only, the report's "State divergence" line), this folds both
+        the mean AND the full covariance difference into a single number.
+        The same Bhattacharyya coefficient map_estimate_repulsion optimizes
+        against (Hellinger^2 = 1 - BC) -- squared rather than plain Hellinger
+        (which would take a further sqrt) since sqrt compresses the spread
+        near 1, bunching highly-separated cases together with little
+        resolution between them.
         """
         means = params.means
         covariances = params.covariances
@@ -804,7 +807,7 @@ class PhlagHMMEmissions(HMMEmissions):
         num_pairs = 0
         for i in range(num_states):
             for j in range(i + 1, num_states):
-                dist = gaussian_hellinger_distance(
+                dist = gaussian_hellinger2(
                     means[i], covariances[i], means[j], covariances[j]
                 )
                 total_distance += dist
@@ -949,8 +952,8 @@ class PhlagHMM(HMM):
         return self.emission_component.state_divergence(params.emissions)
 
     def em_divergence(self, params: HMMParameterSet) -> Float:
-        """Hellinger distance between states -- gaussian-only, since it
-        depends on emission_component.em_divergence (see PhlagHMMEmissions)."""
+        """Squared Hellinger distance between states -- gaussian-only, since
+        it depends on emission_component.em_divergence (see PhlagHMMEmissions)."""
         return self.emission_component.em_divergence(params.emissions)
 
     def m_step(

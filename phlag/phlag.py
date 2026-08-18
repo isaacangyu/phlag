@@ -62,8 +62,9 @@ def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
 
 
 def format_rel_err(value):
-    """Formats a report table numeric value to 6 significant figures."""
-    return f"{value:.6g}"
+    """Formats a report table numeric value: up to 3 decimals, none if >=1000."""
+    from .utils import format_number
+    return format_number(value)
 
 
 def count_trainable_params(params, props):
@@ -410,24 +411,23 @@ class Phlag:
         self.initialize_output()
 
     def extract_distribution_type_from_filename(self):
-        # Check if the user specified model_design explicitly on CLI
-        T_supplied = any(arg.startswith("-d") or arg.startswith("--emission-type") for arg in sys.argv)
-        if not T_supplied:
-            # Check input filename (caster_scores) and output filename
-            filenames_to_check = []
-            if hasattr(self.args, "caster_scores") and self.args.caster_scores:
-                filenames_to_check.append(str(self.args.caster_scores))
-            if hasattr(self.args, "output_file") and self.args.output_file:
-                filenames_to_check.append(str(self.args.output_file))
-                
-            for fname in filenames_to_check:
-                fname_lower = os.path.basename(fname).lower()
-                if "gmm" in fname_lower:
-                    self.args.model_design = "gmm"
-                    break
-                elif "gaussian" in fname_lower:
-                    self.args.model_design = "gaussian"
-                    break
+        # model_design has no CLI flag -- inferred from the input/output
+        # filename, falling back to the "gaussian" default (see parse_arguments)
+        # if neither filename carries a hint.
+        filenames_to_check = []
+        if hasattr(self.args, "caster_scores") and self.args.caster_scores:
+            filenames_to_check.append(str(self.args.caster_scores))
+        if hasattr(self.args, "output_file") and self.args.output_file:
+            filenames_to_check.append(str(self.args.output_file))
+
+        for fname in filenames_to_check:
+            fname_lower = os.path.basename(fname).lower()
+            if "gmm" in fname_lower:
+                self.args.model_design = "gmm"
+                break
+            elif "gaussian" in fname_lower:
+                self.args.model_design = "gaussian"
+                break
 
     def validate_parameters(self):
         pass
@@ -495,6 +495,7 @@ class Phlag:
         self.Y = raw_caster_matrix
 
     def get_default_out_dir(self):
+        import re
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
         # --output-base replaces the usual '<model-design>/w<W>_s<S>' prefix
@@ -517,47 +518,39 @@ class Phlag:
 
         if parsed:
             rel_dir = parsed["relative_dir"]
-            out_dir = phlag_base / dist_prefix / rel_dir / "phlag"
+            out_dir = phlag_base / dist_prefix / rel_dir
         else:
-            if input_path.parent.name == "caster":
-                # Find path relative to model design or phlag root if input is in a caster subfolder
-                # e.g., .../phlag/gaussian/w50k_s1k/admixture/high/Columbiformes_.../45-55/caster/scores.tsv
-                # should preserve w50k_s1k/admixture/high/Columbiformes_.../45-55 under phlag/<dist_type>/
-                locus_dir = input_path.parent.parent
-                parts = locus_dir.parts
-                # Check if model design, an --output-base segment, or 'phlag' is
-                # in parent path parts -- an --output-base override can contain
-                # several segments (e.g. 'gaussian/repulsion/w50k_s1k'), so match
-                # on its full token sequence, not just its first segment.
-                if output_base:
-                    base_parts = tuple(pathlib.PurePosixPath(output_base).parts)
-                    rel_parts = []
-                    for i in range(len(parts) - len(base_parts), -1, -1):
-                        if tuple(parts[i:i + len(base_parts)]) == base_parts:
-                            rel_parts = list(parts[i + len(base_parts):])
-                            break
-                else:
-                    known_models = ["gaussian", "gmm"]
-                    rel_parts = []
-                    for i in range(len(parts) - 1, -1, -1):
-                        if parts[i] in known_models or parts[i] == "phlag":
-                            rel_parts = list(parts[i+1:])
-                            break
-                if rel_parts:
-                    sub_path = pathlib.Path(*rel_parts)
-                    out_dir = phlag_base / dist_prefix / sub_path / "phlag"
-                else:
-                    from .utils import get_simulation_categories, get_short_sim_name
-                    cats = get_simulation_categories(locus_dir.name)
-                    pattern_name = get_short_sim_name(locus_dir.name)
-                    cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                    out_dir = phlag_base / dist_prefix / cat_prefix / pattern_name / "phlag"
+            # scores.tsv lives under a canonical, --output-base-independent
+            # caster/ tree (see caster.py's own output-path derivation) --
+            # report.tsv's location is still base-dependent, so all phlag
+            # needs from the input path is the category/subcategory/
+            # sim_name/pattern segments that follow caster/'s rightmost
+            # occurrence, re-rooted under phlag's own dist_prefix. Where
+            # caster/ itself sat is otherwise irrelevant, EXCEPT: when there's
+            # no --output-base, dist_prefix is dist_type alone (no window/
+            # step), so the 'w<W>_s<S>' segment -- which now sits ABOVE
+            # caster/, not below it -- has to be pulled from there explicitly
+            # to keep report.tsv under the usual '<dist_type>/w<W>_s<S>/...'
+            # tree instead of silently losing that segment.
+            parts = input_path.parts
+            caster_idx = None
+            for i in range(len(parts) - 1, -1, -1):
+                if parts[i] == "caster":
+                    caster_idx = i
+                    break
+            rel_parts = list(parts[caster_idx + 1:-1]) if caster_idx is not None else []
+            if rel_parts:
+                if not output_base and caster_idx is not None and caster_idx >= 1 \
+                        and re.match(r'w\w+_s\w+', parts[caster_idx - 1]):
+                    dist_prefix = pathlib.PurePosixPath(dist_type) / parts[caster_idx - 1]
+                sub_path = pathlib.Path(*rel_parts)
+                out_dir = phlag_base / dist_prefix / sub_path
             else:
                 from .utils import get_simulation_categories, get_short_sim_name
                 cats = get_simulation_categories(input_path.stem)
                 pattern_name = get_short_sim_name(input_path.stem)
                 cat_prefix = pathlib.Path(*cats) if cats else pathlib.Path()
-                out_dir = phlag_base / dist_prefix / cat_prefix / pattern_name / "phlag"
+                out_dir = phlag_base / dist_prefix / cat_prefix / pattern_name
         return out_dir
 
     def determine_optimal_mixtures(self):
@@ -658,11 +651,11 @@ class Phlag:
         except TypeError:
             emission_divergence_str = str(float(divergence))
 
-        # Hellinger distance between states -- gaussian-only (depends on
-        # the full covariance matrix; beta/gmm emissions have no analog).
-        em_hellinger_distance = None
+        # Squared Hellinger distance between states -- gaussian-only (depends
+        # on the full covariance matrix; beta/gmm emissions have no analog).
+        em_hellinger2_distance = None
         if getattr(self.args, "model_design", "gaussian") == "gaussian":
-            em_hellinger_distance = float(self.hmm.em_divergence(self.params))
+            em_hellinger2_distance = float(self.hmm.em_divergence(self.params))
 
 
         # Get the emission distributions for each state to compute log likelihoods
@@ -797,8 +790,18 @@ class Phlag:
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
         f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
+        # Single-operating-point AUC estimate: no per-window posterior score
+        # exists to sweep a real ROC threshold, only the one confusion matrix
+        # Viterbi's hard path already gives, so this is the standard
+        # trapezoid-under-two-points proxy rather than a true swept AUC.
+        auc = (tpr + (1.0 - fpr)) / 2.0
 
-        metrics_str = f"TPR: {tpr:.6g}, FPR: {fpr:.6g}, Precision: {precision:.6g}, F1: {f1:.6g}, Accuracy: {accuracy:.6g}"
+        from .utils import format_number
+        metrics_str = (
+            f"TPR: {format_number(tpr)}, FPR: {format_number(fpr)}, "
+            f"Precision: {format_number(precision)}, F1: {format_number(f1)}, "
+            f"Accuracy: {format_number(accuracy)}, AUC: {format_number(auc)}"
+        )
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -821,13 +824,13 @@ class Phlag:
             if branch_len is None:
                 headers.append(f"Branch length (CU): N/A (no population-information.tsv row for clade '{clade_name}')")
             else:
-                headers.append(f"Branch length (CU, node '{clade_name}'): {branch_len:.6g}")
+                headers.append(f"Branch length (CU, node '{clade_name}'): {format_number(branch_len)}")
         else:
             headers.append("Branch length (CU): N/A")
 
         if pop_info:
             try:
-                headers.append(f"Height (Ngen): {float(pop_info.get('HEIGHT_NGEN')):.6g}")
+                headers.append(f"Height (Ngen): {format_number(float(pop_info.get('HEIGHT_NGEN')))}")
             except (TypeError, ValueError):
                 headers.append("Height (Ngen): N/A")
             try:
@@ -847,7 +850,7 @@ class Phlag:
         n_windows = int(len(y_true))
         n_anomaly = int(np.sum(y_true == 1))
         anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
-        headers.append(f"Anomaly fraction: {anomaly_fraction:.6g} ({n_anomaly}/{n_windows} windows)")
+        headers.append(f"Anomaly fraction: {format_number(anomaly_fraction)} ({n_anomaly}/{n_windows} windows)")
         headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
 
         # Source mtimes at report-generation time -- let bench.benchmark's run_all()
@@ -861,33 +864,34 @@ class Phlag:
         headers.append(f"Phlag source mtime: {_phlag_mtime:.6f}")
 
         headers.append("State divergence: " + emission_divergence_str)
-        if em_hellinger_distance is not None:
-            headers.append(f"EM divergence (Hellinger): {em_hellinger_distance:.6g}")
+        if em_hellinger2_distance is not None:
+            headers.append(f"EM divergence (Hellinger^2): {format_number(em_hellinger2_distance)}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
-            tm_before_str = ", ".join(f"[{', '.join(f'{x:.6g}' for x in row)}]" for row in self.initial_transition_matrix.tolist())
+            tm_before_str = ", ".join(f"[{', '.join(format_number(x) for x in row)}]" for row in self.initial_transition_matrix.tolist())
             headers.append(f"Initial transition matrix (before EM): [{tm_before_str}]")
-        tm_after_str = ", ".join(f"[{', '.join(f'{x:.6g}' for x in row)}]" for row in transition_matrix_np.tolist())
+        tm_after_str = ", ".join(f"[{', '.join(format_number(x) for x in row)}]" for row in transition_matrix_np.tolist())
         headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
 
         if hasattr(self, "final_em_log_prob"):
-            headers.append(f"EM final joint log-likelihood: {self.final_em_log_prob:.6g}")
+            headers.append(f"EM final joint log-likelihood: {format_number(self.final_em_log_prob)}")
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
-            f"BIC: {bic:.6g} (log-likelihood={marginal_ll:.6g}, k={k_params} trainable params, n={n_obs} windows)"
+            f"BIC: {format_number(bic)} (log-likelihood={format_number(marginal_ll)}, "
+            f"k={k_params} trainable params, n={n_obs} windows)"
         )
         if hasattr(self, "clip_activation_count") and self.clip_activation_attempts > 0:
             clip_rate = self.clip_activation_count / self.clip_activation_attempts
             clip_unsafe = clip_rate > GRADIENT_CLIP_UNSAFE_RATE_THRESHOLD
             headers.append(
                 f"Gradient clip activations: {self.clip_activation_count} "
-                f"(rate: {clip_rate:.6g}, unsafe: {clip_unsafe})"
+                f"(rate: {format_number(clip_rate)}, unsafe: {clip_unsafe})"
             )
 
         headers.append(f"{metrics_str}")
@@ -901,14 +905,14 @@ class Phlag:
             # comparison it actually corresponds to instead of assuming
             # state 0 is always Null.
             null_state, alt_state = (1, 0) if flipped_for_eval else (0, 1)
-            # Per-topology (marginal, univariate) ground-truth Hellinger
-            # distance, averaged across topologies -- the ground-truth split
-            # only gives per-topology mean/std (no cross-topology covariance),
-            # so unlike the fitted EM divergence (joint over all topologies at
-            # once) this is an average of marginals. Same measure
-            # hmm.PhlagHMMEmissions.em_divergence uses (bounded [0, 1], 0 =
-            # statistically identical, 1 = fully separated), so the two
-            # numbers are on a comparable scale.
+            # Per-topology (marginal, univariate) ground-truth squared
+            # Hellinger distance, averaged across topologies -- the
+            # ground-truth split only gives per-topology mean/std (no
+            # cross-topology covariance), so unlike the fitted EM divergence
+            # (joint over all topologies at once) this is an average of
+            # marginals. Same measure hmm.PhlagHMMEmissions.em_divergence
+            # uses (bounded [0, 1], 0 = statistically identical, 1 = fully
+            # separated), so the two numbers are on a comparable scale.
             gt_divergences = []
             for d in sorted(self.ground_truth_fits.keys()):
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
@@ -923,15 +927,15 @@ class Phlag:
                 headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
                 headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(mu_alt_fit)}\t{format_rel_err(mu_alt_gt)}\t{format_rel_err(rel_mu_alt)}")
                 headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(std_alt_fit)}\t{format_rel_err(std_alt_gt)}\t{format_rel_err(rel_std_alt)}")
-                hellinger_gt = hmm.gaussian_hellinger_distance(
+                hellinger2_gt = hmm.gaussian_hellinger2(
                     jnp.array([mu_null_gt]), jnp.array([[std_null_gt ** 2]]),
                     jnp.array([mu_alt_gt]), jnp.array([[std_alt_gt ** 2]]),
                 )
-                gt_divergences.append(float(hellinger_gt))
+                gt_divergences.append(float(hellinger2_gt))
             if gt_divergences:
-                headers.append(f"Ground truth EM divergence (Hellinger): {sum(gt_divergences) / len(gt_divergences):.6g}")
+                headers.append(f"Ground truth EM divergence (Hellinger^2): {format_number(sum(gt_divergences) / len(gt_divergences))}")
         for idx, l in enumerate(path_likelihoods):
-            headers.append(f"Path {idx + 1} final joint log-likelihood: {l[-1]:.6g}")
+            headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
         headers.append("--- Bookkeeping ---")
         headers.append(f"Confusion: TP={tp} FP={fp} FN={fn} TN={tn}")
@@ -1200,7 +1204,7 @@ def backfill_branch_length(root_dir=None):
         with open(report_path, "r") as f:
             lines = f.read().splitlines()
 
-        new_line = f"Branch length (CU, node '{clade_name}'): {branch_len:.6g}"
+        new_line = f"Branch length (CU, node '{clade_name}'): {utils.format_number(branch_len)}"
         for idx, line in enumerate(lines):
             if branch_length_line_re.match(line.strip()):
                 lines[idx] = new_line
@@ -1796,14 +1800,7 @@ def parse_arguments(argv=None):
                     rejected ones) starting from this value -- 0 starts at an
                     undamped Newton step, not gradient descent.""",
     )
-    hmm_group.add_argument(
-        "-d",
-        dest="model_design",
-        type=str.lower,
-        default="gaussian",
-        choices=["gaussian", "gmm"],
-        help="Type of HMM emissions (gaussian or gmm. Default: gaussian)",
-    )
+    parser.set_defaults(model_design="gaussian")
     hmm_group.add_argument(
         "--output-base",
         dest="output_base",
@@ -1860,21 +1857,23 @@ def parse_arguments(argv=None):
             if not b.exists():
                 continue
             if target_name:
-                # Look for target_name subdirectory
-                target_dirs = list(b.glob(f"**/{target_name}/**/caster")) + list(b.glob(f"**/{target_name}"))
+                # Look for target_name subdirectory anywhere under b -- under
+                # the canonical caster/ layout that's always somewhere below
+                # a caster/ ancestor, not a sibling/child of one, so there's
+                # no separate '**/caster'-anchored search needed any more.
+                target_dirs = [td for td in b.glob(f"**/{target_name}") if td.is_dir()]
                 for td in target_dirs:
-                    if td.is_dir():
-                        for sfile in td.rglob("scores.tsv"):
-                            if sfile.parent.name == "caster" and sfile.resolve() not in seen:
-                                seen.add(sfile.resolve())
-                                candidates.append(sfile)
-                        for sfile in td.rglob("*.tsv"):
-                            if sfile.parent.name == "caster" and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]) and sfile.resolve() not in seen:
-                                seen.add(sfile.resolve())
-                                candidates.append(sfile)
+                    for sfile in td.rglob("scores.tsv"):
+                        if "caster" in sfile.parts and sfile.resolve() not in seen:
+                            seen.add(sfile.resolve())
+                            candidates.append(sfile)
+                    for sfile in td.rglob("*.tsv"):
+                        if "caster" in sfile.parts and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]) and sfile.resolve() not in seen:
+                            seen.add(sfile.resolve())
+                            candidates.append(sfile)
             else:
                 for sfile in b.rglob("scores.tsv"):
-                    if sfile.parent.name == "caster" and sfile.resolve() not in seen:
+                    if "caster" in sfile.parts and sfile.resolve() not in seen:
                         seen.add(sfile.resolve())
                         candidates.append(sfile)
         if candidates:

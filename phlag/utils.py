@@ -1,7 +1,32 @@
 import time
 import argparse
+import math
 
 from functools import wraps
+
+def format_number(value):
+    """
+    Formats a number for report/table display: up to 3 decimal places,
+    trailing zeros trimmed. A value whose magnitude is >= 1000 is rounded to
+    a plain integer instead -- decimal precision doesn't add useful
+    information at that scale for phlag's metrics/likelihoods/BIC/etc.
+    None/NaN/Inf/non-numeric values pass through unchanged (as their
+    original type, not stringified) so callers can still distinguish a
+    missing value from a formatted one.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return value
+    if math.isnan(f) or math.isinf(f):
+        return value
+    if abs(f) >= 1000:
+        return f"{f:.0f}"
+    s = f"{f:.3f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-", "-0") else "0"
+
 
 def count_lines(filepath):
     try:
@@ -145,16 +170,18 @@ def get_simulation_node_name(file_path):
     """
     Extracts the simulation directory segment (the clade/node identifier, e.g.
     'Strigiformes_N297_rate090-time7099554' or 'N555') directly from a caster/phlag
-    output path, by taking the path component two levels above 'caster' or 'phlag'
-    (.../<node_name>/<pattern>/caster/scores.tsv or .../<node_name>/<pattern>/phlag/report.tsv).
-    Returns None if the path doesn't match this convention.
+    output path. Both scores.tsv (.../caster/.../<node_name>/<pattern>/scores.tsv,
+    caster/ base-independent and possibly many levels up) and report.tsv
+    (.../<node_name>/<pattern>/report.tsv, no phlag/ subdir) sit exactly two
+    directories below their simulation's node_name segment, a fixed offset
+    from the filename regardless of how many segments come before it.
+    Returns None if the path is too shallow to contain one.
     """
     import pathlib
     parts = pathlib.Path(file_path).parts
-    for idx in range(len(parts) - 1, -1, -1):
-        if parts[idx] in ("caster", "phlag") and idx >= 2:
-            return clean_locus_name(parts[idx - 2])
-    return None
+    if len(parts) < 3:
+        return None
+    return clean_locus_name(parts[-3])
 
 
 def get_simulation_clade(caster_scores_path, sim_root=None):
@@ -194,25 +221,20 @@ def get_simulation_clade(caster_scores_path, sim_root=None):
 def resolve_fasta_from_scores_path(scores_path, sim_root=None):
     """
     Reverse-resolves a not-yet-computed scores.tsv-style output path back to its source
-    concat FASTA, by matching the path's simulation-directory segment (the component two
-    levels above 'caster', see get_simulation_node_name) against leaf directories under
-    the simulations root, then requiring an exact match between the path's pattern-stem
-    segment (the component directly above 'caster') and a FASTA filename in that leaf's
-    concat/ subdirectory. Does not guess -- returns None if there is no exact match,
-    including when the concat/ directory has multiple FASTAs and none match.
+    concat FASTA, by matching the path's simulation-directory segment (two levels above
+    the filename, see get_simulation_node_name) against leaf directories under the
+    simulations root, then requiring an exact match between the path's pattern-stem
+    segment (the component directly above the filename) and a FASTA filename in that
+    leaf's concat/ subdirectory. Does not guess -- returns None if there is no exact
+    match, including when the concat/ directory has multiple FASTAs and none match.
     """
     import pathlib
     parts = pathlib.Path(scores_path).parts
-    caster_idx = None
-    for idx in range(len(parts) - 1, -1, -1):
-        if parts[idx] == "caster" and idx >= 2:
-            caster_idx = idx
-            break
-    if caster_idx is None:
+    if "caster" not in parts or len(parts) < 3:
         return None
 
-    node_name = clean_locus_name(parts[caster_idx - 2])
-    pattern_stem = clean_locus_name(parts[caster_idx - 1])
+    node_name = clean_locus_name(parts[-3])
+    pattern_stem = clean_locus_name(parts[-2])
 
     if sim_root is None:
         sim_root = get_data_dir() / "simulations"
@@ -483,18 +505,21 @@ def get_locus_description(file_path):
                 if not sim_part and not re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', p):
                     sim_part = clean_locus_name(p)
 
-    for idx, p in enumerate(parts):
-        if p in ['phlag', 'caster'] and idx > 0:
-            candidate = clean_locus_name(parts[idx - 1])
-            if candidate not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations']:
-                if re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', candidate) or 'a' in candidate.lower() or 'n' in candidate.lower():
-                    pattern_stem = candidate
-                elif not sim_part:
-                    sim_part = candidate
-            if idx > 1 and not sim_part:
-                candidate2 = clean_locus_name(parts[idx - 2])
-                if candidate2 not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations']:
-                    sim_part = candidate2
+    # scores.tsv (the only kind of path ever passed in here) sits directly in
+    # its pattern directory, which sits directly in its simulation directory
+    # -- a fixed two-level offset from the filename, regardless of how many
+    # caster/<category>/<subcategory>/<base> segments come before it.
+    if len(parts) >= 2:
+        candidate = clean_locus_name(parts[-2])
+        if candidate not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations', 'caster']:
+            if re.match(r'^\d+-\d+(?:[;_,]\d+-\d+)*$', candidate) or 'a' in candidate.lower() or 'n' in candidate.lower():
+                pattern_stem = candidate
+            elif not sim_part:
+                sim_part = candidate
+    if len(parts) >= 3 and not sim_part:
+        candidate2 = clean_locus_name(parts[-3])
+        if candidate2 not in ['low', 'high', 'up', 'down', 'admixture', '10X', 'recombination', 'gaussian', 'gmm', 'simulations', 'caster']:
+            sim_part = candidate2
 
     locus_tokens = []
     if sim_part:
@@ -532,7 +557,8 @@ def parse_filename_to_dir_structure(filename):
             "pattern": pattern_val,
             "locus": m.group(4),
             "window_step": m.group(5),
-            "relative_dir": f"{m.group(5)}/{cat_prefix}{short_alt}/{pattern_val}"
+            "relative_dir": f"{m.group(5)}/{cat_prefix}{short_alt}/{pattern_val}",
+            "relative_dir_no_window": f"{cat_prefix}{short_alt}/{pattern_val}",
         }
     # Attempt parsing without locus chunk
     m2 = re.search(r'null-(.*?)_alt-(.*?)_' + pattern_regex + r'_(w\w+_s\w+)', filename)
@@ -547,7 +573,8 @@ def parse_filename_to_dir_structure(filename):
             "alt": alt_name,
             "pattern": pattern_val,
             "window_step": m2.group(4),
-            "relative_dir": f"{m2.group(4)}/{cat_prefix}{short_alt}/{pattern_val}"
+            "relative_dir": f"{m2.group(4)}/{cat_prefix}{short_alt}/{pattern_val}",
+            "relative_dir_no_window": f"{cat_prefix}{short_alt}/{pattern_val}",
         }
     return None
 

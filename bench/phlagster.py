@@ -25,7 +25,9 @@ def parse_arguments(argv=None):
         dest="output_base",
         default=None,
         help="Forwarded to both caster's and phlag's --output-base (default: unset, "
-             "uses the normal '<dist-type>/w<W>_s<S>' output-path prefix).",
+             "uses the normal '<dist-type>/w<W>_s<S>' output-path prefix). Caster "
+             "accepts but ignores it -- scores.tsv always lives in one canonical, "
+             "--output-base-independent location; only phlag's report.tsv honors it.",
     )
     parser.add_argument(
         "--no-plots",

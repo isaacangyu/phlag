@@ -9,6 +9,6 @@
   },
   "benchmark": {
     "fixed": [],
-    "variable": ["--base", "gaussian/repulsion/w50k_s1k"]
+    "variable": []
   }
 }

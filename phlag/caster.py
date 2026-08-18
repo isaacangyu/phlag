@@ -415,10 +415,12 @@ def parse_arguments(argv=None):
         "--output-base",
         dest="output_base",
         default=None,
-        help="Override the '<dist-type>/w<W>_s<S>' output-path prefix with an "
-             "arbitrary relative path (e.g. 'gaussian/repulsion/w50k_s1k'), for "
-             "writing into a relocated/variant-specific output tree instead of "
-             "the default one"
+        help="Accepted for CLI compatibility with phlag/phlagster (which pass "
+             "the same flag to both stages), but has no effect here: "
+             "scores.tsv always lives in one canonical, --output-base-"
+             "independent location keyed only by <dist-type>/w<W>_s<S>, "
+             "shared across every phlag-side --output-base/--base variant "
+             "instead of being recomputed/duplicated per variant."
     )
     parser.add_argument(
         "--tree",
@@ -466,16 +468,17 @@ def main(argv=None):
         # Resolve existing scores.tsv
         from .utils import parse_filename_to_dir_structure, get_phlag_output_base
         phlag_base = get_phlag_output_base(data_dir)
-        # --output-base replaces the usual '<dist-type>/w<W>_s<S>' prefix
-        # wholesale -- it already carries whatever variant/window/step
-        # structure the caller wants, so window_str/step_str aren't
-        # re-appended on top of it.
-        dist_prefix = pathlib.Path(args.output_base) if args.output_base else pathlib.Path(args.dist_type)
-        sim_base = phlag_base / args.output_base if args.output_base else phlag_base / args.dist_type / f"w{window_str}_s{step_str}"
+        # scores.tsv lives in one canonical location keyed only by
+        # dist_type/window/step -- caster's windowed dstar statistics don't
+        # depend on --output-base/--base at all (that only selects a
+        # phlag-side model/variant tree), so every --base variant reads and
+        # writes the same cached scores.tsv here instead of each getting its
+        # own copy recomputed from scratch.
+        caster_root = phlag_base / args.dist_type / f"w{window_str}_s{step_str}" / "caster"
         parsed = parse_filename_to_dir_structure(clean_stem)
         if parsed:
-            rel_dir = parsed["relative_dir"]
-            final_output_path = phlag_base / dist_prefix / rel_dir / "caster" / "scores.tsv"
+            rel_dir = parsed["relative_dir_no_window"]
+            final_output_path = caster_root / rel_dir / "scores.tsv"
         else:
             parts = args.fasta_file.parts
             is_sim = False
@@ -490,15 +493,15 @@ def main(argv=None):
                 short_sim = get_short_sim_name(sim_name)
                 pattern_stem = clean_stem
                 if cats:
-                    final_output_path = sim_base / cats[0] / cats[1] / short_sim / pattern_stem / "caster" / "scores.tsv"
+                    final_output_path = caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
                 else:
-                    final_output_path = sim_base / short_sim / pattern_stem / "caster" / "scores.tsv"
+                    final_output_path = caster_root / short_sim / pattern_stem / "scores.tsv"
                 is_sim = True
 
             if not is_sim:
                 pattern_stem = clean_stem
                 final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-                final_output_path = sim_base / pattern_stem / "caster" / final_output_name
+                final_output_path = caster_root / pattern_stem / final_output_name
 
     is_fasta = not (input_str.endswith('.tsv') or args.fasta_file.name == 'scores.tsv')
     if is_fasta or not final_output_path.exists():
@@ -696,9 +699,27 @@ def main(argv=None):
             for r in results:
                 output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
 
+            # final_output_path may be the shared, base-independent caster/
+            # cache -- concurrent benchmark runs across different --base
+            # variants can legitimately be computing the same scores.tsv at
+            # once, so the write itself must be atomic (write-then-rename)
+            # rather than an in-place open("w"): any reader checking
+            # final_output_path.exists() must only ever see either nothing
+            # or a complete file, never a partial one.
             final_output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(final_output_path, "w") as f:
-                f.writelines(output_lines)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(final_output_path.parent), prefix=".scores_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(tmp_fd, "w") as f:
+                    f.writelines(output_lines)
+                os.replace(tmp_path, final_output_path)
+            except BaseException:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
             print(f"Success: TSV output file generated at: {final_output_path}")
         finally:
             shutil.rmtree(temp_dir)
