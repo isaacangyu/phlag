@@ -12,10 +12,6 @@ from typing import Any, Callable, NamedTuple, Optional, Tuple, Union, cast
 
 from jax import jit, lax
 from jax.flatten_util import ravel_pytree
-from jax.scipy.special import kl_div
-from jax.scipy.optimize import minimize
-from jax.nn import softmax, one_hot
-from jax.lax import while_loop
 from jaxtyping import Array, Float, Int, PyTree
 from dynamax.utils.utils import pytree_sum
 from dynamax.hidden_markov_model.inference import *
@@ -168,13 +164,6 @@ def hmm_two_filter_smoother(
     return posterior
 
 
-def hellinger2_distance(p: Float[Array, "num_classes"], q: Float[Array, "num_classes"]) -> Float:
-    return jnp.sum((jnp.sqrt(p) - jnp.sqrt(q)) ** 2) * 0.5
-
-
-def divergence_e(e_0: Float[Array, "num_classes"], e_1: Float[Array, "num_classes"]) -> Float:
-    return hellinger2_distance(e_1, e_0)
-
 def gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2):
     d = mu1.shape[0]
     eps = 1e-6
@@ -190,11 +179,6 @@ def gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2):
 
 def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
     return 1.0 - gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
-
-
-def gaussian_hellinger_distance(mu1, Sigma1, mu2, Sigma2):
-    """Hellinger distance, bounded [0, 1]: 0 = identical distributions, 1 = fully separated."""
-    return jnp.sqrt(jnp.clip(gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2), a_min=0.0))
 
 
 class ParamsGMMHMMEmissions(NamedTuple):
@@ -476,7 +460,7 @@ class PhlagHMMEmissions(HMMEmissions):
         # steps over the whole run is the arithmetic-sequence sum below, not
         # n_iters itself. tau is a third of that total.
         total_inner_steps = increment_steps * n_iters * (n_iters + 1) // 2
-        self.anneal_tau = max(1, total_inner_steps // 6)
+        self.anneal_tau = max(1, total_inner_steps // 3)
 
         # "Budget mode": un-normalized, the schedule below (1 + boost*exp(-t/tau))
         # is always >= 1, so penalty_lambda * that is always >= penalty_lambda --
@@ -1046,7 +1030,6 @@ class PhlagHMM(HMM):
             m_step_state = self.initialize_m_step_state(params, props)
 
         if verbose:
-            # Print initial transition matrix
             tm_init = params.transitions.transition_matrix
             tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
             print(f"Initial Transition matrix: {tm_init_str}")
@@ -1056,7 +1039,6 @@ class PhlagHMM(HMM):
             log_probs.append(marginal_loglik)
 
             if verbose:
-                # Print transition probabilities at each iteration
                 tm = params.transitions.transition_matrix
                 tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
                 print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")

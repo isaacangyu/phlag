@@ -17,10 +17,12 @@ and ``phlag.py`` uses for ``PhlagPlotter``):
 import ast
 import re
 import sys
+import json
 import time
 import math
 import shutil
 import pathlib
+import datetime
 import argparse
 import subprocess
 
@@ -32,6 +34,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker
+from tqdm import tqdm
 
 RED = "\033[91m"
 RESET = "\033[0m"
@@ -87,7 +90,7 @@ FRACTION_BIN_EDGES = [
 FRACTION_BINS = [label for label, _, _ in FRACTION_BIN_EDGES]
 
 # hd-by-alt-proportion heatmap bin count -- edges are computed per-run from
-# the actual observed em_hd min/max (see BenchmarkStats._compute_hd_bins),
+# the actual observed em_gt_hd min/max (see BenchmarkStats._compute_hd_bins),
 # not fixed over [0, 1], so a run whose separation values cluster in a narrow
 # sub-range still gets visually spread across all 6 rows instead of piling
 # into one or two.
@@ -156,7 +159,7 @@ _RE_CLIP_ACTIVATIONS = re.compile(
     r'^Gradient clip activations:\s*(\d+)\s*\(rate:\s*([-\d.eE+]+),\s*unsafe:\s*(True|False)\)\s*$'
 )
 _RE_BIC = re.compile(
-    r'^BIC:\s*([-\d.eE+]+)\s*\(log-likelihood=([-\d.eE+]+),\s*'
+    r'^BIC:\s*([-\d.eE+]+|-?nan|-?inf)\s*\(log-likelihood=([-\d.eE+]+|-?nan|-?inf),\s*'
     r'k=(\d+)\s*trainable params,\s*n=(\d+)\s*windows\)\s*$'
 )
 # Older reports' "--- Bookkeeping ---"/"--- Fitted parameters ..." section --
@@ -205,25 +208,6 @@ def gaussian_hellinger2_distance_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
     quad = diff @ np.linalg.solve(Sigma_avg, diff)
     bc = np.exp(log_coef - 0.125 * quad)
     return float(max(1.0 - bc, 0.0))
-
-
-def hellinger_distance_from_legacy_log_bc(distance_value):
-    """
-    Converts an "EM divergence (Bhattacharyya):" header value written under
-    the original -log(BC) convention (before this repo switched to a
-    Bhattacharyya coefficient, then to a Hellinger distance) into a Hellinger
-    distance: BC = exp(-distance_value), Hellinger = sqrt(1 - BC).
-
-    NOT safe to apply automatically/generally -- a value in [0, 1] is
-    genuinely ambiguous between this legacy convention and a real Hellinger
-    distance already written by current code (they overlap in range), so
-    this is only correct when the report's provenance (e.g. source mtimes,
-    presence/absence of other header lines added or removed at known points)
-    independently confirms it predates the coefficient/Hellinger switch.
-    Only call this with that external confirmation in hand.
-    """
-    bc = math.exp(-distance_value)
-    return math.sqrt(max(1.0 - bc, 0.0))
 
 
 def _parse_branch_length_value(value_str):
@@ -650,7 +634,7 @@ class PanelBCell:
 class RelErrCell:
     """
     One grouped-bar cell of the relerr figure: two bars, the mean |relative
-    error| (%) of the EM-fitted mean and of the EM-fitted covariance (std),
+    error| (decimal, e.g. 0.05 = 5%) of the EM-fitted mean and of the EM-fitted covariance (std),
     each vs. the ground-truth-split empirical fit, over the runs in this cell.
 
     Same (column, fraction_bin, x_bin) grouping panel A uses, so relerr.png
@@ -700,10 +684,12 @@ class EmDivergenceCell:
 @dataclass
 class HdAltCell:
     """
-    One cell of the hd-by-alt-proportion heatmaps: mean F1 and mean proxy
-    AUC (= (tpr + (1 - fpr)) / 2, the single-operating-point ROC-AUC
-    estimate -- no per-window posterior scores exist to sweep a real
-    threshold) over the runs in this (pattern, hd_bin) cell.
+    One cell of the hd-by-alt-proportion heatmaps: mean F1 and mean ROC-AUC
+    (record.auc -- a real per-window-posterior-swept ROC AUC for reports
+    written after phlag.py started emitting one, else the legacy
+    single-operating-point (tpr + (1 - fpr)) / 2 estimate parse_report()
+    falls back to for older reports) over the runs in this (pattern, hd_bin)
+    cell.
     """
     pattern: str
     hd_bin: str
@@ -837,10 +823,12 @@ class BenchmarkStats:
         tree on disk, so it picks up every finished default-pattern run that exists
         there -- not only ones produced by a `run_all()` call earlier in this process.
 
-        base_override: None reads the plain <dist_type>/w<W>_s<S> tree that every
-        benchmark run shares (no more per-run private raw/ tree -- runs aren't
-        concurrent, so nothing needs isolating); a caller can still pass an
-        explicit override for some other relocated tree if ever needed.
+        base_override: None reads the plain <dist_type>/w<W>_s<S> shared tree
+        (nested '<pattern>/report.tsv' shape). A given base_override is always
+        a specific benchmark run's own <out_dir>/reports/ tree (see
+        get_run_reports_base_override) -- phlag writes report.tsv there as a
+        flat '<pattern>.tsv' file (--bench mode), so this reads that shape
+        instead.
         """
         from phlag.utils import get_simulation_categories
 
@@ -882,10 +870,18 @@ class BenchmarkStats:
                 step_size=self.step_size,
                 base_override=base_override,
             )
-            report_paths = sorted(
-                p for p in sim_output_dir.glob("*/report.tsv")
-                if p.parent.name in DEFAULT_CONCAT_PATTERNS
-            )
+            if base_override is not None:
+                report_paths = sorted(
+                    p for p in sim_output_dir.glob("*.tsv")
+                    if p.stem in DEFAULT_CONCAT_PATTERNS
+                )
+                pattern_of = lambda p: p.stem
+            else:
+                report_paths = sorted(
+                    p for p in sim_output_dir.glob("*/report.tsv")
+                    if p.parent.name in DEFAULT_CONCAT_PATTERNS
+                )
+                pattern_of = lambda p: p.parent.name
             if not report_paths:
                 self.n_leaf_dirs_without_output += 1
                 self.notes.append(
@@ -895,56 +891,11 @@ class BenchmarkStats:
                 continue
 
             for report_path in report_paths:
-                pattern = report_path.parent.name
+                pattern = pattern_of(report_path)
                 self.runs.append(
                     self._build_record(report_path, leaf_dir.name, rel_leaf, category, subcategory, column, pattern)
                 )
 
-        return self.runs
-
-    def collect_from_reports_archive(self, reports_dir):
-        """
-        Populates ``self.runs`` from a previously-archived reports/ snapshot
-        (see ``save_reports``) -- ``reports_dir/<category>/<subcategory>/<leaf>/<pattern>.tsv``
-        -- instead of re-walking the live simulations/ output tree. Used to
-        resummarize an existing --run folder's own frozen inputs without
-        picking up whatever now happens to be at the live expected-output
-        path, which may have changed (rerun, overwritten by a concurrent
-        session, etc.) since that run was made.
-        """
-        self.runs = []
-        self.notes = []
-        self.n_leaf_dirs_uncategorized = 0
-        self.n_leaf_dirs_without_output = 0
-
-        if not reports_dir.exists():
-            self.notes.append(f"reports archive not found at '{reports_dir}' -- nothing to summarize")
-            self.n_leaf_dirs = 0
-            return self.runs
-
-        leaf_keys = set()
-        for report_path in sorted(reports_dir.glob("*/*/*/*.tsv")):
-            leaf_name = report_path.parent.name
-            subcategory = report_path.parent.parent.name
-            category = report_path.parent.parent.parent.name
-            pattern = report_path.stem
-            rel_leaf = f"{category}/{subcategory}/{leaf_name}"
-            leaf_keys.add((category, subcategory, leaf_name))
-
-            column = CATEGORY_TO_COLUMN.get((category, subcategory))
-            if column is None:
-                self.n_leaf_dirs_uncategorized += 1
-                self.notes.append(
-                    f"[skip] {rel_leaf}/{pattern}: category ('{category}', '{subcategory}') "
-                    f"has no Figure-3 column in CATEGORY_TO_COLUMN"
-                )
-                continue
-
-            self.runs.append(
-                self._build_record(report_path, leaf_name, rel_leaf, category, subcategory, column, pattern)
-            )
-
-        self.n_leaf_dirs = len(leaf_keys)
         return self.runs
 
     def _build_record(self, report_path, leaf_name, rel_leaf, category, subcategory, column, pattern):
@@ -1070,15 +1021,15 @@ class BenchmarkStats:
 
     def _compute_hd_bins(self):
         """
-        Builds HD_NUM_BINS equal-width bins spanning the observed em_hd
+        Builds HD_NUM_BINS equal-width bins spanning the observed em_gt_hd
         range across self.runs, rounded to 3 decimals at the ends -- unlike
         the old fixed-[0, 1] version, this keeps the hd-by-alt-proportion
         heatmap's rows meaningful when every run's separation clusters in a
         narrow sub-range instead of spanning the whole theoretical range.
         Sets self.hd_bin_edges (for assign_bin) and self.hd_bins (labels, in
-        row order). No em_hd values at all -> both end up empty.
+        row order). No em_gt_hd values at all -> both end up empty.
         """
-        values = [r.em_hd for r in self.runs if r.em_hd is not None]
+        values = [r.em_gt_hd for r in self.runs if r.em_gt_hd is not None]
         if not values:
             self.hd_bin_edges = []
             self.hd_bins = []
@@ -1109,12 +1060,12 @@ class BenchmarkStats:
         """Reduces ``self.runs`` to a Figure3Data. Call ``collect()`` first."""
         self._compute_hd_bins()
         for record in self.runs:
-            record.hd_bin = assign_bin(record.em_hd, self.hd_bin_edges)
+            record.hd_bin = assign_bin(record.em_gt_hd, self.hd_bin_edges)
             if record.hd_bin is not None and record.f1 is not None:
                 record.in_panel_hd_alt = True
             elif not record.exclusion:
                 record.exclusion = (
-                    "no EM divergence line in report (hd_alt panel only)"
+                    "no ground-truth EM divergence line in report (hd_alt panel only)"
                     if record.hd_bin is None
                     else "no F1 in report (hd_alt panel only)"
                 )
@@ -1212,10 +1163,7 @@ class BenchmarkStats:
         for key, records in panel_hd_alt_groups.items():
             pattern, hd_bin = key
             mean_f1 = sum(r.f1 for r in records) / len(records)
-            # Proxy AUC: no per-window posterior scores exist to sweep a real
-            # ROC threshold, so this is the standard single-operating-point
-            # estimate from the confusion matrix already on hand.
-            mean_auc = sum((r.tpr + (1.0 - r.fpr)) / 2.0 for r in records) / len(records)
+            mean_auc = sum(r.auc for r in records) / len(records)
             panel_hd_alt[key] = HdAltCell(
                 pattern=pattern, hd_bin=hd_bin, n_runs=len(records),
                 mean_f1=mean_f1, mean_auc=mean_auc,
@@ -1273,7 +1221,7 @@ class BenchmarkStats:
         "anomaly_fraction", "anomaly_fraction_source", "fraction_bin",
         "x_variable", "x_value", "x_bin", "branch_length_cu",
         "clade_name", "clade_number",
-        "tpr", "fpr", "precision", "f1", "accuracy", "auc", "tp", "fp", "fn", "tn",
+        "tpr", "fpr", "precision", "f1", "accuracy", "roc_auc", "tp", "fp", "fn", "tn",
         "n_windows", "label_flipped",
         "in_panel_a", "in_panel_b", "in_panel_relerr", "in_panel_em_divergence",
         "in_panel_hd_alt", "hd_bin",
@@ -1338,7 +1286,7 @@ class BenchmarkStats:
                     "tpr": record.tpr, "fpr": record.fpr,
                     "precision": record.precision,
                     "f1": record.f1, "accuracy": record.accuracy,
-                    "auc": record.auc,
+                    "roc_auc": record.auc,
                     "tp": record.tp, "fp": record.fp,
                     "fn": record.fn, "tn": record.tn,
                     "n_windows": record.n_windows,
@@ -1417,99 +1365,6 @@ class BenchmarkStats:
                      cell.err_minus, cell.err_plus, cell.run_ids)
 
         return runs_path, bins_path
-
-    def print_diagnostics(self, figure_data=None):
-        """Prints why every discovered run did or did not end up in a bar/point."""
-        if figure_data is None:
-            figure_data = self.aggregate()
-
-        print("\n=== Benchmark summary ===")
-        print(f"Configuration: dist-type={self.dist_type}, window={self.window_size}, "
-              f"step={self.step_size}, errorbar={self.errorbar}")
-        print(f"Source tree: {self.sim_root}")
-        print(f"Leaf simulation dirs walked: {self.n_leaf_dirs} "
-              f"({self.n_leaf_dirs_uncategorized} uncategorized, "
-              f"{self.n_leaf_dirs_without_output} with no output for this config)")
-        print(f"Reports found: {figure_data.n_reports_found}  |  "
-              f"panel A runs: {figure_data.n_runs_panel_a}  |  "
-              f"panel B runs: {figure_data.n_runs_panel_b}  |  "
-              f"relerr runs: {figure_data.n_runs_relerr}  |  "
-              f"em_divergence runs: {figure_data.n_runs_em_divergence}")
-
-        if figure_data.exclusions:
-            print("\nExclusions:")
-            for reason, count in sorted(figure_data.exclusions.items()):
-                print(f"  {count:4d}  {reason}")
-
-        print("\nPanel A cells (mean F1):")
-        for fraction_bin in figure_data.fraction_bins:
-            row_cells = [
-                (column, x_bin, figure_data.panel_a[(column, fraction_bin, x_bin)])
-                for column in figure_data.columns
-                for x_bin in figure_data.x_bins_by_column[column]
-                if (column, fraction_bin, x_bin) in figure_data.panel_a
-            ]
-            if not row_cells:
-                print(f"  fraction {fraction_bin}: EMPTY (no runs fall in this row)")
-                continue
-            print(f"  fraction {fraction_bin}:")
-            for column, x_bin, cell in row_cells:
-                print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
-                      f"F1={cell.mean_f1:.4f} +/-{cell.sd_f1:.4f}")
-
-        print("\nPanel B cells (macro-averaged TPR/FPR):")
-        for fraction_bin in figure_data.fraction_bins:
-            row_cells = [
-                (column, x_bin, figure_data.panel_b[(column, fraction_bin, x_bin)])
-                for column in figure_data.columns
-                for x_bin in figure_data.x_bins_by_column[column]
-                if (column, fraction_bin, x_bin) in figure_data.panel_b
-            ]
-            if not row_cells:
-                print(f"  fraction {fraction_bin}: EMPTY (no runs fall in this row)")
-                continue
-            print(f"  fraction {fraction_bin}:")
-            for column, x_bin, cell in row_cells:
-                print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
-                      f"TPR={cell.mean_tpr:.4f}  FPR={cell.mean_fpr:.4f}")
-
-        print("\nRelerr cells (mean |rel.err(%)| of EM mean/covariance vs. ground truth):")
-        for fraction_bin in figure_data.fraction_bins:
-            row_cells = [
-                (column, x_bin, figure_data.panel_relerr[(column, fraction_bin, x_bin)])
-                for column in figure_data.columns
-                for x_bin in figure_data.x_bins_by_column[column]
-                if (column, fraction_bin, x_bin) in figure_data.panel_relerr
-            ]
-            if not row_cells:
-                print(f"  fraction {fraction_bin}: EMPTY (no runs fall in this row)")
-                continue
-            print(f"  fraction {fraction_bin}:")
-            for column, x_bin, cell in row_cells:
-                print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
-                      f"mean={cell.mean_relerr:.4f}  covar={cell.covar_relerr:.4f}")
-
-        print("\nEm divergence cells (mean squared Hellinger distance between fitted Null/Alt states):")
-        for fraction_bin in figure_data.fraction_bins:
-            row_cells = [
-                (column, x_bin, figure_data.panel_em_divergence[(column, fraction_bin, x_bin)])
-                for column in figure_data.columns
-                for x_bin in figure_data.x_bins_by_column[column]
-                if (column, fraction_bin, x_bin) in figure_data.panel_em_divergence
-            ]
-            if not row_cells:
-                print(f"  fraction {fraction_bin}: EMPTY (no runs fall in this row)")
-                continue
-            print(f"  fraction {fraction_bin}:")
-            for column, x_bin, cell in row_cells:
-                print(f"    {column:28s} x={x_bin:10s} n={cell.n_runs:3d}  "
-                      f"distance={cell.mean_distance:.4f} +/-{cell.sd_distance:.4f}")
-
-        if self.notes:
-            print("\nDiscovery notes:")
-            for note in self.notes:
-                print(f"  {note}")
-
 
 
 _SURFACE = "#fcfcfb"
@@ -1612,9 +1467,6 @@ class BenchmarkFigurePlotter:
         width with empty space.
         """
         return [len(self.data.x_bins_by_column[c]) for c in self.data.columns]
-
-    def _int_yaxis(self, ax):
-        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _pos: f"{v:.0f}"))
 
     def _add_provenance_footer(self, fig, n_total):
         """
@@ -1812,9 +1664,9 @@ class BenchmarkFigurePlotter:
         """
         Same grid as f1.png (fraction bin x category x branch-length/divergence
         bin), but each cell holds two bars instead of one: mean |relative
-        error(%)| of the EM-fitted mean, and of the EM-fitted covariance (std),
-        vs. the ground-truth-split empirical fit. Lower is better -- this is EM
-        fit quality, not detection performance.
+        error| (decimal, e.g. 0.05 = 5%) of the EM-fitted mean, and of the
+        EM-fitted covariance (std), vs. the ground-truth-split empirical fit.
+        Lower is better -- this is EM fit quality, not detection performance.
         """
         data = self.data
         n_rows, n_cols = len(data.fraction_bins), len(data.columns)
@@ -1822,12 +1674,12 @@ class BenchmarkFigurePlotter:
         pair_offset = _BAR_WIDTH * 0.27
         pair_width = _BAR_WIDTH * 0.42
 
-        # Fixed axis -- relerr is a percentage, so a consistent 0-150 scale
-        # with every-25 gridlines makes cells comparable at a glance instead
-        # of rescaling per run. Bars/whiskers past 150 are simply clipped at
-        # the top edge.
-        y_top = 150.0
-        yticks = np.arange(0, 151, 25)
+        # Fixed axis -- relerr is a decimal fraction, so a consistent 0-1.5
+        # scale with every-0.25 gridlines makes cells comparable at a glance
+        # instead of rescaling per run. Bars/whiskers past 1.5 are simply
+        # clipped at the top edge.
+        y_top = 1.5
+        yticks = np.arange(0, 1.51, 0.25)
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1846,7 +1698,6 @@ class BenchmarkFigurePlotter:
                 ax.set_xlim(-0.7, len(x_bins) - 0.3)
                 ax.set_ylim(0.0, y_top)
                 ax.set_yticks(yticks)
-                self._int_yaxis(ax)
                 ax.set_xticks(list(range(len(x_bins))))
                 ax.set_xticklabels(x_bins, rotation=30, ha="right", fontsize=7.5)
 
@@ -1860,7 +1711,7 @@ class BenchmarkFigurePlotter:
                     ax.bar(
                         pos - pair_offset, cell.mean_relerr, width=pair_width,
                         color=_SERIES_RELERR_MEAN, edgecolor=_SURFACE, linewidth=1.0,
-                        zorder=2, label="Mean rel.err(%)",
+                        zorder=2, label="Mean rel.err",
                     )
                     ax.errorbar(
                         pos - pair_offset, cell.mean_relerr,
@@ -1871,7 +1722,7 @@ class BenchmarkFigurePlotter:
                     ax.bar(
                         pos + pair_offset, cell.covar_relerr, width=pair_width,
                         color=_SERIES_RELERR_COVAR, edgecolor=_SURFACE, linewidth=1.0,
-                        zorder=2, label="Covariance rel.err(%)",
+                        zorder=2, label="Covariance rel.err",
                     )
                     ax.errorbar(
                         pos + pair_offset, cell.covar_relerr,
@@ -1917,7 +1768,7 @@ class BenchmarkFigurePlotter:
             )
 
         fig.suptitle(
-            "Phlag EM fit quality: mean |relative error(%)| of fitted mean/covariance vs. ground truth",
+            "Phlag EM fit quality: mean |relative error| (decimal) of fitted mean/covariance vs. ground truth",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
         fig.tight_layout(rect=[0, 0.045, 1, 0.93])
@@ -2054,7 +1905,7 @@ class BenchmarkFigurePlotter:
         Shared drawing code for the two hd-by-alt-proportion heatmaps: a
         data.hd_bins x DEFAULT_CONCAT_PATTERNS grid, cells colored by the
         mean of ``metric_attr`` (an HdAltCell field) over the runs in that
-        cell. hd_bins is computed per-run from the observed em_hd range (see
+        cell. hd_bins is computed per-run from the observed em_gt_hd range (see
         BenchmarkStats._compute_hd_bins), not a fixed [0, 1] split. Empty
         cells (no runs landed there) are left blank, not zero.
         """
@@ -2062,7 +1913,7 @@ class BenchmarkFigurePlotter:
         rows = data.hd_bins
         cols = DEFAULT_CONCAT_PATTERNS
         if not rows:
-            print(f"[skip] {filename}: no em_hd values available to bin -- nothing to draw.")
+            print(f"[skip] {filename}: no em_gt_hd values available to bin -- nothing to draw.")
             return None
 
         grid = np.full((len(rows), len(cols)), np.nan)
@@ -2102,7 +1953,7 @@ class BenchmarkFigurePlotter:
         ax.set_yticks(range(len(rows)))
         ax.set_yticklabels(rows, fontsize=8)
         ax.set_xlabel("alt proportion (concat pattern)", fontsize=9)
-        ax.set_ylabel("Squared Hellinger distance (fitted Null/Alt separation)", fontsize=9)
+        ax.set_ylabel("Squared Hellinger distance (ground-truth Null/Alt separation)", fontsize=9)
         for side in ax.spines.values():
             side.set_visible(False)
         ax.set_xticks(np.arange(-0.5, len(cols), 1), minor=True)
@@ -2135,13 +1986,12 @@ class BenchmarkFigurePlotter:
 
     def render_hd_alt_auc(self, filename="hd_alt_proportion_auc.png"):
         """
-        Same grid as hd_alt_proportion_f1.png, colored by proxy AUC
-        (= (tpr + (1 - fpr)) / 2 per run, averaged per cell) instead of F1 --
-        see HdAltCell for why this is a proxy rather than a real
-        threshold-swept ROC AUC.
+        Same grid as hd_alt_proportion_f1.png, colored by mean ROC-AUC
+        (record.auc, averaged per cell) instead of F1 -- see HdAltCell for
+        real-vs-legacy-proxy ROC-AUC.
         """
         return self._render_hd_alt_heatmap(
-            "mean_auc", "Mean proxy AUC by squared Hellinger distance x alt proportion", filename
+            "mean_auc", "Mean ROC-AUC by squared Hellinger distance x alt proportion", filename
         )
 
     def render(self):
@@ -2173,7 +2023,7 @@ def _parse_skip_arg(value):
     return stages
 
 
-def parse_arguments(argv=None):
+def _build_parser():
     parser = argparse.ArgumentParser(
         description="Benchmark: run caster and phlag over every dataset in simulations/ "
                     "(rerunning every stage by default), then summarize every "
@@ -2189,15 +2039,6 @@ def parse_arguments(argv=None):
              "config.json flags can change what a stage does without touching any "
              "source file, so existing output is never assumed to still be current "
              "unless you say so here)",
-    )
-    parser.add_argument(
-        "-d",
-        "--dist-type",
-        dest="dist_type",
-        default=DEFAULT_DIST_TYPE,
-        choices=["gaussian", "gmm"],
-        help=f"Distribution type, threaded through to caster and phlag and used to locate "
-             f"outputs when summarizing (default: {DEFAULT_DIST_TYPE})",
     )
     parser.add_argument(
         "--create",
@@ -2218,7 +2059,7 @@ def parse_arguments(argv=None):
              "dir immediately, before any processing, and used to drive "
              "caster/phlag for the rest of this invocation -- editing "
              "config.json afterwards for a different benchmark run doesn't "
-             "affect this one. Exactly one of --create/--rerun is required.",
+             "affect this one. Exactly one of --create/--rerun/--copy is required.",
     )
     parser.add_argument(
         "--rerun",
@@ -2238,7 +2079,30 @@ def parse_arguments(argv=None):
              "underneath is processed this way instead, each with its own "
              "frozen config -- batch processing like this is --rerun-only, "
              "--create is always a single new run. Exactly one of "
-             "--create/--rerun is required.",
+             "--create/--rerun/--copy is required.",
+    )
+    parser.add_argument(
+        "--copy",
+        dest="copy",
+        nargs=2,
+        metavar=("POS1", "POS2"),
+        default=None,
+        help="Copies every run under POS1 into POS2, merging config: for each "
+             "leaf found under POS1 (a single run, or a container batch exactly "
+             "like --rerun's container handling), the merged config.json starts "
+             "as an exact copy of that leaf's own frozen config, then for every "
+             "flag BOTH the live bench/config.json AND that leaf's config "
+             "already set, substitutes in the live bench/config.json's current "
+             "value (POS2's own config.json, if any, is never consulted -- POS2 "
+             "leaves typically don't exist yet, that's the point of copying; "
+             "best-effort -- POS2 never adds flags POS1 didn't already have). "
+             "A leaf whose POS2 side already has a populated reports/ archive "
+             "is left alone (resummarized only, not recomputed) -- rerunning "
+             "--copy after a partial prior run only fills in what's still "
+             "missing. Both POS1 and POS2 are store/-relative paths (same form "
+             "as --create/--rerun); POS1 must already exist, POS2 need not. "
+             "Results land under POS2. Exactly one of --create/--rerun/--copy "
+             "is required.",
     )
     parser.add_argument(
         "--errorbar",
@@ -2254,10 +2118,15 @@ def parse_arguments(argv=None):
         help="Short description of what's different in this run compared to earlier ones; "
              "written to report.txt in the run's output folder, alongside how long the run took",
     )
+    return parser
+
+
+def parse_arguments(argv=None):
+    parser = _build_parser()
     from phlag.utils import apply_cli_config
     args = apply_cli_config(parser, argv, "benchmark")
-    if bool(args.create) == bool(args.rerun):
-        parser.error("exactly one of --create or --rerun is required")
+    if sum(bool(x) for x in (args.create, args.rerun, args.copy)) != 1:
+        parser.error("exactly one of --create, --rerun, or --copy is required")
     return args
 
 
@@ -2309,40 +2178,40 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
     return base / short_sim
 
 
-def get_expected_caster_sim_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
+def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
-    --output-base-independent <dist_type>/w<W>_s<S>/caster/ location (see
-    phlag/caster.py's own output-path derivation), unlike
-    get_expected_sim_output_dir there's no base_override here: caster's
-    windowed dstar statistics don't depend on any phlag-side model/variant
-    choice, so every variant tree reads the same cached scores.tsv instead
-    of each getting its own copy recomputed from scratch.
+    --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
+    phlag/caster.py's own output-path derivation), not nested under
+    store/phlag/ at all: unlike get_expected_sim_output_dir there's no
+    dist_type/base_override here -- caster's windowed dstar statistics don't
+    depend on any phlag-side model/variant choice, so every dist_type/variant
+    tree reads the same cached scores.tsv instead of each getting its own
+    copy recomputed from scratch.
 
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
-    from phlag.utils import get_data_dir, get_phlag_output_base, get_simulation_categories, get_short_sim_name
+    from phlag.utils import get_data_dir, get_simulation_categories, get_short_sim_name
     from phlag.caster import format_val
 
-    phlag_base = get_phlag_output_base(get_data_dir())
     cats = get_simulation_categories(str(sim_path))
     short_sim = get_short_sim_name(leaf_dir.name)
 
     window_str = format_val(window_size)
     step_str = format_val(step_size)
-    base = phlag_base / dist_type / f"w{window_str}_s{step_str}" / "caster"
+    base = get_data_dir() / "caster" / f"w{window_str}_s{step_str}"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
 
 
-def get_expected_scores_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
+def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
-        fasta_path, leaf_dir, dist_type=dist_type,
+        fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
@@ -2360,7 +2229,25 @@ def get_expected_report_path(fasta_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
         base_override=base_override,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
+    if base_override is not None:
+        # A base_override always names a specific benchmark run's own
+        # <out_dir>/reports/ tree -- phlag writes there flat (--bench mode).
+        return sim_output_dir / f"{pattern_stem}.tsv"
     return sim_output_dir / pattern_stem / "report.tsv"
+
+
+def get_run_reports_base_override(out_dir):
+    """
+    out_dir's own reports/ subdir, expressed relative to the shared phlag
+    output root -- the single value used both as phlag's --output-base (so it
+    writes report.tsv directly into <out_dir>/reports/..., flat, via --bench)
+    and as get_expected_report_path/BenchmarkStats.collect's base_override
+    (so the same location is read back), keeping write and read in lockstep.
+    """
+    from phlag.utils import get_data_dir, get_phlag_output_base
+
+    phlag_base = get_phlag_output_base(get_data_dir()).resolve()
+    return (out_dir / "reports").relative_to(phlag_base).as_posix()
 
 
 def run_step(cmd, label, cwd=None, env=None):
@@ -2400,21 +2287,6 @@ def create_source_snapshot(config_override=None):
     return snapshot_root, snapshot_env
 
 
-def _fmt_metric(value):
-    return f"{value:.4f}" if value is not None else "N/A"
-
-
-def _group_cli_tokens(tokens):
-    lines = []
-    for tok in tokens:
-        is_flag = tok.startswith("-") and not (len(tok) > 1 and tok[1].isdigit())
-        if is_flag or not lines:
-            lines.append(tok)
-        else:
-            lines[-1] += " " + tok
-    return lines
-
-
 def run_all(args, sim_root, out_dir, config_override=None):
     """
     Runs phlagster (caster + phlag) over every complete simulation leaf x concat-fasta
@@ -2446,15 +2318,16 @@ def run_all(args, sim_root, out_dir, config_override=None):
     <out_dir>/config.json itself back in here, so the snapshot replays this
     run's own original settings instead of whatever's currently live.
 
-    Both caster and phlag write to their plain shared <dist_type>/w<W>_s<S>
-    tree (no --output-base override, no per-run private raw/ copy) --
-    benchmark runs aren't concurrent, so there's nothing to isolate; each
-    run's own results are captured afterward via summarize()'s reports/
-    archive instead. Caster's scores.tsv is additionally canonical/shared in
-    its own right regardless (see get_expected_caster_sim_dir/caster.py),
-    with atomic (write-then-rename) writes.
+    Caster's scores.tsv stays canonical/shared in its own store/caster/
+    w<W>_s<S> tree regardless (see get_expected_caster_sim_dir/caster.py),
+    with atomic (write-then-rename) writes, unaffected by this run's own
+    output location or dist_type. Phlag, in contrast, is pointed (via --output-base and
+    --bench together) directly at THIS run's own <out_dir>/reports/ tree --
+    it never touches the shared tree at all, and writes report.tsv there as
+    a flat '<pattern>.tsv' file, so there's no separate archive-copy step
+    afterward (see get_run_reports_base_override).
     """
-    from phlag.utils import find_mapping_file, load_cli_config
+    from phlag.utils import find_mapping_file
 
     snapshot_root, snapshot_env = create_source_snapshot(config_override=config_override)
     snapshot_config = snapshot_root / "bench" / "config.json"
@@ -2462,6 +2335,21 @@ def run_all(args, sim_root, out_dir, config_override=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(snapshot_config, out_dir / "config.json")
         print(f"Wrote config:         {out_dir / 'config.json'}")
+
+    # Persist a cheap copy of the phlag/ source snapshot (just the .py files
+    # this invocation actually ran, already assembled above) into the run
+    # dir, overwritten every call -- unlike config.json (frozen once at
+    # --create so --rerun replays it), this always reflects the code as of
+    # the MOST RECENT invocation, since --rerun replays old config against
+    # whatever code is currently live, not old code. That's the only place
+    # to see what code produced a given run after the fact -- the temp
+    # snapshot_root itself is deleted at the end of this function.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    source_snapshot_dir = out_dir / "source"
+    if source_snapshot_dir.exists():
+        shutil.rmtree(source_snapshot_dir)
+    shutil.copytree(snapshot_root / "phlag", source_snapshot_dir)
+    print(f"Wrote source snapshot: {source_snapshot_dir}")
 
     leaf_dirs = discover_leaf_dirs(sim_root)
 
@@ -2490,80 +2378,138 @@ def run_all(args, sim_root, out_dir, config_override=None):
         for fasta_path in fasta_paths:
             work_items.append((leaf_dir, rel_path, fasta_path))
 
-    caster_variable, _ = load_cli_config("caster")
-    phlag_variable, _ = load_cli_config("phlag")
+    # Read straight from snapshot_config (the effective config for THIS run --
+    # config_override's content when given, the live bench/config.json
+    # otherwise) rather than phlag.utils.load_cli_config, which always
+    # resolves relative to its own __file__: called from here (the live
+    # process, not one of the subprocess invocations below that actually run
+    # out of snapshot_root), that would silently report the live repo's
+    # bench/config.json even during a --rerun replaying a different frozen
+    # one -- correct for what actually executes, misleading for what's shown.
+    def _read_config_tokens(tool_name, kind):
+        import json
+        if not snapshot_config.exists():
+            return []
+        try:
+            config = json.loads(snapshot_config.read_text())
+        except Exception:
+            return []
+        return config.get(tool_name, {}).get(kind, [])
 
-    print(
-        f"Benchmark run {out_dir}\n"
-        f"\n{len(work_items)} file(s) to process\n"
-        f"{'skipping ' + ', '.join(args.skip) if args.skip else 'rerunning all outputs'}\n"
-        f"dist-type={args.dist_type}, window={DEFAULT_WINDOW_SIZE}, step={DEFAULT_STEP_SIZE}\n"
-        f"caster/phlag output: shared canonical <dist-type>/w<W>_s<S>/ tree "
-        f"(no per-run private copy -- see summarize()'s reports/ archive for that)\n"
-        "caster variable args:\n" + "\n".join(_group_cli_tokens(caster_variable)) + "\n"
-        "phlag variable args:\n" + "\n".join(_group_cli_tokens(phlag_variable))
-    )
+    def _effective_args(tool_name, build_parser_fn):
+        """Full effective flags for tool_name (every arg, defaults included --
+        same shape as caster.py's/phlag.py's own '[caster]/[phlag] Effective
+        flags: ...' self-print), computed the same way apply_cli_config()
+        would from THIS run's frozen snapshot_config specifically (not
+        phlag.utils.load_cli_config, which -- called from here rather than
+        from inside the subprocess -- would read the live repo's
+        bench/config.json instead, wrong during a --rerun/--copy replaying a
+        different frozen one). Positional/per-file args (fasta_file,
+        caster_scores) are left at their parser defaults since no single
+        file is "current" at this point in the run.
+        """
+        variable_tokens = _read_config_tokens(tool_name, "variable")
+        fixed_tokens = _read_config_tokens(tool_name, "fixed")
+        parser = build_parser_fn()
+        if variable_tokens:
+            variable_ns, _ = parser.parse_known_args(variable_tokens)
+            parser.set_defaults(**vars(variable_ns))
+        effective_args = parser.parse_args([])
+        if fixed_tokens:
+            sentinel = object()
+            dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
+            empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
+            fixed_ns, _ = parser.parse_known_args(fixed_tokens, namespace=empty_ns)
+            for key in dests:
+                value = getattr(fixed_ns, key)
+                if value is not sentinel:
+                    setattr(effective_args, key, value)
+        return effective_args
+
+    from phlag import caster as caster_module
+    from phlag import phlag as phlag_module
+    caster_effective = _effective_args("caster", caster_module.build_parser)
+    phlag_effective = _effective_args("phlag", phlag_module.build_parser)
+    report_base_override = get_run_reports_base_override(out_dir)
+
+    config_lines = [
+        f"{len(work_items)} file(s) to process -- "
+        f"{'skipping ' + ', '.join(args.skip) if args.skip else 'rerunning all outputs'}",
+        f"phlag reports write directly to {out_dir / 'reports'} (--bench)",
+        "[caster] Effective flags: " + " ".join(f"{k}={v}" for k, v in vars(caster_effective).items()),
+        "[phlag] Effective flags: " + " ".join(f"{k}={v}" for k, v in vars(phlag_effective).items()),
+    ]
+    # Printed once, plainly, before the bar starts -- multiple stacked
+    # position= bars (the previous approach) rely on the terminal supporting
+    # multi-line ANSI cursor addressing, which not every terminal (e.g. some
+    # IDE panels) handles for redraws, so each update was landing on a new
+    # line instead of overwriting in place. A single bar's own carriage-return
+    # redraw is reliable everywhere, so the header is now just plain text.
+    for line in config_lines:
+        print(line)
 
     processed = 0
     skipped_present = 0
     failures = []
 
-    for leaf_dir, rel_path, fasta_path in work_items:
+    progress = tqdm(work_items, desc="", unit="file")
+    for leaf_dir, rel_path, fasta_path in progress:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
 
-        scores_path = get_expected_scores_path(fasta_path, leaf_dir, dist_type=args.dist_type)
-        report_path = get_expected_report_path(fasta_path, leaf_dir, dist_type=args.dist_type)
+        scores_path = get_expected_scores_path(fasta_path, leaf_dir)
+        report_path = get_expected_report_path(
+            fasta_path, leaf_dir, base_override=report_base_override
+        )
 
         caster_done = scores_path.exists() and "caster" in args.skip
         phlag_done = report_path.exists() and "phlag" in args.skip
 
         if caster_done and phlag_done:
-            print(f"[skip] {pattern_rel}: already present at {report_path.parent}")
             skipped_present += 1
             continue
 
         if caster_done:
-            print(f"[skip caster] {pattern_rel}: scores already at {scores_path}")
+            progress.set_description(f"[phlag] {pattern_rel} is being processed")
             phlag_ok, phlag_out = run_step(
-                [sys.executable, "-m", "phlag.phlag", str(scores_path), "-d", args.dist_type]
+                [sys.executable, "-m", "phlag.phlag", str(scores_path)]
+                + ["--output-base", report_base_override, "--bench"]
                 + ["--plot", "-s", "1000"],
                 "phlag",
                 cwd=str(snapshot_root), env=snapshot_env,
             )
             if not phlag_ok:
                 msg = f"{pattern_rel}: phlag failed\n{phlag_out}"
-                print(f"{RED}[fail] {msg}{RESET}")
+                progress.write(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
         else:
+            progress.set_description(f"[caster] {pattern_rel} is being processed")
             phlagster_ok, phlagster_out = run_step(
-                [sys.executable, "-m", "bench.phlagster", str(fasta_path), "-d", args.dist_type]
+                [sys.executable, "-m", "bench.phlagster", str(fasta_path)]
+                + ["--output-base", report_base_override, "--bench"]
                 + ["--no-plots"],
                 "phlagster",
                 cwd=str(snapshot_root), env=snapshot_env,
             )
             if not phlagster_ok:
                 msg = f"{pattern_rel}: phlagster failed\n{phlagster_out}"
-                print(f"{RED}[fail] {msg}{RESET}")
+                progress.write(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
             if not scores_path.exists():
                 msg = f"{pattern_rel}: phlagster reported success but scores file not found at {scores_path}"
-                print(f"{RED}[fail] {msg}{RESET}")
+                progress.write(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
             if not report_path.exists():
                 msg = f"{pattern_rel}: phlagster reported success but report file not found at {report_path}"
-                print(f"{RED}[fail] {msg}{RESET}")
+                progress.write(f"{RED}[fail] {msg}{RESET}")
                 failures.append(msg)
                 continue
 
-        parsed = parse_report(report_path)
-        print(
-            f"[done] {pattern_rel}: TPR={_fmt_metric(parsed['tpr'])} "
-            f"FPR={_fmt_metric(parsed['fpr'])} F1={_fmt_metric(parsed['f1'])}"
-        )
         processed += 1
+    progress.set_description("")
+    progress.close()
 
     shutil.rmtree(snapshot_root, ignore_errors=True)
 
@@ -2582,7 +2528,7 @@ def run_all(args, sim_root, out_dir, config_override=None):
     return processed, skipped_incomplete, skipped_present, failures
 
 
-ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "auc"] + ["tp", "fp", "fn", "tn"] + [
+ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["tp", "fp", "fn", "tn"] + [
     f"relerr_{topo}_{state}_{stat}"
     for topo in TOPOLOGY_NAMES
     for state in RELERR_STATES
@@ -2609,7 +2555,14 @@ def compute_analysis(runs_path, out_path=None):
     import pandas as pd
 
     runs_path = pathlib.Path(runs_path)
-    df = pd.read_csv(runs_path, sep="\t")
+    # keep_default_na=False/na_values=[""]: pandas' default NA sniffing
+    # treats literal "nan"/"null"/etc. text as missing, indistinguishable
+    # from a genuinely absent field -- since a diverged EM fit's
+    # log-likelihood is written out as the literal text "nan"/"inf"/"-inf"
+    # (see phlag.py's BIC line), that default would erase exactly the
+    # signal log_likelihood_exploded below needs. Only "" (this module's
+    # _fmt() output for a field that's truly absent) counts as missing.
+    df = pd.read_csv(runs_path, sep="\t", keep_default_na=False, na_values=[""])
 
     rows = []
     for metric in ANALYSIS_METRICS:
@@ -2633,6 +2586,20 @@ def compute_analysis(runs_path, out_path=None):
             "min_value": float(values[min_idx]), "min_run_id": df.loc[min_idx, "run_id"],
         })
 
+    if "log_likelihood" in df.columns:
+        ll_present = df["log_likelihood"].notna()
+        ll_numeric = pd.to_numeric(df["log_likelihood"], errors="coerce")
+        exploded = ll_present & ~np.isfinite(ll_numeric)
+        n_exploded = int(exploded.sum())
+        rows.append({
+            "metric": "log_likelihood_exploded",
+            "n": int(ll_present.sum()),
+            "mean_value": float(n_exploded),
+            "max_value": None,
+            "max_run_id": ",".join(sorted(df.loc[exploded, "run_id"])) if n_exploded > 0 else None,
+            "min_value": None, "min_run_id": None,
+        })
+
     analysis_df = pd.DataFrame(
         rows,
         columns=["metric", "n", "mean_value", "max_value", "max_run_id", "min_value", "min_run_id"],
@@ -2650,49 +2617,6 @@ def compute_analysis(runs_path, out_path=None):
     return analysis_df, out_path
 
 
-def save_reports(stats, out_dir):
-    """
-    Snapshots every discovered report.tsv (same set as runs.tsv, including
-    excluded runs) into out_dir/reports/<category>/<subcategory>/<leaf>/<pattern>.tsv
-    -- a per-run copy of the exact source reports this run's tables/figures were
-    built from, so two numbered benchmark runs can be diffed report-by-report
-    after a code change instead of only comparing the aggregated stats.
-
-    <leaf> is the basename of the leaf directory under simulations/ (e.g. an
-    admixture pair's directory name, or a plain node id for recombination/10X)
-    -- not the "Clade" header value, which can be shared by several leaves.
-
-    Hard invariant, not just a convention: this never silently overwrites an
-    already-populated reports/ archive. summarize() should only ever call
-    this for a genuinely fresh out_dir (first population) -- every path that
-    reuses an existing, already-archived run is supposed to read that archive
-    instead (see collect_from_reports_archive) rather than get here. If this
-    is reached anyway with existing files already in place, that invariant
-    has been violated somewhere upstream -- abort loudly instead of clobbering
-    real data, so the violation gets fixed rather than silently masked.
-    """
-    reports_dir = out_dir / "reports"
-    if reports_dir.exists() and any(reports_dir.rglob("*.tsv")):
-        sys.exit(
-            f"{RED}Error: {reports_dir} already has archived reports, but "
-            f"save_reports() was about to overwrite it (not resummarizing "
-            f"from the existing archive). Refusing to clobber -- this "
-            f"indicates a bug in how the run/reuse path was selected, not a "
-            f"normal condition.{RESET}"
-        )
-    n_saved = 0
-    for record in stats.runs:
-        src = pathlib.Path(record.report_path)
-        if not src.exists():
-            continue
-        leaf_name = pathlib.PurePosixPath(record.source_leaf).name
-        dest_dir = reports_dir / record.category / record.subcategory / leaf_name
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest_dir / f"{record.pattern}.tsv")
-        n_saved += 1
-    return reports_dir, n_saved
-
-
 def _format_duration(seconds):
     total = int(round(seconds))
     hours, rem = divmod(total, 3600)
@@ -2702,6 +2626,32 @@ def _format_duration(seconds):
     if minutes:
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
+
+
+def _validate_store_path(flag_label, run_path):
+    """Shared by resolve_run_dir (--create/--rerun) and resolve_copy_dirs
+    (--copy): run_path must be a path relative to the repo root starting
+    with 'store/' (the symlink to $CONNECTION_DIR) and must resolve under
+    the phlag output tree. Returns the resolved candidate Path, or
+    sys.exit()s with a red error."""
+    if not run_path.startswith("store/"):
+        sys.exit(
+            f"{RED}{flag_label} must be a path relative to the repo root starting "
+            f"with 'store/' (e.g. 'store/phlag/.../benchmark/annealing/"
+            f"tau2x') -- got {run_path!r}.{RESET}"
+        )
+
+    from phlag.utils import get_repo_root, get_data_dir, get_phlag_output_base
+    candidate = (get_repo_root() / run_path).resolve()
+    phlag_base = get_phlag_output_base(get_data_dir()).resolve()
+    try:
+        candidate.relative_to(phlag_base)
+    except ValueError:
+        sys.exit(
+            f"{RED}{flag_label} {run_path!r} resolves to {candidate}, which isn't "
+            f"under the phlag output tree ({phlag_base}).{RESET}"
+        )
+    return candidate
 
 
 def resolve_run_dir(args):
@@ -2722,26 +2672,8 @@ def resolve_run_dir(args):
     out_dir didn't exist, --rerun guarantees it did.
     """
     flag, run_path = ("--create", args.create) if args.create else ("--rerun", args.rerun)
+    out_dir = _validate_store_path(flag, run_path)
 
-    if not run_path.startswith("store/"):
-        sys.exit(
-            f"{RED}{flag} must be a path relative to the repo root starting "
-            f"with 'store/' (e.g. 'store/phlag/.../benchmark/annealing/"
-            f"tau2x') -- got {run_path!r}.{RESET}"
-        )
-
-    from phlag.utils import get_repo_root, get_data_dir, get_phlag_output_base
-    candidate = (get_repo_root() / run_path).resolve()
-    phlag_base = get_phlag_output_base(get_data_dir()).resolve()
-    try:
-        candidate.relative_to(phlag_base)
-    except ValueError:
-        sys.exit(
-            f"{RED}{flag} {run_path!r} resolves to {candidate}, which isn't "
-            f"under the phlag output tree ({phlag_base}).{RESET}"
-        )
-
-    out_dir = candidate
     exists = out_dir.exists()
     if args.create and exists:
         sys.exit(f"{RED}--create {run_path}: already exists at {out_dir} -- use --rerun instead.{RESET}")
@@ -2749,6 +2681,18 @@ def resolve_run_dir(args):
         sys.exit(f"{RED}--rerun {run_path}: no existing run at {out_dir} -- use --create instead.{RESET}")
 
     return out_dir, bool(args.rerun)
+
+
+def resolve_copy_dirs(args):
+    """--copy's PATH resolution: POS1 must already exist (it's the source
+    template, like --rerun's PATH); POS2 need not as a whole tree -- its
+    per-leaf existence is checked leaf-by-leaf in handle_copy()."""
+    pos1_path, pos2_path = args.copy
+    pos1_dir = _validate_store_path("--copy POS1", pos1_path)
+    pos2_dir = _validate_store_path("--copy POS2", pos2_path)
+    if not pos1_dir.exists():
+        sys.exit(f"{RED}--copy {pos1_path}: no existing run/container at {pos1_dir}.{RESET}")
+    return pos1_dir, pos2_dir
 
 
 def _has_reports_archive(run_dir):
@@ -2768,18 +2712,225 @@ def _skips_all_stages(args):
 def discover_archived_run_dirs(prefix_dir):
     """
     Recursively finds every directory under prefix_dir that is itself a
-    completed run -- i.e. has its own populated reports/ archive (see
-    save_reports) -- for batch-resummarizing every run nested under a --run
-    value that names a container (e.g. 'annealing', holding 'annealing/base',
+    completed run -- i.e. has its own populated reports/ tree (phlag writes
+    there directly, see get_run_reports_base_override) -- for
+    batch-resummarizing every run nested under a --run value that names a
+    container (e.g. 'annealing', holding 'annealing/base',
     'annealing/boost=1', ...) rather than a single leaf run. Each match's own
-    reports/ subtree is a flat archive, never itself containing a nested run,
-    so matches don't overlap.
+    reports/ subtree is flat ('<pattern>.tsv' files), never itself containing
+    a nested run, so matches don't overlap.
     """
     return sorted(
         reports_dir.parent
         for reports_dir in prefix_dir.rglob("reports")
         if reports_dir.is_dir() and any(reports_dir.rglob("*.tsv"))
     )
+
+
+def _read_config_sections(config_path):
+    """Tolerant JSON load for a run's config.json -- mirrors
+    phlag.utils.load_cli_config's tolerance: missing file or bad JSON -> {}.
+    Never synthesizes missing sections/keys; callers must .get() defensively."""
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text())
+    except Exception:
+        return {}
+
+
+def _walk_token_spans(tokens, parser):
+    """Segments one flat CLI token list (one config.json 'fixed' or
+    'variable' list) into (kind, flag_token, action, dest, value_tokens,
+    start, end) spans, using the parser's own recognized option strings to
+    find flag boundaries -- correctly handles store_true (nargs=0),
+    single-value (nargs=None), optional (nargs='?'), and greedy (nargs='+'/
+    '*') flags, unlike a naive "peek at the next token" heuristic. end is
+    exclusive. Unrecognized tokens pass through as ("opaque", ...) rather
+    than raising -- config.json is expected to hold only real flag tokens
+    (see apply_cli_config's docstring), but this degrades gracefully instead
+    of crashing on anything unexpected.
+
+    Not a byte-for-byte reimplementation of argparse's own optional-vs-value
+    disambiguation (e.g. negative-number-looking values) -- acceptable since
+    every value observed in this repo's config.json files is a plain
+    non-dash string.
+    """
+    option_map = parser._option_string_actions
+    n = len(tokens)
+    i = 0
+    spans = []
+    while i < n:
+        tok = tokens[i]
+        action = option_map.get(tok)
+        if action is None:
+            spans.append(("opaque", tok, None, None, [tok], i, i + 1))
+            i += 1
+            continue
+        nargs = action.nargs
+        if nargs == 0:
+            j, values = i + 1, []
+        elif nargs is None:
+            j = min(i + 2, n)
+            values = tokens[i + 1:j]
+        elif nargs == "?":
+            if i + 1 < n and tokens[i + 1] not in option_map:
+                j, values = i + 2, [tokens[i + 1]]
+            else:
+                j, values = i + 1, []
+        elif nargs in ("+", "*"):
+            j = i + 1
+            while j < n and tokens[j] not in option_map:
+                j += 1
+            values = tokens[i + 1:j]
+        else:
+            j = min(i + 1 + int(nargs), n)
+            values = tokens[i + 1:j]
+        spans.append(("flag", tok, action, action.dest, values, i, j))
+        i = j
+    return spans
+
+
+def _flag_dest_set(tokens_by_kind, parser):
+    """The set of option dests a config section actually sets. Tries a real
+    argparse parse first (not a hand-rolled tokenizer) -- correct for
+    nargs='+'/'*'/'?' flags without reimplementing argparse's own logic.
+    Pooled as variable tokens then fixed tokens, fixed wins on duplicate
+    dest -- same precedence apply_cli_config already uses for real argv vs.
+    config.json.
+
+    Falls back to _walk_token_spans's dest set on a parse error (e.g. a
+    frozen config.json holds a value that was valid when written but whose
+    choices= list has since narrowed, like --plot's now-removed "dist"
+    choice) -- span-walking still gets flag boundaries/dests right even
+    though it can't validate choices the way a real parse does, so this
+    stays correct for stale-but-shaped-right configs instead of crashing."""
+    pooled = list(tokens_by_kind.get("variable", [])) + list(tokens_by_kind.get("fixed", []))
+    option_dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
+    sentinel = object()
+    ns = argparse.Namespace(**{d: sentinel for d in option_dests})
+    try:
+        parsed_ns, _ = parser.parse_known_args(pooled, namespace=ns)
+    except SystemExit:
+        return {span[3] for span in _walk_token_spans(pooled, parser) if span[0] == "flag"}
+    return {d for d in option_dests if getattr(parsed_ns, d) is not sentinel}
+
+
+def _merge_config_section(live_section, pos1_section, parser):
+    """Merges one config.json section (e.g. "phlag"): starts as an exact
+    copy of pos1_section, then for every flag both live_section and
+    pos1_section set, splices in live_section's raw value tokens -- keeping
+    the flag in whichever of fixed/variable pos1 originally placed it, only
+    the value token span changes. Raw-token splicing (not parse-value-then-
+    reserialize) so an abbreviated value like "100k" never gets silently
+    rewritten to "100000".
+
+    POS2's own config.json is never consulted -- --copy's POS2 leaves
+    typically don't exist yet (that's the point of copying), so live
+    bench/config.json's current value is the override directly, not a
+    fallback behind some usually-absent POS2 config. A dest not in
+    `overridable` (live doesn't currently set it) is left at POS1's
+    original value -- POS2 never adds flags POS1 didn't already have.
+    """
+    live_flags = _flag_dest_set(live_section, parser)
+    pos1_flags = _flag_dest_set(pos1_section, parser)
+    overridable = live_flags & pos1_flags
+
+    live_values_by_dest = {}
+    for kind in ("variable", "fixed"):
+        for span in _walk_token_spans(live_section.get(kind, []), parser):
+            if span[0] == "flag":
+                live_values_by_dest[span[3]] = span[4]
+
+    merged = {}
+    for kind in ("fixed", "variable"):
+        out_tokens = list(pos1_section.get(kind, []))
+        for span in reversed(_walk_token_spans(out_tokens, parser)):
+            if span[0] != "flag":
+                continue
+            _, _flag_token, _action, dest, _old_values, start, end = span
+            if dest in overridable:
+                out_tokens[start + 1:end] = live_values_by_dest[dest]
+        merged[kind] = out_tokens
+    return merged
+
+
+def _merge_leaf_config(live_config, pos1_config, parsers_by_section):
+    """Merges a whole leaf's config.json (all sections). Section presence
+    mirrors pos1_config's own keys -- never synthesizes a section pos1
+    doesn't have. Unrecognized top-level keys pass through from pos1
+    verbatim rather than being dropped."""
+    merged = {}
+    for section_name in pos1_config:
+        parser = parsers_by_section.get(section_name)
+        if parser is None:
+            merged[section_name] = pos1_config[section_name]
+            continue
+        merged[section_name] = _merge_config_section(
+            live_config.get(section_name, {}),
+            pos1_config[section_name],
+            parser,
+        )
+    return merged
+
+
+def handle_copy(args, sim_root, stats, start_time):
+    """--copy POS1 POS2: for every leaf found under POS1 (a container batch,
+    exactly like --rerun's container handling, or POS1 itself if it's a
+    single run), merges that leaf's own config against the live
+    bench/config.json and the SAME relative leaf under POS2 (see
+    _merge_leaf_config), writes the merged config.json under POS2, and runs
+    (or resummarizes, honoring --skip like --rerun does) there. If POS2 has
+    no leaf yet at that relative path, one is created with pos1's config
+    verbatim (no overrides available)."""
+    pos1_dir, pos2_dir = resolve_copy_dirs(args)
+
+    from phlag import caster as caster_module
+    from phlag import phlag as phlag_module
+    from phlag.utils import get_repo_root
+    parsers_by_section = {
+        "caster": caster_module.build_parser(),
+        "phlag": phlag_module.build_parser(),
+        "benchmark": _build_parser(),
+    }
+
+    live_config = _read_config_sections(get_repo_root() / "bench" / "config.json")
+
+    is_container = pos1_dir.is_dir() and not _has_reports_archive(pos1_dir)
+    leaf_dirs = discover_archived_run_dirs(pos1_dir) if is_container else []
+    if not leaf_dirs:
+        leaf_dirs = [pos1_dir]
+
+    skip_run_all = _skips_all_stages(args)
+
+    for pos1_leaf in leaf_dirs:
+        rel = pos1_leaf.relative_to(pos1_dir)
+        pos2_leaf = pos2_dir / rel
+        print(f"\n=== {rel} ===")
+
+        pos1_leaf_config_path = pos1_leaf / "config.json"
+        if not pos1_leaf_config_path.exists():
+            print(f"{RED}[skip] {pos1_leaf}: no config.json of its own -- can't --copy it.{RESET}")
+            continue
+        pos1_config = _read_config_sections(pos1_leaf_config_path)
+        if not pos1_config:
+            print(f"{RED}[skip] {pos1_leaf}: config.json unreadable/invalid JSON.{RESET}")
+            continue
+
+        pos2_leaf_existed = pos2_leaf.exists()
+
+        merged_config = _merge_leaf_config(live_config, pos1_config, parsers_by_section)
+
+        pos2_leaf.mkdir(parents=True, exist_ok=True)
+        merged_config_path = pos2_leaf / "config.json"
+        merged_config_path.write_text(json.dumps(merged_config, indent=2) + "\n")
+        print(f"Wrote merged config: {merged_config_path}")
+
+        if skip_run_all or _has_reports_archive(pos2_leaf):
+            print(f"[skip caster,phlag] resummarizing directly from {pos2_leaf / 'reports'}")
+        else:
+            run_all(args, sim_root, pos2_leaf, config_override=merged_config_path)
+        summarize(args, sim_root, stats, pos2_leaf, pos2_leaf_existed, start_time=start_time)
 
 
 def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
@@ -2791,32 +2942,22 @@ def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
 
     start_time: time.perf_counter() value from when the `benchmark` command
     started (main()'s first line) -- used to record how long the run took
-    in report.txt alongside the change note.
+    in report.txt alongside the change note and a readable wall-clock
+    timestamp of when this entry was appended.
     """
 
-    # Any reuse of an existing run folder that already has its own archived
-    # reports/ snapshot (see save_reports) resummarizes from that frozen
-    # snapshot instead of re-reading the shared live tree (which every
-    # benchmark run also reads/writes, and may since have moved on to a
-    # different run's output) -- e.g. a `--skip caster phlag` rerun means
-    # recomputing ITS tables/figures from what was frozen when the run was
-    # first made, not from whatever the shared tree holds now. save_reports()
-    # below additionally refuses outright to overwrite an existing non-empty
-    # archive, as a hard backstop in case this check is ever wrong.
-    archive_dir = out_dir / "reports"
-    archive_has_content = archive_dir.exists() and any(archive_dir.rglob("*.tsv"))
-    from_archive = reuse and archive_has_content
-    if from_archive:
-        print(f"Resummarizing from archived reports at {archive_dir} (live tree not touched).")
-        stats.collect_from_reports_archive(archive_dir)
-    else:
-        stats.collect()
+    # Phlag writes report.tsv directly into out_dir/reports/ (see run_all's
+    # --output-base/--bench) -- there's no separate shared-tree location to
+    # fall back to any more, so this always reads straight from there,
+    # whether that's a fresh run (nothing yet), a fully-populated existing
+    # one being resummarized, or a partial rerun (a mix of untouched and
+    # freshly-rewritten leaves).
+    stats.collect(base_override=get_run_reports_base_override(out_dir))
     figure_data = stats.aggregate()
-    stats.print_diagnostics(figure_data)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    report_lines = []
+    report_lines = [f"Run at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
     if args.change:
         report_lines.append(args.change)
     if start_time is not None:
@@ -2840,11 +2981,7 @@ def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
     _analysis_df, analysis_path = compute_analysis(runs_path)
     print(f"Wrote analysis table: {analysis_path}")
 
-    if from_archive:
-        print(f"Reports archive untouched (read-only resummarize): {archive_dir}")
-    else:
-        reports_dir, n_reports_saved = save_reports(stats, out_dir)
-        print(f"Saved {n_reports_saved} report(s) to: {reports_dir}")
+    print(f"Reports at: {out_dir / 'reports'}")
 
     if (
         figure_data.n_runs_panel_a == 0 and figure_data.n_runs_panel_b == 0
@@ -2865,6 +3002,9 @@ def main(argv=None):
     start_time = time.perf_counter()
     args = parse_arguments(argv)
 
+    flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
+    print(f"[benchmark] Effective flags: {flags_str}")
+
     from phlag.utils import get_data_dir
 
     sim_root = get_data_dir() / "simulations"
@@ -2873,9 +3013,13 @@ def main(argv=None):
 
     stats = BenchmarkStats(
         sim_root=sim_root,
-        dist_type=args.dist_type,
         errorbar=args.errorbar,
     )
+
+    if args.copy:
+        handle_copy(args, sim_root, stats, start_time)
+        return
+
     out_dir, reuse = resolve_run_dir(args)
 
     # --rerun given a container path (e.g. 'annealing', holding

@@ -218,40 +218,6 @@ def get_simulation_clade(caster_scores_path, sim_root=None):
     return node_name, None, None
 
 
-def resolve_fasta_from_scores_path(scores_path, sim_root=None):
-    """
-    Reverse-resolves a not-yet-computed scores.tsv-style output path back to its source
-    concat FASTA, by matching the path's simulation-directory segment (two levels above
-    the filename, see get_simulation_node_name) against leaf directories under the
-    simulations root, then requiring an exact match between the path's pattern-stem
-    segment (the component directly above the filename) and a FASTA filename in that
-    leaf's concat/ subdirectory. Does not guess -- returns None if there is no exact
-    match, including when the concat/ directory has multiple FASTAs and none match.
-    """
-    import pathlib
-    parts = pathlib.Path(scores_path).parts
-    if "caster" not in parts or len(parts) < 3:
-        return None
-
-    node_name = clean_locus_name(parts[-3])
-    pattern_stem = clean_locus_name(parts[-2])
-
-    if sim_root is None:
-        sim_root = get_data_dir() / "simulations"
-    sim_root = pathlib.Path(sim_root)
-    if not sim_root.exists():
-        return None
-
-    for concat_dir in sim_root.rglob("concat"):
-        leaf_dir = concat_dir.parent
-        if get_short_sim_name(leaf_dir.name) != node_name:
-            continue
-        for fasta_path in concat_dir.iterdir():
-            if fasta_path.suffix.lower() in (".fa", ".fasta") and clean_locus_name(fasta_path.stem) == pattern_stem:
-                return fasta_path
-    return None
-
-
 def get_clade_info_path(filename):
     """
     Resolves a file under the repo's clade-info/ reference-data directory

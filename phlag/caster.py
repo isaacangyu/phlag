@@ -47,11 +47,12 @@ def get_fasta_length(fasta_path):
 
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=True):
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, locus_pattern=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
         self.topologies = topologies
+        self.locus_pattern = locus_pattern
 
         os.makedirs(self.data_dir, exist_ok=True)
 
@@ -72,11 +73,6 @@ class CasterPlotter:
                 'AABB': '#2CA02C',    # Vibrant Forest Green
             }
 
-            # 1. Run empirical histograms with parametric distribution overlay
-            if plot_dist:
-                self.plot_caster_histograms(show_fits=True, filename='dist.png')
-
-            # 2. Scatter plot three topology scores over the genome
             if plot_scores:
                 self.plot_topology_scatter()
 
@@ -94,6 +90,21 @@ class CasterPlotter:
         except Exception as e:
             print(f"Error reading dataset file {target_path}: {e}")
             self.df = None
+
+    def _ground_truth_pattern(self):
+        """
+        The ground-truth locus pattern (e.g. '37-62' or 'n1a1n5...'), preferring
+        the explicit locus_pattern the caller already knows (caster.py's own
+        run passes it, since flat standalone output no longer encodes it in
+        scores_file's path) and falling back to regex-parsing scores_file's
+        path/filename otherwise (a bare scores.tsv invocation, or the
+        canonical --bench tree, which still encodes it there).
+        """
+        if self.locus_pattern:
+            return self.locus_pattern
+        full_path_str = str(self.scores_file)
+        m = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
+        return m.group(1) if m else None
 
     def calculate_summary_statistics(self, series):
         """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
@@ -118,118 +129,30 @@ class CasterPlotter:
             }
         return self.params
 
-    def plot_caster_histograms(self, show_fits=True, filename='dist.png'):
-        """Generates 3 subplots for ABBA, BABA, AABB topologies, plotting empirical histogram and optional fitted distribution curves."""
-        norm_label = 'Normalized (Min-Max)' if self.is_normalized_file else 'Raw'
-
-        # Determine topology columns to plot
-        avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
-        if self.topologies is not None:
-            filtered_cols = []
-            for col in avg_cols:
-                for t in self.topologies:
-                    if t.lower() in col.lower():
-                        filtered_cols.append(col)
-                        break
-            avg_cols = filtered_cols
-
-        if not avg_cols:
-            print("No matching topology columns found to plot.")
-            return
-
-        # Require a ground truth locus pattern in the filename or path
-        full_path_str = str(self.scores_file)
-        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
-        if not pattern_str_match:
-            sys.exit(f"Error: No ground truth locus pattern (e.g. 'n1a1n5...') found in '{full_path_str}'. Caster requires a ground truth pattern in the score file's path or filename to plot '{filename}'.")
-
-        pattern_str = pattern_str_match.group(1)
-        from .utils import parse_pattern_string
-        total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
-        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
-        if not (anomaly_intervals or blocks):
-            sys.exit(f"Error: Could not parse ground truth locus pattern '{pattern_str}' from '{full_path_str}'.")
-
-        y_true = np.zeros(len(self.df), dtype=int)
-        if 'pos' in self.df.columns:
-            positions = self.df['pos'].values
-            for idx, pos in enumerate(positions):
-                for start_bp, end_bp in anomaly_intervals:
-                    if start_bp <= pos < end_bp:
-                        y_true[idx] = 1
-                        break
-
-        num_plots = len(avg_cols)
-        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5), squeeze=False)
-        axes = axes[0]
-
-        import matplotlib.transforms as transforms
-
-        for i, col in enumerate(avg_cols):
-            ax = axes[i]
-            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
-            topo_name = match.group(1).upper() if match else col.replace('avg*', '').replace('c*', '')
-
-            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
-            vals = self.df[col].values
-            xmin, xmax = vals.min(), vals.max()
-            margin = (xmax - xmin) * 0.15 if xmax > xmin else 1.0
-            x_grid = np.linspace(xmin - margin, xmax + margin, 200)
-
-            df_null = self.df[y_true == 0]
-            df_alt = self.df[y_true == 1]
-
-            if len(df_null) > 0:
-                sns.histplot(df_null[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#2B4C7E', label='Null Histogram', bins=30)
-            if len(df_alt) > 0:
-                sns.histplot(df_alt[col], ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=30)
-
-            if show_fits:
-                if len(df_null) > 1:
-                    mu_null, std_null = norm.fit(df_null[col])
-                    pdf_null = norm.pdf(x_grid, mu_null, std_null)
-                    ax.plot(x_grid, pdf_null, color='#2B4C7E', linewidth=2.2, label='Null Fit')
-                    ax.axvline(mu_null, color='#2B4C7E', linestyle='--', linewidth=1.5)
-                    ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-                    ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color='#2B4C7E', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-
-                if len(df_alt) > 1:
-                    mu_alt, std_alt = norm.fit(df_alt[col])
-                    pdf_alt = norm.pdf(x_grid, mu_alt, std_alt)
-                    ax.plot(x_grid, pdf_alt, color='#E05638', linewidth=2.2, linestyle='--', label=f'Alt Fit')
-                    ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
-                    ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-                    ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-
-            ax.set_title(f'Topology: {topo_name}', fontsize=12, fontweight='bold')
-            ax.set_xlabel(f'{norm_label} Score')
-            if i == 0:
-                ax.set_ylabel('Density')
-            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
-            ax.grid(True, linestyle=':', alpha=0.5)
-
-        if show_fits:
-            fig.suptitle(f'Topology Histograms & {self.distribution} Fits: {self.gene_name}', fontsize=13, fontweight='bold')
-        else:
-            fig.suptitle(f'Topology Histograms: {self.gene_name}', fontsize=13, fontweight='bold')
-
-        fig.tight_layout()
-
-        output_dir = self.data_dir
-        os.makedirs(output_dir, exist_ok=True)
-        save_path_top = os.path.join(output_dir, filename)
-        plt.savefig(save_path_top, dpi=300, bbox_inches='tight')
-        print(f"Saved topology histogram chart to: {save_path_top}")
-        plt.close()
-
     def plot_topology_scatter(self):
-        """Generates a scatter plot of topology scores across genomic coordinates."""
-        avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+        # caster-pair's chunk_scores.tsv carries both raw per-window quartet-support
+        # sums (c*ABBA/c*BABA/c*AABB, unbounded, scale with window size) and their
+        # normalized proportions (q1/q2/q3, in [0,1], positionally ABBA/BABA/AABB --
+        # see caster-pair.cpp's scoreChunksForBranch). Prefer q1/q2/q3 when present
+        # so the plotted "Score" is comparable in scale to dstar's own already-
+        # normalized c*ABBA/c*BABA/c*AABB columns.
+        pair_cols = ['q1', 'q2', 'q3']
+        if all(c in self.df.columns for c in pair_cols):
+            avg_cols = pair_cols
+            rename_map = {'q1': 'ABBA', 'q2': 'BABA', 'q3': 'AABB'}
+        else:
+            avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+            rename_map = {}
+            for col in avg_cols:
+                match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+                rename_map[col] = match.group(1).upper() if match else col
+
         if self.topologies is not None:
             filtered_cols = []
             for col in avg_cols:
+                mapped_name = rename_map.get(col, col)
                 for t in self.topologies:
-                    if t.lower() in col.lower():
+                    if t.lower() in mapped_name.lower():
                         filtered_cols.append(col)
                         break
             avg_cols = filtered_cols
@@ -240,30 +163,17 @@ class CasterPlotter:
 
         plt.figure(figsize=(12, 6))
 
-        # Rename columns to standard topology names (ABBA, BABA, AABB) for clean palette hue mapping
-        rename_map = {}
-        for col in avg_cols:
-            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
-            if match:
-                rename_map[col] = match.group(1).upper()
-            else:
-                rename_map[col] = col
-
         renamed_df = self.df.rename(columns=rename_map)
         clean_cols = [rename_map.get(c, c) for c in avg_cols]
 
-        # Melt the dataframe for seaborn plotting
         melted_df = renamed_df.melt(id_vars=['pos'], value_vars=clean_cols,
                                  var_name='Topology', value_name='Score')
 
-        # Create scatter plot with small points and transparency
         sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
 
-        # Draw vertical split lines and shade alt regions if path/filename contains ground truth pattern
-        full_path_str = str(self.scores_file)
-        pattern_str_match = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
-        if pattern_str_match:
-            pattern_str = pattern_str_match.group(1)
+        # Draw vertical split lines and shade alt regions if a ground truth pattern is known
+        pattern_str = self._ground_truth_pattern()
+        if pattern_str:
             from .utils import parse_pattern_string
             total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
             blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
@@ -292,17 +202,14 @@ class CasterPlotter:
                         plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
                         alt_shaded = True
 
-                    # Draw vertical boundary line at start of block (except 0)
                     if start_pos > 0:
                         plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
 
-                    # Label null/alt above x-axis at bottom of plot
                     plt.text(mid_pos, 0.02, label_text, transform=plt.gca().get_xaxis_transform(),
                              ha='center', va='bottom', fontsize=10, fontweight='bold',
                              bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='none'))
 
                     curr_pos_bp = end_pos
-                # Vertical line at end of last block
                 plt.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
 
         # Format names for cleaner legend and title
@@ -320,18 +227,17 @@ class CasterPlotter:
         plt.close()
 
 
-def parse_arguments(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Caster: Load scores and generate topology distribution and scatter plots."
     )
 
-    # Input FASTA or scores.tsv file
     parser.add_argument(
         "fasta_file",
         nargs="?",
         type=pathlib.Path,
         default=None,
-        help="Input FASTA or scores.tsv file path"
+        help="Input FASTA file path"
     )
     
     # Recent flag & Left/Right indices
@@ -382,6 +288,14 @@ def parse_arguments(argv=None):
     )
 
     parser.add_argument(
+        "--shift-caster",
+        dest="shift_caster",
+        action="store_true",
+        default=False,
+        help="Shift each window's reported pos right by window_size/2 so it "
+             "marks the window's center instead of its left edge (default: omitted)"
+    )
+    parser.add_argument(
         "-m",
         dest="mapping",
         type=pathlib.Path,
@@ -391,9 +305,9 @@ def parse_arguments(argv=None):
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["scores", "dist"],
-        default=["scores", "dist"],
-        help="List of plots to generate (choices: scores, dist. Default: scores, dist)",
+        choices=["scores"],
+        default=["scores"],
+        help="List of plots to generate (choices: scores. Default: scores)",
     )
     parser.add_argument(
         "-t",
@@ -409,7 +323,15 @@ def parse_arguments(argv=None):
         dest="dist_type",
         default="gaussian",
         choices=["gaussian", "gmm"],
-        help="Distribution type for output directory structure (default: gaussian)"
+        help="Distribution type used for CasterPlotter's statistical fits (default: "
+             "gaussian). No longer affects scores.tsv's output location -- that's "
+             "shared across dist_types, see --bench."
+    )
+    parser.add_argument(
+        "-o", dest="output_file", type=pathlib.Path, default=None,
+        help="Path to save scores.tsv (its directory is also where scatter.png is "
+             "saved, if plotting). Ignored when --bench is set (canonical tree "
+             "always wins there)."
     )
     parser.add_argument(
         "--output-base",
@@ -417,20 +339,180 @@ def parse_arguments(argv=None):
         default=None,
         help="Accepted for CLI compatibility with phlag/phlagster (which pass "
              "the same flag to both stages), but has no effect here: "
-             "scores.tsv always lives in one canonical, --output-base-"
-             "independent location keyed only by <dist-type>/w<W>_s<S>, "
-             "shared across every phlag-side --output-base/--base variant "
-             "instead of being recomputed/duplicated per variant."
+             "scores.tsv always lives in one canonical, --output-base/dist_type-"
+             "independent location keyed only by w<W>_s<S>, shared across every "
+             "phlag-side --output-base/--base/dist_type variant instead of being "
+             "recomputed/duplicated per variant."
     )
     parser.add_argument(
-        "--tree",
-        dest="tree_file",
+        "--bench",
+        dest="bench",
+        action="store_true",
+        default=False,
+        help="Set by benchmark's run_all() for its own subprocess invocations -- "
+             "not meant to be passed by hand. Accepted for CLI compatibility with "
+             "phlag/phlagster; has no effect on scores.tsv's location when set "
+             "(stays in the canonical shared tree, same as always: "
+             "store/caster/w<W>_s<S>/...). When NOT set (standalone use, the "
+             "default), scores.tsv goes to a flat <repo_root>/out/<node_name>/"
+             "scores.tsv instead of the shared canonical tree."
+    )
+    parser.add_argument(
+        "--pair",
+        dest="pair",
+        action="store_true",
+        default=False,
+        help="Run ./caster/bin/caster-pair (auto-(re)compiling from "
+             "caster/caster-pair.cpp if missing/stale) instead of dstar -- scores one "
+             "fixed quartet branch's topology per genomic chunk, instead of D*/ABBA-"
+             "BABA-AABB windows. The branch is the -m/--mapping population mapping "
+             "file (auto-detected the same way as for dstar), which must assign every "
+             "taxon to exactly one of 4 groups. See --chunk-scores."
+    )
+    parser.add_argument(
+        "--chunk-scores",
+        dest="chunk_scores",
         type=pathlib.Path,
         default=None,
-        help="Optional species tree file (default: store/63K.tre)"
+        help="Output path for --pair's per-chunk quartet scores TSV (default: "
+             "chunk_scores.tsv alongside where scores.tsv would normally go)."
     )
+    parser.add_argument(
+        "--chunk",
+        dest="chunk_size",
+        type=int_or_abbrev,
+        default=None,
+        help="Window size (in sites) for --pair's per-window quartet scores, rolled up "
+             "from caster-pair's own fine-grained -s-sized chunks the same way dstar's "
+             "window/step aggregation works below (default: -w's window size). See -s "
+             "for the step/stride between windows -- when -s < --chunk, windows overlap."
+    )
+    return parser
+
+
+def parse_arguments(argv=None):
+    parser = build_parser()
     from .utils import apply_cli_config
     return apply_cli_config(parser, argv, "caster")
+
+
+def run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern):
+    binary_name = "caster-pair.exe" if sys.platform == "win32" else "caster-pair"
+    binary_candidates = [
+        data_dir / "bin" / binary_name,
+        repo_root / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "bin" / binary_name,
+    ]
+    which_path = shutil.which(binary_name)
+    if which_path:
+        binary_candidates.append(pathlib.Path(which_path))
+
+    binary_path = None
+    for candidate in binary_candidates:
+        if candidate.exists():
+            binary_path = candidate
+            break
+
+    if not binary_path:
+        binary_path = repo_root / "caster" / "bin" / binary_name
+
+    caster_pair_cpp = repo_root / "caster" / "caster-pair.cpp"
+    if caster_pair_cpp.exists():
+        if not binary_path.exists() or os.path.getmtime(caster_pair_cpp) > os.path.getmtime(binary_path):
+            target_bin = repo_root / "caster" / "bin" / binary_name
+            os.makedirs(target_bin.parent, exist_ok=True)
+            print(f"Compiling 'caster-pair' binary from {caster_pair_cpp}...")
+            includes_dir = repo_root / "caster" / "includes"
+            compile_cmd = ["g++", "-std=gnu++17", "-O2", "-I", str(includes_dir), str(caster_pair_cpp), "-o", str(target_bin)]
+            try:
+                subprocess.run(compile_cmd, check=True)
+                binary_path = target_bin
+                print(f"Successfully compiled 'caster-pair' binary at {binary_path}")
+            except Exception as e:
+                print(f"Warning: Could not auto-compile 'caster-pair': {e}")
+
+    if sys.platform != "win32" and binary_path.exists() and not os.access(binary_path, os.X_OK):
+        try:
+            os.chmod(binary_path, os.stat(binary_path).st_mode | 0o755)
+        except Exception as e:
+            print(f"Warning: Failed to set executable permission on '{binary_path}': {e}")
+
+    if not binary_path.exists():
+        sys.exit(f"Error: 'caster-pair' binary not found and could not be compiled (looked for source at {caster_pair_cpp}).")
+
+    if not args.mapping.exists():
+        sys.exit(f"Error: Mapping file not found at '{args.mapping}'")
+
+    chunk_scores_path = args.chunk_scores if args.chunk_scores else (plot_data_dir / "chunk_scores.tsv")
+    chunk_scores_path.parent.mkdir(parents=True, exist_ok=True)
+    window_size = args.chunk_size if args.chunk_size is not None else args.window_size
+    pair_step = min(args.step_size, window_size)
+
+    print(f"Running caster-pair on '{args.fasta_file}' with branch mapping '{args.mapping}', chunk(window)={window_size}, step={pair_step}...")
+    cmd = [
+        str(binary_path),
+        "--branch-mapping", str(args.mapping.resolve()),
+        "--chunk-scores", str(chunk_scores_path.resolve()),
+        "--chunk", str(pair_step),
+        str(args.fasta_file.resolve()),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Error running 'caster-pair' binary:\nCommand: {e.cmd}\nExit Code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
+
+    # caster-pair itself only ever partitions a locus into non-overlapping
+    # --chunk-sized blocks -- it has no native step/stride concept. To get an
+    # overlapping window+step model (window_size != pair_step), we ran it above
+    # at the fine pair_step granularity, and now roll consecutive per-locus rows
+    # into window_size-wide sliding windows here -- the same two-stage
+    # fine-grained-rows -> rolling-window trick used for dstar above.
+    K = max(1, window_size // pair_step)
+    if K > 1:
+        raw_df = pd.read_csv(chunk_scores_path, sep="\t")
+        agg_rows = []
+        for locus, locus_df in raw_df.groupby("locus", sort=False):
+            locus_df = locus_df.sort_values("pos").reset_index(drop=True)
+            for i in range(len(locus_df) - K + 1):
+                window = locus_df.iloc[i:i + K]
+                s0 = window["c*ABBA"].sum()
+                s1 = window["c*BABA"].sum()
+                s2 = window["c*AABB"].sum()
+                tot = s0 + s1 + s2
+                pos_val = int(locus_df.iloc[i]["pos"])
+                if args.shift_caster:
+                    pos_val += window_size // 2
+                agg_rows.append({
+                    "locus": locus,
+                    "pos": pos_val,
+                    "c*ABBA": s0,
+                    "c*BABA": s1,
+                    "c*AABB": s2,
+                    "q1": s0 / tot if tot > 0 else 1.0 / 3,
+                    "q2": s1 / tot if tot > 0 else 1.0 / 3,
+                    "q3": s2 / tot if tot > 0 else 1.0 / 3,
+                })
+        pd.DataFrame(agg_rows).to_csv(chunk_scores_path, sep="\t", index=False)
+
+    print(f"Success: chunk scores written to: {chunk_scores_path}")
+
+    if args.plot and "scores" in args.plot:
+        # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
+        # by caster-pair.cpp to mirror dstar's scores.tsv exactly, so the same
+        # CasterPlotter -- same palette, same ground-truth shading -- renders
+        # it directly instead of a separate plotting path.
+        CasterPlotter(
+            scores_file=str(chunk_scores_path.resolve()),
+            distribution=args.dist_type,
+            data_dir=str(plot_data_dir.resolve()),
+            topologies=args.topologies,
+            plot_scores=True,
+            locus_pattern=locus_pattern,
+        )
+
+    return chunk_scores_path
+
 
 def main(argv=None):
     args = parse_arguments(argv)
@@ -438,8 +520,12 @@ def main(argv=None):
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
         args.step_size = args.window_size
-        
-    from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file, clean_locus_name
+
+    if not args.bench:
+        flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
+        print(f"[caster] Effective flags: {flags_str}")
+
+    from .utils import get_data_dir, get_repo_root, get_most_recent_file, clean_locus_name
     repo_root = get_repo_root()
     data_dir = get_data_dir()
     
@@ -454,291 +540,310 @@ def main(argv=None):
             sys.exit("Error: No input file found in store/msa/concat or candidate MSA directories.")
         args.fasta_file = recent_fasta
 
-    input_str = str(args.fasta_file)
-    if input_str.endswith('.tsv') or args.fasta_file.name == 'scores.tsv':
-        final_output_path = args.fasta_file
-    else:
-        window_str = format_val(args.window_size)
-        step_str = format_val(args.step_size)
-        norm_suffix = "_n" if args.normalize else ""
-        clean_stem = clean_locus_name(args.fasta_file.stem)
-        left_str = format_val(args.left)
-        right_str = format_val(args.right if args.right is not None else 0)
+    # Ground-truth locus pattern (e.g. '37-62') for CasterPlotter's scatter.png shading.
+    window_str = format_val(args.window_size)
+    step_str = format_val(args.step_size)
+    norm_suffix = "_n" if args.normalize else ""
+    clean_stem = clean_locus_name(args.fasta_file.stem)
+    left_str = format_val(args.left)
+    right_str = format_val(args.right if args.right is not None else 0)
 
-        # Resolve existing scores.tsv
-        from .utils import parse_filename_to_dir_structure, get_phlag_output_base
-        phlag_base = get_phlag_output_base(data_dir)
-        # scores.tsv lives in one canonical location keyed only by
-        # dist_type/window/step -- caster's windowed dstar statistics don't
-        # depend on --output-base/--base at all (that only selects a
-        # phlag-side model/variant tree), so every --base variant reads and
+    from .utils import parse_filename_to_dir_structure, get_simulation_categories, get_short_sim_name
+    parsed = parse_filename_to_dir_structure(clean_stem)
+    locus_pattern = parsed["pattern"] if parsed else clean_stem
+
+    parts = args.fasta_file.parts
+    is_sim = "simulations" in parts
+    cats = None
+    short_sim = None
+    if is_sim:
+        sim_dir = args.fasta_file.parent
+        if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
+            sim_dir = sim_dir.parent
+        cats = get_simulation_categories(args.fasta_file)
+        short_sim = get_short_sim_name(sim_dir.name)
+
+    if args.bench:
+        # --bench (set only by benchmark's own subprocess invocations) keeps
+        # scores.tsv in the shared canonical tree, keyed only by window/step
+        # -- caster's windowed dstar statistics don't depend on dist_type or
+        # --output-base/--base at all (those only select a phlag-side
+        # model/variant tree), so every dist_type/--base variant reads and
         # writes the same cached scores.tsv here instead of each getting its
-        # own copy recomputed from scratch.
-        caster_root = phlag_base / args.dist_type / f"w{window_str}_s{step_str}" / "caster"
-        parsed = parse_filename_to_dir_structure(clean_stem)
+        # own copy recomputed from scratch. Lives in its own store/caster/
+        # tree, not nested under store/phlag/, since it isn't a phlag output.
+        caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}"
         if parsed:
             rel_dir = parsed["relative_dir_no_window"]
             final_output_path = caster_root / rel_dir / "scores.tsv"
+        elif is_sim:
+            pattern_stem = clean_stem
+            if cats:
+                final_output_path = caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
+            else:
+                final_output_path = caster_root / short_sim / pattern_stem / "scores.tsv"
         else:
-            parts = args.fasta_file.parts
-            is_sim = False
-            if "simulations" in parts:
-                sim_dir = args.fasta_file.parent
-                if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
-                    sim_dir = sim_dir.parent
-                sim_name = sim_dir.name
+            pattern_stem = clean_stem
+            final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
+            final_output_path = caster_root / pattern_stem / final_output_name
+    else:
+        # Standalone use (the default): no shared/canonical tree, no
+        # dist_type/window/category/pattern nesting -- everything for a
+        # node lands flat in <repo_root>/out/<node_name>/, alongside
+        # phlag's report.tsv for the same node (see phlag.py). Node name
+        # is the short simulation name for sim inputs, the alt name for
+        # parsed null/alt filenames, or the cleaned stem otherwise.
+        if parsed:
+            node_name = get_short_sim_name(parsed["alt"])
+        elif is_sim:
+            node_name = short_sim
+        else:
+            node_name = clean_stem
+        if args.pair:
+            # --pair's chunk-rollup granularity is an independent axis from
+            # dstar's window/step (it may not even be run for the same node),
+            # so its output gets its own out/c<chunk>_s<step>/<node_name>/
+            # prefix instead of colliding with dstar's flat out/<node_name>/.
+            pair_chunk = args.chunk_size if args.chunk_size is not None else args.window_size
+            pair_chunk_str = format_val(pair_chunk)
+            pair_step_str = format_val(args.step_size)
+            final_output_path = repo_root / "out" / f"c{pair_chunk_str}_s{pair_step_str}" / node_name / "scores.tsv"
+        else:
+            final_output_path = repo_root / "out" / node_name / "scores.tsv"
 
-                from .utils import get_simulation_categories, get_short_sim_name
-                cats = get_simulation_categories(args.fasta_file)
-                short_sim = get_short_sim_name(sim_name)
-                pattern_stem = clean_stem
-                if cats:
-                    final_output_path = caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
-                else:
-                    final_output_path = caster_root / short_sim / pattern_stem / "scores.tsv"
-                is_sim = True
+    # -o override (standalone use only -- ignored under --bench, where the
+    # canonical tree always wins): redirects where scores.tsv itself gets
+    # written (and, via its parent, where CasterPlotter's scatter.png lands).
+    if args.output_file and not args.bench:
+        final_output_path = args.output_file
+    plot_data_dir = final_output_path.parent
 
-            if not is_sim:
-                pattern_stem = clean_stem
-                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-                final_output_path = caster_root / pattern_stem / final_output_name
+    if not args.fasta_file.exists():
+        sys.exit(f"Error: FASTA file not found at '{args.fasta_file}'")
+    if args.left < 0:
+        sys.exit(f"Error: Left index must be >= 0, got {args.left}")
+    if args.right is None:
+        try:
+            args.right = get_fasta_length(args.fasta_file)
+        except Exception as e:
+            sys.exit(f"Error reading FASTA file to compute right endpoint: {e}")
+    if args.right <= args.left:
+        sys.exit(f"Error: Right index must be greater than left index, got left={args.left}, right={args.right}")
 
-    is_fasta = not (input_str.endswith('.tsv') or args.fasta_file.name == 'scores.tsv')
-    if is_fasta or not final_output_path.exists():
-        if not is_fasta and not args.fasta_file.exists():
-            # A scores.tsv-style path was given but doesn't exist yet -- recover the
-            # source concat FASTA from the path structure and recompute from there,
-            # instead of wrongly reporting it as a missing FASTA.
-            from .utils import resolve_fasta_from_scores_path
-            recovered_fasta = resolve_fasta_from_scores_path(args.fasta_file)
-            if recovered_fasta is None:
-                sys.exit(f"Error: Score file not found at '{args.fasta_file}', and no matching source FASTA could be found under the simulations directory to recompute it.")
-            print(f"Score file '{args.fasta_file}' does not exist yet; recomputing from source FASTA: {recovered_fasta}")
-            args.fasta_file = recovered_fasta
-            is_fasta = True
-        if not args.fasta_file.exists():
-            sys.exit(f"Error: FASTA file not found at '{args.fasta_file}'")
-        if args.left < 0:
-            sys.exit(f"Error: Left index must be >= 0, got {args.left}")
-        if args.right is None:
+    # Locate dstar binary, auto-(re)compiling from source if missing or stale
+    binary_name = "dstar.exe" if sys.platform == "win32" else "dstar"
+    binary_candidates = [
+        data_dir / "bin" / binary_name,
+        repo_root / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "bin" / binary_name,
+    ]
+    which_path = shutil.which(binary_name)
+    if which_path:
+        binary_candidates.append(pathlib.Path(which_path))
+
+    binary_path = None
+    for candidate in binary_candidates:
+        if candidate.exists():
+            binary_path = candidate
+            break
+
+    if not binary_path:
+        binary_path = repo_root / "caster" / "bin" / binary_name
+
+    dstar_cpp = repo_root / "caster" / "dstar.cpp"
+    if dstar_cpp.exists():
+        if not binary_path.exists() or os.path.getmtime(dstar_cpp) > os.path.getmtime(binary_path):
+            target_bin = repo_root / "caster" / "bin" / binary_name
+            os.makedirs(target_bin.parent, exist_ok=True)
+            print(f"Compiling 'dstar' binary from {dstar_cpp}...")
+            compile_cmd = ["g++", "-std=gnu++17", "-O2", str(dstar_cpp), "-o", str(target_bin)]
             try:
-                args.right = get_fasta_length(args.fasta_file)
+                subprocess.run(compile_cmd, check=True)
+                binary_path = target_bin
+                print(f"Successfully compiled 'dstar' binary at {binary_path}")
             except Exception as e:
-                sys.exit(f"Error reading FASTA file to compute right endpoint: {e}")
-        if args.right <= args.left:
-            sys.exit(f"Error: Right index must be greater than left index, got left={args.left}, right={args.right}")
+                print(f"Warning: Could not auto-compile 'dstar': {e}")
 
-        # Locate dstar binary, auto-(re)compiling from source if missing or stale
-        binary_name = "dstar.exe" if sys.platform == "win32" else "dstar"
-        binary_candidates = [
-            data_dir / "bin" / binary_name,
-            repo_root / "caster" / "data" / "bin" / binary_name,
-            pathlib.Path.cwd() / "caster" / "data" / "bin" / binary_name,
-            pathlib.Path.cwd() / "bin" / binary_name,
-        ]
-        which_path = shutil.which(binary_name)
-        if which_path:
-            binary_candidates.append(pathlib.Path(which_path))
+    if sys.platform != "win32" and binary_path.exists() and not os.access(binary_path, os.X_OK):
+        try:
+            os.chmod(binary_path, os.stat(binary_path).st_mode | 0o755)
+        except Exception as e:
+            print(f"Warning: Failed to set executable permission on '{binary_path}': {e}")
 
-        binary_path = None
-        for candidate in binary_candidates:
-            if candidate.exists():
-                binary_path = candidate
+    # Auto-detect a population mapping file if none was given explicitly.
+    # Simulation mapping files live alongside 'concat/' as neoaves_{node}_mapping.tsv,
+    # where {node} may carry a ':clade' disambiguator suffix (e.g. 'Strigiformes:3').
+    if args.mapping is None:
+        sim_dir = args.fasta_file.parent
+        if sim_dir.name == "concat" or sim_dir.name.startswith("concat_"):
+            sim_dir = sim_dir.parent
+        mapping_candidates = sorted(sim_dir.glob("neoaves_*_mapping.tsv")) or sorted(sim_dir.glob("*_mapping.tsv"))
+
+        if len(mapping_candidates) == 1:
+            args.mapping = mapping_candidates[0]
+            print(f"Auto-detected mapping file: {args.mapping}")
+        elif len(mapping_candidates) > 1:
+            sys.exit(f"Error: Multiple candidate mapping files found in '{sim_dir}': {[str(p) for p in mapping_candidates]}. Please specify one explicitly with --mapping.")
+        else:
+            sys.exit(f"Error: No mapping file found in '{sim_dir}'. Please generate one or specify an existing one explicitly with --mapping.")
+
+    if args.pair:
+        return run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern)
+
+    # Run dstar binary on original fasta file directly, then aggregate its
+    # fine-grained (step_size-spaced) rows into rolling window_size averages
+    print(f"Running D* calculation on original file '{args.fasta_file}' with window={args.window_size}, step={args.step_size}...")
+    cmd = [str(binary_path), str(args.fasta_file.resolve())]
+    if args.mapping:
+        if not args.mapping.exists():
+            sys.exit(f"Error: Mapping file not found at '{args.mapping}'")
+        cmd.append(str(args.mapping.resolve()))
+    else:
+        cmd.append("-")
+    cmd.append(str(args.step_size))
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        try:
+            result = subprocess.run(cmd, cwd=temp_dir, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"Error running 'dstar' binary:\nCommand: {e.cmd}\nExit Code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
+
+        lines = result.stdout.splitlines()
+        if not lines:
+            sys.exit(f"Error: D* output was empty. Stderr: {result.stderr}")
+
+        header_idx = 0
+        for idx, line in enumerate(lines):
+            if "pos" in line:
+                header_idx = idx
                 break
 
-        if not binary_path:
-            binary_path = repo_root / "caster" / "data" / "bin" / binary_name
+        raw_rows = []
+        for line in lines[header_idx + 1:]:
+            if not line.strip():
+                continue
+            parts = line.strip().split("\t") if "\t" in line else line.strip().split()
+            if len(parts) >= 7:
+                raw_rows.append(parts)
 
-        dstar_cpp = repo_root / "caster" / "data" / "dstar.cpp"
-        if dstar_cpp.exists():
-            if not binary_path.exists() or os.path.getmtime(dstar_cpp) > os.path.getmtime(binary_path):
-                target_bin = repo_root / "caster" / "data" / "bin" / binary_name
-                os.makedirs(target_bin.parent, exist_ok=True)
-                print(f"Compiling 'dstar' binary from {dstar_cpp}...")
-                compile_cmd = ["g++", "-std=gnu++17", "-O2", str(dstar_cpp), "-o", str(target_bin)]
-                try:
-                    subprocess.run(compile_cmd, check=True)
-                    binary_path = target_bin
-                    print(f"Successfully compiled 'dstar' binary at {binary_path}")
-                except Exception as e:
-                    print(f"Warning: Could not auto-compile 'dstar': {e}")
+        if not raw_rows:
+            mapping_name = args.mapping.name if args.mapping else "-"
+            sys.exit(f"Error: No window scores calculated for '{args.fasta_file.name}' using mapping '{mapping_name}'. Please check that sequence headers in the FASTA match species in the mapping file.")
 
-        if sys.platform != "win32" and binary_path.exists() and not os.access(binary_path, os.X_OK):
-            try:
-                os.chmod(binary_path, os.stat(binary_path).st_mode | 0o755)
-            except Exception as e:
-                print(f"Warning: Failed to set executable permission on '{binary_path}': {e}")
+        # Perform rolling window average with O(1) sliding window
+        K = max(1, args.window_size // args.step_size)
 
-        # Auto-detect a population mapping file if none was given explicitly.
-        # Simulation mapping files live alongside 'concat/' as neoaves_{node}_mapping.tsv,
-        # where {node} may carry a ':clade' disambiguator suffix (e.g. 'Strigiformes:3').
-        if args.mapping is None:
-            sim_dir = args.fasta_file.parent
-            if sim_dir.name == "concat" or sim_dir.name.startswith("concat_"):
-                sim_dir = sim_dir.parent
-            mapping_candidates = sorted(sim_dir.glob("neoaves_*_mapping.tsv")) or sorted(sim_dir.glob("*_mapping.tsv"))
-
-            if len(mapping_candidates) == 1:
-                args.mapping = mapping_candidates[0]
-                print(f"Auto-detected mapping file: {args.mapping}")
-            elif len(mapping_candidates) > 1:
-                sys.exit(f"Error: Multiple candidate mapping files found in '{sim_dir}': {[str(p) for p in mapping_candidates]}. Please specify one explicitly with --mapping.")
-            else:
-                sys.exit(f"Error: No mapping file found in '{sim_dir}'. Please generate one or specify an existing one explicitly with --mapping.")
-
-        # Run dstar binary on original fasta file directly, then aggregate its
-        # fine-grained (step_size-spaced) rows into rolling window_size averages
-        print(f"Running D* calculation on original file '{args.fasta_file}' with window={args.window_size}, step={args.step_size}...")
-        cmd = [str(binary_path), str(args.fasta_file.resolve())]
-        if args.mapping:
-            if not args.mapping.exists():
-                sys.exit(f"Error: Mapping file not found at '{args.mapping}'")
-            cmd.append(str(args.mapping.resolve()))
-        else:
-            cmd.append("-")
-        cmd.append(str(args.step_size))
-
-        temp_dir = tempfile.mkdtemp()
-        try:
-            try:
-                result = subprocess.run(cmd, cwd=temp_dir, capture_output=True, text=True, check=True)
-            except subprocess.CalledProcessError as e:
-                sys.exit(f"Error running 'dstar' binary:\nCommand: {e.cmd}\nExit Code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
-
-            lines = result.stdout.splitlines()
-            if not lines:
-                sys.exit(f"Error: D* output was empty. Stderr: {result.stderr}")
-
-            header_idx = 0
-            for idx, line in enumerate(lines):
-                if "pos" in line:
-                    header_idx = idx
-                    break
-
-            raw_rows = []
-            for line in lines[header_idx + 1:]:
-                if not line.strip():
-                    continue
-                parts = line.strip().split("\t") if "\t" in line else line.strip().split()
-                if len(parts) >= 7:
-                    raw_rows.append(parts)
-
-            if not raw_rows:
-                mapping_name = args.mapping.name if args.mapping else "-"
-                sys.exit(f"Error: No window scores calculated for '{args.fasta_file.name}' using mapping '{mapping_name}'. Please check that sequence headers in the FASTA match species in the mapping file.")
-
-            # Perform rolling window average with O(1) sliding window
-            K = max(1, args.window_size // args.step_size)
-
-            parsed_rows = [
-                (
-                    row[0],             # file
-                    int(row[1]),        # pos
-                    float(row[2]),      # abba
-                    float(row[3]),      # baba
-                    float(row[4]),      # aabb
-                    float(row[6])       # qcnt
-                )
-                for row in raw_rows
-            ]
-
-            results = []
-            if len(parsed_rows) >= K:
-                run_abba = sum(r[2] for r in parsed_rows[:K])
-                run_baba = sum(r[3] for r in parsed_rows[:K])
-                run_aabb = sum(r[4] for r in parsed_rows[:K])
-                run_qcnt = sum(r[5] for r in parsed_rows[:K])
-
-                for i in range(len(parsed_rows) - K + 1):
-                    if i > 0:
-                        outgoing = parsed_rows[i - 1]
-                        incoming = parsed_rows[i + K - 1]
-                        run_abba += incoming[2] - outgoing[2]
-                        run_baba += incoming[3] - outgoing[3]
-                        run_aabb += incoming[4] - outgoing[4]
-                        run_qcnt += incoming[5] - outgoing[5]
-
-                    pos_val = parsed_rows[i][1]  # Position of the start of the window
-
-                    avg_abba = run_abba / K
-                    avg_baba = run_baba / K
-                    avg_aabb = run_aabb / K
-                    avg_qcnt = run_qcnt / K
-
-                    # Recalculate D* for the combined window (denom ratio is invariant to K)
-                    denom = run_abba + run_baba + run_aabb
-                    dstar_val = (run_abba - run_baba) / denom if denom != 0 else 0.0
-
-                    if args.left <= pos_val < args.right:
-                        file_val = parsed_rows[i][0]
-                        results.append({
-                            'file': file_val,
-                            'pos': pos_val,
-                            'abba': avg_abba,
-                            'baba': avg_baba,
-                            'aabb': avg_aabb,
-                            'dstar': dstar_val,
-                            'qcnt': avg_qcnt
-                        })
-
-            # If normalization is requested, apply min-max scaling to [0, 1] for each score column
-            if args.normalize and len(results) > 0:
-                for key in ['abba', 'baba', 'aabb', 'dstar']:
-                    vals = [r[key] for r in results]
-                    min_val = min(vals)
-                    max_val = max(vals)
-                    diff = max_val - min_val
-                    if diff == 0:
-                        for r in results:
-                            r[key] = 0.0
-                    else:
-                        for r in results:
-                            r[key] = (r[key] - min_val) / diff
-
-            output_lines = ["file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"]
-            for r in results:
-                output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
-
-            # final_output_path may be the shared, base-independent caster/
-            # cache -- concurrent benchmark runs across different --base
-            # variants can legitimately be computing the same scores.tsv at
-            # once, so the write itself must be atomic (write-then-rename)
-            # rather than an in-place open("w"): any reader checking
-            # final_output_path.exists() must only ever see either nothing
-            # or a complete file, never a partial one.
-            final_output_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=str(final_output_path.parent), prefix=".scores_", suffix=".tmp"
+        parsed_rows = [
+            (
+                row[0],             # file
+                int(row[1]),        # pos
+                float(row[2]),      # abba
+                float(row[3]),      # baba
+                float(row[4]),      # aabb
+                float(row[6])       # qcnt
             )
+            for row in raw_rows
+        ]
+
+        results = []
+        if len(parsed_rows) >= K:
+            run_abba = sum(r[2] for r in parsed_rows[:K])
+            run_baba = sum(r[3] for r in parsed_rows[:K])
+            run_aabb = sum(r[4] for r in parsed_rows[:K])
+            run_qcnt = sum(r[5] for r in parsed_rows[:K])
+
+            for i in range(len(parsed_rows) - K + 1):
+                if i > 0:
+                    outgoing = parsed_rows[i - 1]
+                    incoming = parsed_rows[i + K - 1]
+                    run_abba += incoming[2] - outgoing[2]
+                    run_baba += incoming[3] - outgoing[3]
+                    run_aabb += incoming[4] - outgoing[4]
+                    run_qcnt += incoming[5] - outgoing[5]
+
+                pos_val = parsed_rows[i][1]  # Position of the start of the window
+                if args.shift_caster:
+                    pos_val += args.window_size // 2
+
+                avg_abba = run_abba / K
+                avg_baba = run_baba / K
+                avg_aabb = run_aabb / K
+                avg_qcnt = run_qcnt / K
+
+                # Recalculate D* for the combined window (denom ratio is invariant to K)
+                denom = run_abba + run_baba + run_aabb
+                dstar_val = (run_abba - run_baba) / denom if denom != 0 else 0.0
+
+                if args.left <= pos_val < args.right:
+                    file_val = parsed_rows[i][0]
+                    results.append({
+                        'file': file_val,
+                        'pos': pos_val,
+                        'abba': avg_abba,
+                        'baba': avg_baba,
+                        'aabb': avg_aabb,
+                        'dstar': dstar_val,
+                        'qcnt': avg_qcnt
+                    })
+
+        # If normalization is requested, apply min-max scaling to [0, 1] for each score column
+        if args.normalize and len(results) > 0:
+            for key in ['abba', 'baba', 'aabb', 'dstar']:
+                vals = [r[key] for r in results]
+                min_val = min(vals)
+                max_val = max(vals)
+                diff = max_val - min_val
+                if diff == 0:
+                    for r in results:
+                        r[key] = 0.0
+                else:
+                    for r in results:
+                        r[key] = (r[key] - min_val) / diff
+
+        output_lines = ["file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"]
+        for r in results:
+            output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
+
+        # final_output_path may be the shared, base-independent caster/
+        # cache -- concurrent benchmark runs across different --base
+        # variants can legitimately be computing the same scores.tsv at
+        # once, so the write itself must be atomic (write-then-rename)
+        # rather than an in-place open("w"): any reader checking
+        # final_output_path.exists() must only ever see either nothing
+        # or a complete file, never a partial one.
+        final_output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(final_output_path.parent), prefix=".scores_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                f.writelines(output_lines)
+            os.replace(tmp_path, final_output_path)
+        except BaseException:
             try:
-                with os.fdopen(tmp_fd, "w") as f:
-                    f.writelines(output_lines)
-                os.replace(tmp_path, final_output_path)
-            except BaseException:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                raise
-            print(f"Success: TSV output file generated at: {final_output_path}")
-        finally:
-            shutil.rmtree(temp_dir)
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        print(f"Success: TSV output file generated at: {final_output_path}")
+    finally:
+        shutil.rmtree(temp_dir)
 
     print(f"Using scores file: {final_output_path}")
 
-    # Plotting support
     if args.plot:
         plot_scores = "scores" in args.plot
-        plot_dist = "dist" in args.plot
 
-        if plot_scores or plot_dist:
+        if plot_scores:
             CasterPlotter(
                 scores_file=str(final_output_path.resolve()),
                 distribution=args.dist_type,
-                data_dir=str(final_output_path.parent.resolve()),
+                data_dir=str(plot_data_dir.resolve()),
                 topologies=args.topologies,
                 plot_scores=plot_scores,
-                plot_dist=plot_dist,
+                locus_pattern=locus_pattern,
             )
 
     return final_output_path

@@ -18,7 +18,7 @@ struct DataType16{
     typedef long long CounterType;
 };
 
-template<typename DataType> class DStarQuadrupartitionScorer{
+template<typename DataType> class DStarQuadripartitionScorer{
 public:
     typedef typename DataType::FreqType FreqType;
     typedef typename DataType::EqFreqType EqFreqType;
@@ -263,6 +263,6 @@ int main(int argc, char *argv[])
 	int size = (argc > 3) ? stoi(argv[3]) : 1000000;
 	int win_size = (argc > 4) ? stoi(argv[4]) : 10000;
 	
-    cout << DStarQuadrupartitionScorer<DataType16>::multiind(fasta, mapping, size, win_size);
+    cout << DStarQuadripartitionScorer<DataType16>::multiind(fasta, mapping, size, win_size);
     return 0;
 }

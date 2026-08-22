@@ -6,8 +6,6 @@ import argparse
 import jax
 import numpy as np
 import jax.numpy as jnp
-import jax.random as jrand
-import tensorflow_probability.substrates.jax.distributions as tfd
 
 from collections import defaultdict
 from functools import partial
@@ -141,7 +139,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
 
         s_2 = scores[2]
 
-        # Print global table
         print(f"\nTopology / Dimension: {topo_name}")
         print(f"{'k':<5} | {'Global Silhouette Score':<25}")
         print("-" * 35)
@@ -154,7 +151,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
         if s_2 > silhouette_threshold:
             print(f"s_2 ({s_2:.4f}) > threshold ({silhouette_threshold:.4f}) -> Partitioning into Null and Alternative clusters:")
 
-            # Fit 2-means to partition the data
             kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
             labels_2 = kmeans_2.fit_predict(y_d)
 
@@ -227,7 +223,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 num_mixtures_matrix[0, d] = best_kn
                 num_mixtures_matrix[1, d] = best_ka
 
-            # Save Null sub-cluster plot if kn > 1
             if best_kn > 1:
                 sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
                 sub_labels = sub_kmeans.fit_predict(y_sub_N)
@@ -244,7 +239,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 plt.close()
                 print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
 
-            # Save Alternative sub-cluster plot if ka > 1
             if best_ka > 1:
                 sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
                 sub_labels = sub_kmeans.fit_predict(y_sub_A)
@@ -261,7 +255,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                 plt.close()
                 print(f"Saved Alternative sub-cluster optimal plot to: {plot_path_sub_A}")
 
-            # Save combined optimal plot (kmeans_kstar_{topo_name}.png)
             plt.figure(figsize=(10, 5))
             sns.set_theme(style="whitegrid")
             sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
@@ -274,7 +267,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             plt.close()
             print(f"Saved combined optimal plot to: {plot_path_opt}")
 
-            # Compute Null sub-cluster mixture parameters
             null_params = []
             if best_kn == 1:
                 mu_n, cov_n = _cluster_mean_cov(y_sub_N, D)
@@ -293,7 +285,6 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
                         cov = np.eye(D) * 1e-4
                     null_params.append((w, mu, cov))
 
-            # Compute Alt sub-cluster mixture parameters
             alt_params = []
             if best_ka == 1:
                 mu_a, cov_a = _cluster_mean_cov(y_sub_A, D)
@@ -390,11 +381,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
 class Phlag:
     def __init__(self, args):
         self.args = args
-        if not hasattr(self.args, "n_iters"):
-            self.args.n_iters = 10
         self.args.increment_steps = 5
-        if not hasattr(self.args, "step_size"):
-            self.args.step_size = None
 
         # Auto-extract model_design from filename if not explicitly passed
         self.extract_distribution_type_from_filename()
@@ -437,6 +424,11 @@ class Phlag:
         Reads CASTER scores file with guaranteed schema:
         pos  avg*ABBA  avg*BABA  avg*AABB  sliding_D* QuartetCnt
         Drops sliding_D* and QuartetCnt, mapping pos to the three topology scores.
+        For --pair's chunk_scores.tsv (which also carries q1/q2/q3, the
+        normalized ABBA/BABA/AABB proportions -- see CasterPlotter's own
+        preference for the same columns), q1/q2/q3 are used instead of the
+        unnormalized c*ABBA/c*BABA/c*AABB sums, whose scale grows with window
+        size and isn't comparable to a Gaussian/GMM emission model's expectations.
         Preserves the partial-based defaultdict structure for JAX consistency.
         Raises FileNotFoundError if the file path does not exist.
         """
@@ -454,6 +446,7 @@ class Phlag:
             raise FileNotFoundError(f"CASTER scores file not found at: {path}")
 
         self.pos_to_caster = defaultdict(partial(jnp.zeros, 3))
+        self.source_fasta_path = None
 
         with open(path, "r") as f:
             header = f.readline()
@@ -461,27 +454,39 @@ class Phlag:
                 return
 
             header_parts = header.strip().split("\t") if "\t" in header else header.strip().split()
-            if header_parts and header_parts[0].lower() == "file":
-                pos_idx = 1
-                score_indices = [2, 3, 4]
+            lower_parts = [h.lower() for h in header_parts]
+            is_file_header = bool(header_parts) and lower_parts[0] == "file"
+            is_locus_header = bool(header_parts) and lower_parts[0] == "locus"
+
+            if all(q in lower_parts for q in ("q1", "q2", "q3")):
+                score_indices = [lower_parts.index("q1"), lower_parts.index("q2"), lower_parts.index("q3")]
             else:
-                pos_idx = 0
-                score_indices = [1, 2, 3]
+                abba_idx = next((i for i, n in enumerate(lower_parts) if 'abba' in n), None)
+                baba_idx = next((i for i, n in enumerate(lower_parts) if 'baba' in n), None)
+                aabb_idx = next((i for i, n in enumerate(lower_parts) if 'aabb' in n), None)
+                if abba_idx is not None and baba_idx is not None and aabb_idx is not None:
+                    score_indices = [abba_idx, baba_idx, aabb_idx]
+                else:
+                    score_indices = [2, 3, 4] if (is_file_header or is_locus_header) else [1, 2, 3]
+
+            pos_idx = lower_parts.index("pos") if "pos" in lower_parts else (1 if (is_file_header or is_locus_header) else 0)
 
             for line in f:
                 if not line.strip():
                     continue
-                
+
                 values = line.strip().split("\t") if "\t" in line else line.strip().split()
-                
+
                 try:
                     pos_key = int(values[pos_idx])
                     scores = jnp.array([
-                        float(values[score_indices[0]]), 
-                        float(values[score_indices[1]]), 
+                        float(values[score_indices[0]]),
+                        float(values[score_indices[1]]),
                         float(values[score_indices[2]])
                     ], dtype=jnp.float32)
                     self.pos_to_caster[pos_key] = scores
+                    if self.source_fasta_path is None and is_file_header:
+                        self.source_fasta_path = values[0]
                 except (ValueError, IndexError):
                     continue
 
@@ -489,7 +494,6 @@ class Phlag:
             sys.exit(f"Error: No valid window scores parsed from CASTER score file '{path}'. Please check that sequence headers in the FASTA match the species in the mapping file.")
 
     def compute_emissions(self):
-        # Convert CASTER scores dictionary values into sequential matrix positions
         sorted_positions = sorted(self.pos_to_caster.keys())
         raw_caster_matrix = jnp.stack([self.pos_to_caster[pos] for pos in sorted_positions], axis=0)
         self.Y = raw_caster_matrix
@@ -498,20 +502,51 @@ class Phlag:
         import re
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
+        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base, get_short_sim_name
+        parsed = parse_filename_to_dir_structure(input_path.stem)
+
+        if not getattr(self.args, "bench", False):
+            # Standalone use (the default): flat <repo_root>/out/<node_name>/,
+            # no dist_type/window/category/pattern nesting, so ad-hoc runs
+            # never write into the tree benchmark runs share/read. The scores
+            # file may come from either layout -- caster.py's own flat
+            # <node_name>/scores.tsv (the common case; node_name is right
+            # there as the parent dir), or (found via -r's broadened search,
+            # or passed explicitly) the canonical --bench tree's
+            # <node_name>/<pattern>/scores.tsv under a caster/ ancestor,
+            # where node_name sits one level further up -- get_simulation_node_name
+            # handles that fixed two-directories-up offset. parsed (synthetic
+            # null/alt filenames) takes precedence over both.
+            if parsed:
+                node_name = get_short_sim_name(parsed["alt"])
+            elif "caster" in input_path.parts:
+                from .utils import get_simulation_node_name
+                node_name = get_simulation_node_name(input_path) or input_path.parent.name
+            else:
+                node_name = input_path.parent.name
+            # caster --pair nests its output one level deeper, under
+            # out/c<chunk>_s<step>/<node_name>/ (see caster.py) -- preserve
+            # that prefix so report.tsv/plots land alongside it instead of
+            # flattening back to out/<node_name>/.
+            grandparent_name = input_path.parent.parent.name
+            if not parsed and re.fullmatch(r'c\w+_s\w+', grandparent_name):
+                return get_repo_root() / "out" / grandparent_name / node_name
+            return get_repo_root() / "out" / node_name
+
+        # --bench (set only by benchmark's own subprocess invocations) keeps
+        # output in the shared canonical tree.
         # --output-base replaces the usual '<model-design>/w<W>_s<S>' prefix
         # wholesale -- it already carries whatever variant/window/step
         # structure the caller wants.
         output_base = getattr(self.args, "output_base", None)
         dist_prefix = pathlib.PurePosixPath(output_base) if output_base else pathlib.PurePosixPath(dist_type)
-        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base
-        parsed = parse_filename_to_dir_structure(input_path.stem)
 
         conn_env = os.environ.get("CONNECTION_DIR")
         if conn_env:
             base_dir = pathlib.Path(conn_env)
         else:
             base_dir = get_data_dir()
-            if base_dir == get_repo_root() / "caster" / "data":
+            if base_dir == get_repo_root() / "caster":
                 base_dir = get_repo_root() / "connection_dir"
 
         phlag_base = get_phlag_output_base(base_dir)
@@ -520,29 +555,33 @@ class Phlag:
             rel_dir = parsed["relative_dir"]
             out_dir = phlag_base / dist_prefix / rel_dir
         else:
-            # scores.tsv lives under a canonical, --output-base-independent
-            # caster/ tree (see caster.py's own output-path derivation) --
-            # report.tsv's location is still base-dependent, so all phlag
-            # needs from the input path is the category/subcategory/
-            # sim_name/pattern segments that follow caster/'s rightmost
-            # occurrence, re-rooted under phlag's own dist_prefix. Where
-            # caster/ itself sat is otherwise irrelevant, EXCEPT: when there's
-            # no --output-base, dist_prefix is dist_type alone (no window/
-            # step), so the 'w<W>_s<S>' segment -- which now sits ABOVE
-            # caster/, not below it -- has to be pulled from there explicitly
-            # to keep report.tsv under the usual '<dist_type>/w<W>_s<S>/...'
-            # tree instead of silently losing that segment.
+            # scores.tsv lives under a canonical, --output-base/dist_type-
+            # independent store/caster/w<W>_s<S>/... tree (see caster.py's own
+            # output-path derivation) -- report.tsv's location is still
+            # base-dependent, so all phlag needs from the input path is the
+            # w<W>_s<S> segment (immediately after caster/) plus the
+            # category/subcategory/sim_name/pattern segments that follow it,
+            # re-rooted under phlag's own dist_prefix. Where caster/ itself
+            # sat is otherwise irrelevant, EXCEPT: when there's no
+            # --output-base, dist_prefix is dist_type alone (no window/step),
+            # so the 'w<W>_s<S>' segment has to be pulled from the path
+            # explicitly to keep report.tsv under the usual
+            # '<dist_type>/w<W>_s<S>/...' tree instead of silently losing it.
             parts = input_path.parts
             caster_idx = None
             for i in range(len(parts) - 1, -1, -1):
                 if parts[i] == "caster":
                     caster_idx = i
                     break
-            rel_parts = list(parts[caster_idx + 1:-1]) if caster_idx is not None else []
+            if caster_idx is not None and caster_idx + 1 < len(parts) - 1:
+                w_s_part = parts[caster_idx + 1]
+                rel_parts = list(parts[caster_idx + 2:-1])
+            else:
+                w_s_part = None
+                rel_parts = []
             if rel_parts:
-                if not output_base and caster_idx is not None and caster_idx >= 1 \
-                        and re.match(r'w\w+_s\w+', parts[caster_idx - 1]):
-                    dist_prefix = pathlib.PurePosixPath(dist_type) / parts[caster_idx - 1]
+                if not output_base and w_s_part is not None and re.match(r'w\w+_s\w+', w_s_part):
+                    dist_prefix = pathlib.PurePosixPath(dist_type) / w_s_part
                 sub_path = pathlib.Path(*rel_parts)
                 out_dir = phlag_base / dist_prefix / sub_path
             else:
@@ -585,9 +624,17 @@ class Phlag:
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
         else:
             out_dir = self.get_default_out_dir()
-            out_dir.mkdir(parents=True, exist_ok=True)
-            self.output_file = out_dir / "report.tsv"
-            
+            if getattr(self.args, "bench", False):
+                # Flat '<pattern>.tsv' -- out_dir.name is always the pattern
+                # (every get_default_out_dir branch ends with it as the last
+                # segment) -- matching the existing benchmark reports/ archive
+                # shape exactly, so no migration is needed for prior runs.
+                out_dir.parent.mkdir(parents=True, exist_ok=True)
+                self.output_file = out_dir.parent / f"{out_dir.name}.tsv"
+            else:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                self.output_file = out_dir / "report.tsv"
+
         headers = [f"{' '.join(sys.argv)}"]
         self.output_str = "\n".join(headers)
 
@@ -658,14 +705,12 @@ class Phlag:
             em_hellinger2_distance = float(self.hmm.em_divergence(self.params))
 
 
-        # Get the emission distributions for each state to compute log likelihoods
         log_likelihoods = []
         for state in range(self.hmm.num_states):
             dist = self.hmm.emission_component.distribution(self.params.emissions, state)
             log_likelihoods.append(dist.log_prob(self.Y))
         log_likelihoods = jnp.stack(log_likelihoods, axis=-1)
         
-        # Convert values to numpy arrays for Viterbi calculation
         initial_probs_np = np.array(self.params.initial.probs)
         transition_matrix_np = np.array(self.params.transitions.transition_matrix)
         log_likelihoods_np = np.array(log_likelihoods)
@@ -680,13 +725,16 @@ class Phlag:
         sorted_positions = sorted(self.pos_to_caster.keys())
         y_true = np.zeros(len(sorted_positions), dtype=int)
 
-        pattern_str = None
+        # 0. Explicit --locus-pattern override (needed once caster.py's flat
+        # standalone output stopped encoding the pattern in scores.tsv's path).
+        pattern_str = getattr(self.args, "locus_pattern", None)
         # 1. Try to find the pattern in the path parts (matches [an]\d+ blocks, range syntax, or start-end coords)
         pattern_full_match_regex = r'(?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?)+|\d+-\d+(?:[_,]\d+-\d+)*'
-        for part in reversed(input_path_obj.parts):
-            if re.fullmatch(pattern_full_match_regex, part):
-                pattern_str = part
-                break
+        if not pattern_str:
+            for part in reversed(input_path_obj.parts):
+                if re.fullmatch(pattern_full_match_regex, part):
+                    pattern_str = part
+                    break
 
         # 2. Try the file stem
         if not pattern_str:
@@ -694,20 +742,43 @@ class Phlag:
             if pattern_str_match:
                 pattern_str = pattern_str_match.group(1)
 
-        if not pattern_str:
-            sys.exit(f"Error: No ground truth locus pattern (e.g. 'n1a1n5...') found in '{input_path_obj}'. Phlag requires a ground truth pattern in the score file's path or filename.")
-
-        from .utils import parse_pattern_string
-        total_span = sorted_positions[-1] if sorted_positions else None
-        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
-        if not blocks:
-            sys.exit(f"Error: Could not parse ground truth locus pattern '{pattern_str}' from '{input_path_obj}'.")
-
-        for idx, pos in enumerate(sorted_positions):
-            for start_bp, end_bp in anomaly_intervals:
-                if start_bp <= pos <= end_bp:
-                    y_true[idx] = 1
+        # 3. Try the source FASTA path caster recorded in scores.tsv's own
+        # 'file' column (read_caster_scores captures it as
+        # self.source_fasta_path) -- still encodes the pattern even once
+        # caster_scores' own path/filename stops doing so, e.g. the flat
+        # standalone out/<node>/scores.tsv layout.
+        if not pattern_str and getattr(self, "source_fasta_path", None):
+            source_path_obj = pathlib.Path(self.source_fasta_path)
+            for part in reversed(source_path_obj.parts):
+                if re.fullmatch(pattern_full_match_regex, part):
+                    pattern_str = part
                     break
+            if not pattern_str:
+                pattern_str_match = re.search(r'((?:[an]\d+)+(?:[_,]\d+-\d+(?:[_,]\d+-\d+)*)?|(?:[an]\d+(?:-[an]?\d+)?(?:[_,])?){2,}|\d+-\d+(?:[_,]\d+-\d+)*)', source_path_obj.stem)
+                if pattern_str_match:
+                    pattern_str = pattern_str_match.group(1)
+
+        # No pattern found anywhere (and none given explicitly): evaluation
+        # against ground truth isn't possible -- degrade gracefully (skip
+        # metrics/ground-truth plots) instead of erroring, since standalone
+        # runs on non-simulation data or flat-output paths legitimately have
+        # no ground truth to compare against.
+        self.has_ground_truth = False
+        if not pattern_str:
+            print(f"Warning: No ground truth locus pattern found for '{input_path_obj}' (and no --locus-pattern given) -- skipping evaluation metrics and ground-truth plots.")
+        else:
+            from .utils import parse_pattern_string
+            total_span = sorted_positions[-1] if sorted_positions else None
+            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+            if not blocks:
+                print(f"Warning: Could not parse ground truth locus pattern '{pattern_str}' from '{input_path_obj}' -- skipping evaluation metrics and ground-truth plots.")
+            else:
+                self.has_ground_truth = True
+                for idx, pos in enumerate(sorted_positions):
+                    for start_bp, end_bp in anomaly_intervals:
+                        if start_bp <= pos <= end_bp:
+                            y_true[idx] = 1
+                            break
 
         # Store ground truth info and compute the ground-truth-split empirical fits
         # (Null vs Alt), shared by the report's relative-error stats and the em.png top row
@@ -740,7 +811,10 @@ class Phlag:
                     print(f"Warning: Could not parse transition values from '{correct_trans_arg}'. Using auto ground-truth estimation.")
                     correct_trans_arg = "auto"
             
-            if correct_trans_arg == "auto" or (isinstance(correct_trans_arg, str) and correct_trans_arg.lower() == "auto"):
+            is_auto = correct_trans_arg == "auto" or (isinstance(correct_trans_arg, str) and correct_trans_arg.lower() == "auto")
+            if is_auto and not self.has_ground_truth:
+                print("Warning: --correct-transition auto requested but no ground truth pattern is available -- skipping.")
+            elif is_auto:
                 N_00 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 0))
                 N_01 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 1))
                 N_10 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 0))
@@ -762,46 +836,68 @@ class Phlag:
                 )
                 print(f"\n[Ground Truth Transition Matrix Override] Applied: {gt_tm.tolist()}\n")
 
-        # Calculate n-best Viterbi paths
         n_paths = getattr(self.args, "best_paths", 1)
         paths, path_likelihoods = self.get_n_best_viterbi_paths(
             initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
         )
 
-        # Calculate metrics for primary Viterbi path (Path 1)
+        from .utils import format_number
+
+        # Calculate metrics for primary Viterbi path (Path 1) -- only
+        # meaningful with a real ground truth to compare against; without
+        # one, skip evaluation entirely (flipping to "match" an all-null
+        # y_true would silently relabel states based on nothing) rather than
+        # report misleading numbers.
         y_pred = np.array(paths[0])
         flipped_for_eval = False
-        
-        # Flip the state assignments according to whichever has smaller hamming distance
-        hamming_dist = np.sum(y_pred != y_true)
-        hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
+        tp = fp = fn = tn = 0
 
-        if hamming_dist_flipped < hamming_dist:
-            y_pred = 1 - y_pred
-            flipped_for_eval = True
+        if self.has_ground_truth:
+            # Flip the state assignments according to whichever has smaller hamming distance
+            hamming_dist = np.sum(y_pred != y_true)
+            hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
 
-        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+            if hamming_dist_flipped < hamming_dist:
+                y_pred = 1 - y_pred
+                flipped_for_eval = True
 
-        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
-        f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
-        # Single-operating-point AUC estimate: no per-window posterior score
-        # exists to sweep a real ROC threshold, only the one confusion matrix
-        # Viterbi's hard path already gives, so this is the standard
-        # trapezoid-under-two-points proxy rather than a true swept AUC.
-        auc = (tpr + (1.0 - fpr)) / 2.0
+            # Per-window posterior P(Alt) from the same forward-backward smoother
+            # fit_em's E-step already runs -- reused here (one extra pass on the
+            # final params) to sweep a real ROC AUC instead of a hard-decision
+            # proxy. Oriented the same way y_pred was flipped above, so state
+            # index 1's posterior always means "Alt" for evaluation purposes.
+            inference_args = self.hmm._inference_args(self.params, self.Y, None)
+            posterior = hmm.hmm_two_filter_smoother(*inference_args)
+            alt_scores = np.array(posterior.smoothed_probs[:, 1])
+            if flipped_for_eval:
+                alt_scores = 1.0 - alt_scores
 
-        from .utils import format_number
-        metrics_str = (
-            f"TPR: {format_number(tpr)}, FPR: {format_number(fpr)}, "
-            f"Precision: {format_number(precision)}, F1: {format_number(f1)}, "
-            f"Accuracy: {format_number(accuracy)}, AUC: {format_number(auc)}"
-        )
+            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
+            f1 = (2 * precision * tpr) / (precision + tpr) if (precision + tpr) > 0 else 0.0
+            try:
+                from sklearn.metrics import roc_auc_score
+                auc = float(roc_auc_score(y_true, alt_scores))
+            except ValueError:
+                # y_true has only one class (all-Null or all-Alt window set) --
+                # no ROC curve to sweep, fall back to the single-operating-point
+                # estimate the hard Viterbi confusion matrix already gives.
+                auc = (tpr + (1.0 - fpr)) / 2.0
+
+            metrics_str = (
+                f"TPR: {format_number(tpr)}, FPR: {format_number(fpr)}, "
+                f"Precision: {format_number(precision)}, F1: {format_number(f1)}, "
+                f"Accuracy: {format_number(accuracy)}, AUC: {format_number(auc)}"
+            )
+        else:
+            metrics_str = "N/A (no ground truth pattern)"
         print(f"\n[Evaluation Metrics] {metrics_str}\n")
 
         # Build headers
@@ -847,11 +943,15 @@ class Phlag:
         # the locus pattern -- the fraction in particular is not a pure function of
         # the pattern string, since it depends on where the actual window grid
         # (sorted_positions) falls inside the anomaly intervals.
-        n_windows = int(len(y_true))
-        n_anomaly = int(np.sum(y_true == 1))
-        anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
-        headers.append(f"Anomaly fraction: {format_number(anomaly_fraction)} ({n_anomaly}/{n_windows} windows)")
-        headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
+        if self.has_ground_truth:
+            n_windows = int(len(y_true))
+            n_anomaly = int(np.sum(y_true == 1))
+            anomaly_fraction = (n_anomaly / n_windows) if n_windows > 0 else 0.0
+            headers.append(f"Anomaly fraction: {format_number(anomaly_fraction)} ({n_anomaly}/{n_windows} windows)")
+            headers.append(f"Label polarity flipped for evaluation: {flipped_for_eval}")
+        else:
+            headers.append("Anomaly fraction: N/A (no ground truth pattern)")
+            headers.append("Label polarity flipped for evaluation: N/A (no ground truth pattern)")
 
         # Source mtimes at report-generation time -- let bench.benchmark's run_all()
         # detect a stale report (caster.py or phlag.py/hmm.py edited since this report
@@ -897,7 +997,7 @@ class Phlag:
         headers.append(f"{metrics_str}")
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
-            headers.append("Topology\tState\tStatistic\tFitted\tGroundTruth\tRel.err(%)")
+            headers.append("Topology\tState\tStatistic\tFitted\tGroundTruth\tRel.err")
             # State index 0/1 is an arbitrary EM cluster label, not a fixed
             # Null/Alt identity -- flipped_for_eval (established above from
             # which orientation matches y_true) says which physical state
@@ -918,10 +1018,10 @@ class Phlag:
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
                 mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, null_state, d, np.array([0.0]))
                 mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, alt_state, d, np.array([0.0]))
-                rel_mu_null = (mu_null_fit - mu_null_gt) / mu_null_gt * 100 if mu_null_gt != 0 else float('nan')
-                rel_std_null = (std_null_fit - std_null_gt) / std_null_gt * 100 if std_null_gt != 0 else float('nan')
-                rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt * 100 if mu_alt_gt != 0 else float('nan')
-                rel_std_alt = (std_alt_fit - std_alt_gt) / std_alt_gt * 100 if std_alt_gt != 0 else float('nan')
+                rel_mu_null = (mu_null_fit - mu_null_gt) / mu_null_gt if mu_null_gt != 0 else float('nan')
+                rel_std_null = (std_null_fit - std_null_gt) / std_null_gt if std_null_gt != 0 else float('nan')
+                rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt if mu_alt_gt != 0 else float('nan')
+                rel_std_alt = (std_alt_fit - std_alt_gt) / std_alt_gt if std_alt_gt != 0 else float('nan')
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
                 headers.append(f"{topo_name}\tNull\tmean\t{format_rel_err(mu_null_fit)}\t{format_rel_err(mu_null_gt)}\t{format_rel_err(rel_mu_null)}")
                 headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
@@ -942,7 +1042,6 @@ class Phlag:
 
         self.output_str += "\n" + "\n".join(headers)
 
-        # Add the state paths as comma-separated rows in the report
         for path in paths:
             effective_path = (1 - path) if flipped_for_eval else path
             self.output_str += "\n" + ",".join(map(str, effective_path.tolist()))
@@ -969,7 +1068,8 @@ class Phlag:
                     line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
                     ax1.step(positions_kb, plot_path_data, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
                 
-                ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+                if self.has_ground_truth:
+                    ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
 
                 ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
@@ -994,38 +1094,6 @@ class Phlag:
                 print(f"Saved visual HMM states plot to: {plot_path}")
             except Exception as e:
                 print(f"Warning: Could not generate visual states plot: {e}")
-
-    def generate_histogram(self, most_likely_states):
-        step_size = self.args.step_size
-        if step_size is None:
-            step_size = 100
-
-        num_positions = len(most_likely_states)
-        step_counts = []
-        for start in range(0, num_positions, step_size):
-            end = min(start + step_size, num_positions)
-            count = int(jnp.sum(most_likely_states[start:end] == 1))
-            step_counts.append((start, end, count))
-
-        # 1. Text-based ASCII histogram
-        lines = [
-            "",
-            f"Step-based counts of flagged positions (step size = {step_size}):",
-            "Range       | Count | Bar",
-        ]
-        
-        max_count = max([c for _, _, c in step_counts]) if step_counts else 0
-        bar_max_width = 40
-        
-        for start, end, count in step_counts:
-            bar_len = int((count / max_count) * bar_max_width) if max_count > 0 else 0
-            bar = "*" * bar_len
-            range_str = f"{start:<6}-{end:<6}"
-            lines.append(f"# {range_str} | {count:<5} | {bar}")
-            
-        text_hist = "\n".join(lines) + "\n"
-
-        return text_hist
 
     def initialize_hmm(self):
         # Prior hyperparameters
@@ -1082,12 +1150,11 @@ class Phlag:
                 initial_gmm_params=getattr(self, "gmm_init_params", None),
             )
         else:
-            # Shape: [num_states, emission_dim, emission_dim + 1] where column 0 is
-            # the mean and the remaining emission_dim columns are the full covariance.
-            state0_init = jnp.concatenate([data_mean[:, None], data_cov], axis=-1)
-            state1_init = jnp.concatenate(
-                [data_mean[:, None], alt_variance_mult * data_cov], axis=-1
-            )
+            # Shape: [num_states, emission_dim, 2] where column 0 is the mean and
+            # column 1 is the variance -- hmm.py's initialize() builds the actual
+            # (diagonal) covariance matrix from this itself.
+            state0_init = jnp.concatenate([data_mean[:, None], data_cov], axis=-1) # CHANGED FROM data_cov and data_mean[:,None]
+            state1_init = jnp.concatenate([data_mean[:, None], alt_variance_mult * data_cov], axis=-1)
             init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
                 initial_probs=INITIAL_PROBS,
@@ -1147,82 +1214,6 @@ class Phlag:
         with open(self.output_file, "w") as f:
             f.write(self.output_str)
         print(f"Saved PHLAG output report to: {self.output_file}")
-
-
-def backfill_branch_length(root_dir=None):
-    """
-    Patches the 'Branch length (CU...)' header line in every already-written
-    report.tsv under root_dir (default: the same CONNECTION_DIR-resolved phlag
-    output base that get_default_out_dir() uses) to use
-    get_cu_branch_length_from_population_info() instead of whatever it was
-    computed with before -- without touching anything else in the file (no EM
-    rerun needed, since this line never depended on the HMM/Viterbi output).
-
-    Never overwrites a line that already carries a real numeric branch length,
-    and leaves admixture reports (no single branch to report) untouched.
-    Returns a dict of counts: patched / already_resolved / admixture / unresolved / no_clade.
-    """
-    import re
-    import pathlib
-    from . import utils
-    from .benchmark import parse_report
-
-    branch_length_line_re = re.compile(r'^Branch length \(CU[^)]*\):\s*(.+?)\s*$')
-
-    if root_dir is None:
-        conn_env = os.environ.get("CONNECTION_DIR")
-        if conn_env:
-            base_dir = pathlib.Path(conn_env)
-        else:
-            base_dir = utils.get_data_dir()
-            if base_dir == utils.get_repo_root() / "caster" / "data":
-                base_dir = utils.get_repo_root() / "connection_dir"
-        root_dir = utils.get_phlag_output_base(base_dir)
-    root_dir = pathlib.Path(root_dir)
-
-    counts = {"patched": 0, "already_resolved": 0, "admixture": 0, "unresolved": 0, "no_clade": 0}
-
-    for report_path in sorted(root_dir.rglob("report.tsv")):
-        parsed = parse_report(report_path)
-        clade_name = parsed["clade_name"]
-
-        if "admixture" in report_path.parts:
-            counts["admixture"] += 1
-            continue
-        if not clade_name:
-            counts["no_clade"] += 1
-            continue
-        if parsed["branch_length_present"] and parsed["branch_length"] is not None:
-            counts["already_resolved"] += 1
-            continue
-
-        branch_len = utils.get_cu_branch_length_from_population_info(clade_name)
-        if branch_len is None:
-            counts["unresolved"] += 1
-            continue
-
-        with open(report_path, "r") as f:
-            lines = f.read().splitlines()
-
-        new_line = f"Branch length (CU, node '{clade_name}'): {utils.format_number(branch_len)}"
-        for idx, line in enumerate(lines):
-            if branch_length_line_re.match(line.strip()):
-                lines[idx] = new_line
-                break
-        else:
-            continue
-
-        with open(report_path, "w") as f:
-            f.write("\n".join(lines))
-        counts["patched"] += 1
-
-    print(
-        f"Backfilled branch lengths under {root_dir}: "
-        f"{counts['patched']} patched, {counts['already_resolved']} already resolved, "
-        f"{counts['admixture']} admixture (skipped), {counts['unresolved']} still unresolved, "
-        f"{counts['no_clade']} with no clade name."
-    )
-    return counts
 
 
 class PhlagPlotter:
@@ -1292,8 +1283,13 @@ class PhlagPlotter:
         # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian)
         if self.phlag.args.model_design == "gmm":
             self._plot_gmm_init_row(axes[0], ranges)
-        else:
+        elif self.phlag.ground_truth_fits:
             self._plot_ground_truth_row(axes[0], ranges)
+        else:
+            for d in range(self.emission_dim):
+                axes[0][d].text(0.5, 0.5, "No ground truth available", ha="center", va="center", transform=axes[0][d].transAxes, fontsize=10, color="gray")
+                axes[0][d].set_xticks([])
+                axes[0][d].set_yticks([])
 
         # Row 1: After EM (fitted emission curves and HMM-assigned empirical data)
         self._plot_em_row(axes[1], ranges)
@@ -1500,16 +1496,6 @@ class PhlagPlotter:
         return Ellipse(xy=mean_xy, width=width, height=height, angle=angle, **kwargs)
 
     def plot_correlations(self):
-        """
-        Pairwise cross-topology correlation plot: for every pair of topology
-        dimensions, scatters the HMM-assigned data and draws 1-sigma/2-sigma
-        ellipses from the fitted full covariance matrix (PhlagHMMEmissions now
-        uses MultivariateNormalFullCovariance, not just the diagonal -- see
-        hmm.py), so the correlation structure the EM fit actually captures is
-        visible instead of only implied by the independent per-dimension curves
-        in em.png. Gaussian-only: gmm emissions have no cross-dimension
-        covariance to show.
-        """
         if self.emission_dim < 2 or self.phlag.args.model_design != "gaussian":
             return
 
@@ -1681,10 +1667,14 @@ def int_or_abbrev(val_str):
         return int(float(val_str[:-1]) * 1000000)
     return int(val_str)
 
-def parse_arguments(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER"
     )
+    # model_design has no CLI flag -- it's inferred from the input/output
+    # filename (see Phlag.extract_distribution_type_from_filename), falling
+    # back to this default if neither filename carries a "gaussian"/"gmm" hint.
+    parser.set_defaults(model_design="gaussian")
 
     parser.add_argument(
         "caster_scores",
@@ -1800,7 +1790,6 @@ def parse_arguments(argv=None):
                     rejected ones) starting from this value -- 0 starts at an
                     undamped Newton step, not gradient descent.""",
     )
-    parser.set_defaults(model_design="gaussian")
     hmm_group.add_argument(
         "--output-base",
         dest="output_base",
@@ -1809,6 +1798,30 @@ def parse_arguments(argv=None):
              "arbitrary relative path (e.g. 'gaussian/repulsion/w50k_s1k'), for "
              "writing into a relocated/variant-specific output tree instead of "
              "the default one",
+    )
+    hmm_group.add_argument(
+        "--locus-pattern",
+        dest="locus_pattern",
+        default=None,
+        help="Explicit ground-truth locus pattern (e.g. '37-62' or 'n1a1n5...') "
+             "to evaluate against, for when the score file's path/filename doesn't "
+             "encode one (e.g. caster.py's flat standalone output). Falls back to "
+             "parsing one out of the score file's path/filename when not given; if "
+             "neither succeeds, evaluation metrics and ground-truth plots are "
+             "skipped instead of erroring.",
+    )
+    hmm_group.add_argument(
+        "--bench",
+        dest="bench",
+        action="store_true",
+        default=False,
+        help="Set by benchmark's run_all() for its own subprocess invocations -- "
+             "not meant to be passed by hand. When set, report.tsv is written as a "
+             "flat '<output-base>/<pattern>.tsv' file instead of the default "
+             "'<pattern>/report.tsv', and the output root is the shared canonical "
+             "tree (default: off, writes report.tsv + plots to a flat "
+             "<repo_root>/out/<node_name>/ instead of the shared tree, for "
+             "standalone use, alongside caster.py's scores.tsv for that node).",
     )
     hmm_group.add_argument(
         "-t",
@@ -1834,7 +1847,11 @@ def parse_arguments(argv=None):
         default=None,
         help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
     )
+    return parser
 
+
+def parse_arguments(argv=None):
+    parser = build_parser()
     args = utils.apply_cli_config(parser, argv, "phlag")
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
@@ -1845,15 +1862,37 @@ def parse_arguments(argv=None):
 
     def resolve_model_scores(target_name=None):
         from .utils import get_phlag_output_base
-        search_bases = [
-            get_phlag_output_base(data_dir) / dist_type,
-            get_phlag_output_base(repo_root / "store" / "phlag") / dist_type,
-            get_phlag_output_base(data_dir),
-            get_phlag_output_base(repo_root / "store" / "phlag"),
+        # Canonical bases (--bench's shared tree) key scores.tsv under a
+        # 'caster' ancestor directory, so candidates there are filtered on
+        # that. scores.tsv lives in its own store/caster/w<W>_s<S>/... tree
+        # (dist_type-independent, not nested under phlag_base at all -- see
+        # caster.py). The flat 'out/' base is caster.py's standalone scratch
+        # tree (see caster.py) -- everything under it is ours, no 'caster'
+        # ancestor to filter on.
+        canonical_bases = [
+            data_dir / "caster",
+            repo_root / "store" / "caster",
         ]
-        candidates = []
+        flat_bases = [repo_root / "out"]
+
+        # flat_candidates (out/) and canonical_candidates are kept in
+        # separate pools rather than merged-then-sorted-by-mtime: out/ is the
+        # standalone scratch tree a single interactive `phlag -r` session
+        # writes into, while the canonical bases are shared with every
+        # concurrently-running --bench sweep, whose scores.tsv files get
+        # touched far more often -- a raw mtime merge would almost always
+        # pick a canonical file that has nothing to do with what -r's user
+        # just ran standalone. out/ wins whenever it has anything at all.
+        flat_candidates = []
+        canonical_candidates = []
         seen = set()
-        for b in search_bases:
+
+        def add(pool, sfile):
+            if sfile.resolve() not in seen:
+                seen.add(sfile.resolve())
+                pool.append(sfile)
+
+        for b in canonical_bases:
             if not b.exists():
                 continue
             if target_name:
@@ -1864,21 +1903,39 @@ def parse_arguments(argv=None):
                 target_dirs = [td for td in b.glob(f"**/{target_name}") if td.is_dir()]
                 for td in target_dirs:
                     for sfile in td.rglob("scores.tsv"):
-                        if "caster" in sfile.parts and sfile.resolve() not in seen:
-                            seen.add(sfile.resolve())
-                            candidates.append(sfile)
+                        if "caster" in sfile.parts:
+                            add(canonical_candidates, sfile)
                     for sfile in td.rglob("*.tsv"):
-                        if "caster" in sfile.parts and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]) and sfile.resolve() not in seen:
-                            seen.add(sfile.resolve())
-                            candidates.append(sfile)
+                        if "caster" in sfile.parts and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                            add(canonical_candidates, sfile)
             else:
                 for sfile in b.rglob("scores.tsv"):
-                    if "caster" in sfile.parts and sfile.resolve() not in seen:
-                        seen.add(sfile.resolve())
-                        candidates.append(sfile)
-        if candidates:
-            candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-            return candidates[0].resolve()
+                    if "caster" in sfile.parts:
+                        add(canonical_candidates, sfile)
+
+        for b in flat_bases:
+            if not b.exists():
+                continue
+            if target_name:
+                for td in b.glob(f"**/{target_name}"):
+                    if td.is_dir():
+                        for sfile in td.rglob("scores.tsv"):
+                            add(flat_candidates, sfile)
+                        for sfile in td.rglob("*.tsv"):
+                            if not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                                add(flat_candidates, sfile)
+            else:
+                # chunk_scores.tsv is --pair's scores.tsv-equivalent (see
+                # caster.py's run_caster_pair) -- included here so `-r` can
+                # find it under out/c<chunk>_s<step>/<node_name>/ too.
+                for pattern in ("scores.tsv", "chunk_scores.tsv"):
+                    for sfile in b.rglob(pattern):
+                        add(flat_candidates, sfile)
+
+        for candidates in (flat_candidates, canonical_candidates):
+            if candidates:
+                candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                return candidates[0].resolve()
         return None
 
     if args.recent or args.caster_scores == pathlib.Path("-r") or args.caster_scores is None:
@@ -1910,39 +1967,13 @@ def parse_arguments(argv=None):
     return args
 
 
-def organize_existing_test_files():
-    import pathlib
-    import shutil
-    test_dir = pathlib.Path.cwd() / "test"
-    if not test_dir.exists():
-        return
-    for item in list(test_dir.iterdir()):
-        if not item.is_file() or item.name == "check_output.py":
-            continue
-        fname = item.name
-        stem = None
-        if fname.startswith("report_") or fname.startswith("em_") or fname.startswith("states_"):
-            parts = fname.split("_", 2)
-            if len(parts) >= 3:
-                stem = pathlib.Path(parts[2]).stem
-        elif fname.startswith("kmeans_"):
-            stem = "null-neoaves_alt-Nyctibiidae_10X_up_n1n8a1n5_0_2m_w50k_s1k"
-        
-        if stem:
-            target_dir = test_dir / stem
-            target_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.move(str(item), str(target_dir / fname))
-            except Exception:
-                pass
-
-
-organize_existing_test_files()
-
-
 def main(argv=None):
-    organize_existing_test_files()
     args = parse_arguments(argv)
+
+    if not args.bench:
+        flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
+        print(f"[phlag] Effective flags: {flags_str}")
+
     phlag = Phlag(args)
 
     phlag.run()
