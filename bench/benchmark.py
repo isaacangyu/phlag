@@ -26,6 +26,8 @@ import datetime
 import argparse
 import subprocess
 
+from zoneinfo import ZoneInfo
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -2062,6 +2064,18 @@ def _build_parser():
              "affect this one. Exactly one of --create/--rerun/--copy is required.",
     )
     parser.add_argument(
+        "--config",
+        dest="config",
+        type=pathlib.Path,
+        default=None,
+        metavar="PATH",
+        help="Only valid with --create: use the config.json at PATH instead of "
+             "the live bench/config.json to drive this run (snapshotted into "
+             "the new run dir immediately, same as the live-config default). "
+             "PATH must exist and be a valid config.json (fixed/variable "
+             "sections, same shape as bench/config.json).",
+    )
+    parser.add_argument(
         "--rerun",
         dest="rerun",
         type=str,
@@ -2127,6 +2141,10 @@ def parse_arguments(argv=None):
     args = apply_cli_config(parser, argv, "benchmark")
     if sum(bool(x) for x in (args.create, args.rerun, args.copy)) != 1:
         parser.error("exactly one of --create, --rerun, or --copy is required")
+    if args.config and not args.create:
+        parser.error("--config is only valid with --create")
+    if args.config and not args.config.exists():
+        parser.error(f"--config {args.config}: file not found")
     return args
 
 
@@ -2267,8 +2285,10 @@ def create_source_snapshot(config_override=None):
 
     config_override: a path to an alternate config.json to use in place of
     the live repo's -- e.g. a previously-frozen <run_dir>/config.json for
-    --rerun, so a rerun replays that run's own original settings rather than
-    whatever bench/config.json currently says.
+    --rerun (so a rerun replays that run's own original settings rather than
+    whatever bench/config.json currently says), or --create's own --config
+    PATH (so a fresh run is driven by an arbitrary config.json instead of
+    the live one).
     """
     import os
     import tempfile
@@ -2310,12 +2330,13 @@ def run_all(args, sim_root, out_dir, config_override=None):
     always matches whatever that default currently is without needing to be
     kept in sync here.
 
-    config_override: None for --create (a fresh run) -- the live
-    bench/config.json is snapshotted as usual, then that snapshot's copy is
-    immediately persisted to <out_dir>/config.json (before any processing),
-    freezing it against concurrent edits to the live file made for some
-    OTHER benchmark run started later. For --rerun, the caller passes
-    <out_dir>/config.json itself back in here, so the snapshot replays this
+    config_override: None for a plain --create (a fresh run) -- the live
+    bench/config.json is snapshotted as usual; --create --config PATH passes
+    PATH here instead, using it in place of the live file. Either way, that
+    snapshot's copy is immediately persisted to <out_dir>/config.json (before
+    any processing), freezing it against concurrent edits to the live file
+    made for some OTHER benchmark run started later. For --rerun, the caller
+    passes <out_dir>/config.json itself back in here, so the snapshot replays this
     run's own original settings instead of whatever's currently live.
 
     Caster's scores.tsv stays canonical/shared in its own store/caster/
@@ -2331,7 +2352,7 @@ def run_all(args, sim_root, out_dir, config_override=None):
 
     snapshot_root, snapshot_env = create_source_snapshot(config_override=config_override)
     snapshot_config = snapshot_root / "bench" / "config.json"
-    if config_override is None and snapshot_config.exists():
+    if snapshot_config.exists():
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(snapshot_config, out_dir / "config.json")
         print(f"Wrote config:         {out_dir / 'config.json'}")
@@ -2667,18 +2688,26 @@ def resolve_run_dir(args):
     This fully determines out_dir (validated as falling under the phlag
     output tree, nothing more specific than that -- there's no separate
     --base to join it against, and so nothing left to accidentally double
-    up). --create errors out if out_dir already exists; --rerun errors out
-    if it doesn't. reuse is just bool(args.rerun) -- --create guarantees
-    out_dir didn't exist, --rerun guarantees it did.
+    up). --create errors out if out_dir already has a populated reports/
+    archive (not merely if out_dir exists -- run_all() itself may have
+    already mkdir'd it and written config.json/source/ there on a prior
+    invocation that didn't get as far as producing any report.tsv, and
+    --create should be able to resume into that); --rerun errors out
+    if out_dir has no analysis.tsv directly under it (a prior --create/
+    --rerun that got as far as summarize()). reuse is just bool(args.rerun)
+    -- --create guarantees out_dir had no reports/ archive yet, --rerun
+    guarantees out_dir/analysis.tsv did.
     """
     flag, run_path = ("--create", args.create) if args.create else ("--rerun", args.rerun)
     out_dir = _validate_store_path(flag, run_path)
 
-    exists = out_dir.exists()
-    if args.create and exists:
-        sys.exit(f"{RED}--create {run_path}: already exists at {out_dir} -- use --rerun instead.{RESET}")
-    if args.rerun and not exists:
-        sys.exit(f"{RED}--rerun {run_path}: no existing run at {out_dir} -- use --create instead.{RESET}")
+    if args.create and _has_reports_archive(out_dir):
+        sys.exit(f"{RED}--create {run_path}: already has a reports/ archive at {out_dir} -- use --rerun instead.{RESET}")
+    if args.rerun and not (out_dir / "analysis.tsv").exists():
+        sys.exit(
+            f"{RED}--rerun {run_path}: no analysis.tsv found directly under {out_dir} "
+            f"-- use --create instead.{RESET}"
+        )
 
     return out_dir, bool(args.rerun)
 
@@ -2930,6 +2959,9 @@ def handle_copy(args, sim_root, stats, start_time):
             print(f"[skip caster,phlag] resummarizing directly from {pos2_leaf / 'reports'}")
         else:
             run_all(args, sim_root, pos2_leaf, config_override=merged_config_path)
+            if "caster" not in args.skip:
+                args.skip = args.skip + ["caster"]
+                print("[copy] caster generated -- skipping caster for remaining leaves")
         summarize(args, sim_root, stats, pos2_leaf, pos2_leaf_existed, start_time=start_time)
 
 
@@ -2957,7 +2989,8 @@ def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    report_lines = [f"Run at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+    run_at = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
+    report_lines = [f"Run at: {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}"]
     if args.change:
         report_lines.append(args.change)
     if start_time is not None:
@@ -3061,6 +3094,8 @@ def main(argv=None):
             return
 
     config_override = None
+    if args.create and args.config:
+        config_override = args.config
     if args.rerun:
         config_override = out_dir / "config.json"
         if not config_override.exists():

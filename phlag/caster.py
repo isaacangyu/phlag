@@ -354,8 +354,8 @@ def build_parser():
              "phlag/phlagster; has no effect on scores.tsv's location when set "
              "(stays in the canonical shared tree, same as always: "
              "store/caster/w<W>_s<S>/...). When NOT set (standalone use, the "
-             "default), scores.tsv goes to a flat <repo_root>/out/<node_name>/"
-             "scores.tsv instead of the shared canonical tree."
+             "default), scores go to <repo_root>/out/w<W>_s<S>/<node_name>/"
+             "<node_name>.tsv instead of the shared canonical tree."
     )
     parser.add_argument(
         "--pair",
@@ -375,7 +375,7 @@ def build_parser():
         type=pathlib.Path,
         default=None,
         help="Output path for --pair's per-chunk quartet scores TSV (default: "
-             "chunk_scores.tsv alongside where scores.tsv would normally go)."
+             "wherever --pair's scores file would normally go)."
     )
     parser.add_argument(
         "--chunk",
@@ -396,7 +396,8 @@ def parse_arguments(argv=None):
     return apply_cli_config(parser, argv, "caster")
 
 
-def run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern):
+def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern):
+    plot_data_dir = final_output_path.parent
     binary_name = "caster-pair.exe" if sys.platform == "win32" else "caster-pair"
     binary_candidates = [
         data_dir / "bin" / binary_name,
@@ -444,7 +445,7 @@ def run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern):
     if not args.mapping.exists():
         sys.exit(f"Error: Mapping file not found at '{args.mapping}'")
 
-    chunk_scores_path = args.chunk_scores if args.chunk_scores else (plot_data_dir / "chunk_scores.tsv")
+    chunk_scores_path = args.chunk_scores if args.chunk_scores else final_output_path
     chunk_scores_path.parent.mkdir(parents=True, exist_ok=True)
     window_size = args.chunk_size if args.chunk_size is not None else args.window_size
     pair_step = min(args.step_size, window_size)
@@ -472,7 +473,7 @@ def run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern):
     if K > 1:
         raw_df = pd.read_csv(chunk_scores_path, sep="\t")
         agg_rows = []
-        for locus, locus_df in raw_df.groupby("locus", sort=False):
+        for source_file, locus_df in raw_df.groupby("file", sort=False):
             locus_df = locus_df.sort_values("pos").reset_index(drop=True)
             for i in range(len(locus_df) - K + 1):
                 window = locus_df.iloc[i:i + K]
@@ -484,7 +485,7 @@ def run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern):
                 if args.shift_caster:
                     pos_val += window_size // 2
                 agg_rows.append({
-                    "locus": locus,
+                    "file": source_file,
                     "pos": pos_val,
                     "c*ABBA": s0,
                     "c*BABA": s1,
@@ -588,11 +589,11 @@ def main(argv=None):
             final_output_path = caster_root / pattern_stem / final_output_name
     else:
         # Standalone use (the default): no shared/canonical tree, no
-        # dist_type/window/category/pattern nesting -- everything for a
-        # node lands flat in <repo_root>/out/<node_name>/, alongside
-        # phlag's report.tsv for the same node (see phlag.py). Node name
-        # is the short simulation name for sim inputs, the alt name for
-        # parsed null/alt filenames, or the cleaned stem otherwise.
+        # dist_type/category/pattern nesting -- everything for a node lands
+        # under <repo_root>/out/w<W>_s<S>/<node_name>/<node_name>.tsv,
+        # alongside phlag's report.tsv for the same node (see phlag.py).
+        # Node name is the short simulation name for sim inputs, the alt
+        # name for parsed null/alt filenames, or the cleaned stem otherwise.
         if parsed:
             node_name = get_short_sim_name(parsed["alt"])
         elif is_sim:
@@ -603,13 +604,13 @@ def main(argv=None):
             # --pair's chunk-rollup granularity is an independent axis from
             # dstar's window/step (it may not even be run for the same node),
             # so its output gets its own out/c<chunk>_s<step>/<node_name>/
-            # prefix instead of colliding with dstar's flat out/<node_name>/.
+            # prefix instead of colliding with dstar's out/w<W>_s<S>/<node_name>/.
             pair_chunk = args.chunk_size if args.chunk_size is not None else args.window_size
             pair_chunk_str = format_val(pair_chunk)
             pair_step_str = format_val(args.step_size)
-            final_output_path = repo_root / "out" / f"c{pair_chunk_str}_s{pair_step_str}" / node_name / "scores.tsv"
+            final_output_path = repo_root / "out" / f"c{pair_chunk_str}_s{pair_step_str}" / node_name / f"{node_name}.tsv"
         else:
-            final_output_path = repo_root / "out" / node_name / "scores.tsv"
+            final_output_path = repo_root / "out" / f"w{window_str}_s{step_str}" / node_name / f"{node_name}.tsv"
 
     # -o override (standalone use only -- ignored under --bench, where the
     # canonical tree always wins): redirects where scores.tsv itself gets
@@ -689,7 +690,7 @@ def main(argv=None):
             sys.exit(f"Error: No mapping file found in '{sim_dir}'. Please generate one or specify an existing one explicitly with --mapping.")
 
     if args.pair:
-        return run_caster_pair(args, repo_root, data_dir, plot_data_dir, locus_pattern)
+        return run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
 
     # Run dstar binary on original fasta file directly, then aggregate its
     # fine-grained (step_size-spaced) rows into rolling window_size averages

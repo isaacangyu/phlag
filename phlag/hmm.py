@@ -416,6 +416,7 @@ class PhlagHMMTransitions(HMMTransitions):
             if self.num_states == 1:
                 transition_matrix = jnp.array([[1.0]])
             else:
+                # batch_stats
                 expected_trans_counts = batch_stats.sum(axis=0)
                 transition_matrix = expected_trans_counts / (expected_trans_counts.sum(axis=-1, keepdims=True) + 1e-12)
             params = params._replace(transition_matrix=transition_matrix)
@@ -445,6 +446,7 @@ class PhlagHMMEmissions(HMMEmissions):
         anneal_boost: float = 2.0,
         n_iters: int = 10,
         increment_steps: int = 5,
+        sigma_min: float = 1e-2,
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
@@ -452,6 +454,7 @@ class PhlagHMMEmissions(HMMEmissions):
         self.parameterization = parameterization
         self.lm_damping = lm_damping
         self.repulsion_optimizer = repulsion_optimizer
+        self.sigma_min = sigma_min
         self.penalty_lambda_anneal = penalty_lambda_anneal
         self.anneal_boost = anneal_boost
         # t (in exp(-t/anneal_tau), see m_step) is counted in actual inner EM
@@ -460,7 +463,7 @@ class PhlagHMMEmissions(HMMEmissions):
         # steps over the whole run is the arithmetic-sequence sum below, not
         # n_iters itself. tau is a third of that total.
         total_inner_steps = increment_steps * n_iters * (n_iters + 1) // 2
-        self.anneal_tau = max(1, total_inner_steps // 3)
+        self.anneal_tau = max(1, 10 * total_inner_steps // 3)
 
         # "Budget mode": un-normalized, the schedule below (1 + boost*exp(-t/tau))
         # is always >= 1, so penalty_lambda * that is always >= penalty_lambda --
@@ -601,7 +604,7 @@ class PhlagHMMEmissions(HMMEmissions):
 
         grad_flat = jax.grad(flat_obj)
 
-        sigma_min = 1e-2
+        sigma_min = self.sigma_min
 
         def clamp_L(L):
             # Eigendecompose Sigma (symmetric by construction) and floor its
@@ -861,6 +864,7 @@ class PhlagHMM(HMM):
                 penalty_lambda_anneal=kwargs.get("penalty_lambda_anneal", False),
                 n_iters=kwargs.get("n_iters", 10),
                 increment_steps=kwargs.get("increment_steps", 5),
+                sigma_min=kwargs.get("sigma_min", 1e-2),
             )
         super().__init__(
             num_states=self.num_states,

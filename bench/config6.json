@@ -1,0 +1,14 @@
+{
+  "caster": {
+    "fixed": [],
+    "variable": ["-d", "gaussian", "-w", "250k", "-s", "1k", "--shift-caster"]
+  },
+  "phlag": {
+    "fixed": ["--np", "free"],
+    "variable": ["--double-variance-init", "--ap", "repulsion", "--annealing", "--lam", "1.5"]
+  },
+  "benchmark": {
+    "fixed": [],
+    "variable": []
+  }
+}

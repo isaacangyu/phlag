@@ -305,13 +305,14 @@ struct Workflow {
             cerr << "Error: could not open '" << outFile << "' for writing.\n";
             exit(1);
         }
-        fout << "locus\tpos\tc*ABBA\tc*BABA\tc*AABB\tq1\tq2\tq3\n";
+        const string &inputFile = ARG.getStringArg("input");
+        fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tq1\tq2\tq3\n";
         for (auto &kv: chunkScores){
             double s0 = (double) kv.second[0], s1 = (double) kv.second[1], s2 = (double) kv.second[2];
             double tot = s0 + s1 + s2;
             double q0 = tot > 0 ? s0 / tot : 1.0 / 3, q1v = tot > 0 ? s1 / tot : 1.0 / 3, q2v = tot > 0 ? s2 / tot : 1.0 / 3;
             long long pos = (long long) kv.first.second * chunkSizeArg;
-            fout << kv.first.first << "\t" << pos << "\t"
+            fout << inputFile << "\t" << pos << "\t"
                  << s0 << "\t" << s1 << "\t" << s2 << "\t"
                  << q0 << "\t" << q1v << "\t" << q2v << "\n";
         }

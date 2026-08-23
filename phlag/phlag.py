@@ -447,6 +447,7 @@ class Phlag:
 
         self.pos_to_caster = defaultdict(partial(jnp.zeros, 3))
         self.source_fasta_path = None
+        self.used_pair_scores = False
 
         with open(path, "r") as f:
             header = f.readline()
@@ -460,6 +461,7 @@ class Phlag:
 
             if all(q in lower_parts for q in ("q1", "q2", "q3")):
                 score_indices = [lower_parts.index("q1"), lower_parts.index("q2"), lower_parts.index("q3")]
+                self.used_pair_scores = True
             else:
                 abba_idx = next((i for i, n in enumerate(lower_parts) if 'abba' in n), None)
                 baba_idx = next((i for i, n in enumerate(lower_parts) if 'baba' in n), None)
@@ -506,13 +508,13 @@ class Phlag:
         parsed = parse_filename_to_dir_structure(input_path.stem)
 
         if not getattr(self.args, "bench", False):
-            # Standalone use (the default): flat <repo_root>/out/<node_name>/,
-            # no dist_type/window/category/pattern nesting, so ad-hoc runs
-            # never write into the tree benchmark runs share/read. The scores
-            # file may come from either layout -- caster.py's own flat
-            # <node_name>/scores.tsv (the common case; node_name is right
-            # there as the parent dir), or (found via -r's broadened search,
-            # or passed explicitly) the canonical --bench tree's
+            # Standalone use (the default): <repo_root>/out/w<W>_s<S>/<node_name>/,
+            # no dist_type/category/pattern nesting, so ad-hoc runs never
+            # write into the tree benchmark runs share/read. The scores file
+            # may come from either layout -- caster.py's own
+            # w<W>_s<S>/<node_name>/<node_name>.tsv (the common case; node_name
+            # is right there as the parent dir), or (found via -r's broadened
+            # search, or passed explicitly) the canonical --bench tree's
             # <node_name>/<pattern>/scores.tsv under a caster/ ancestor,
             # where node_name sits one level further up -- get_simulation_node_name
             # handles that fixed two-directories-up offset. parsed (synthetic
@@ -524,12 +526,13 @@ class Phlag:
                 node_name = get_simulation_node_name(input_path) or input_path.parent.name
             else:
                 node_name = input_path.parent.name
-            # caster --pair nests its output one level deeper, under
-            # out/c<chunk>_s<step>/<node_name>/ (see caster.py) -- preserve
-            # that prefix so report.tsv/plots land alongside it instead of
+            # caster's dstar and --pair paths both nest one level deeper,
+            # under out/w<W>_s<S>/<node_name>/ or out/c<chunk>_s<step>/<node_name>/
+            # respectively (see caster.py) -- preserve that prefix so
+            # report.tsv/plots land alongside the scores file instead of
             # flattening back to out/<node_name>/.
             grandparent_name = input_path.parent.parent.name
-            if not parsed and re.fullmatch(r'c\w+_s\w+', grandparent_name):
+            if not parsed and re.fullmatch(r'[cw]\w+_s\w+', grandparent_name):
                 return get_repo_root() / "out" / grandparent_name / node_name
             return get_repo_root() / "out" / node_name
 
@@ -1122,6 +1125,7 @@ class Phlag:
             penalty_lambda_anneal=self.args.annealing,
             n_iters=self.args.n_iters,
             increment_steps=self.args.increment_steps,
+            sigma_min=1e-5 if getattr(self, "used_pair_scores", False) else 1e-2,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1819,8 +1823,8 @@ def build_parser():
              "not meant to be passed by hand. When set, report.tsv is written as a "
              "flat '<output-base>/<pattern>.tsv' file instead of the default "
              "'<pattern>/report.tsv', and the output root is the shared canonical "
-             "tree (default: off, writes report.tsv + plots to a flat "
-             "<repo_root>/out/<node_name>/ instead of the shared tree, for "
+             "tree (default: off, writes report.tsv + plots to "
+             "<repo_root>/out/w<W>_s<S>/<node_name>/ instead of the shared tree, for "
              "standalone use, alongside caster.py's scores.tsv for that node).",
     )
     hmm_group.add_argument(
@@ -1892,6 +1896,11 @@ def parse_arguments(argv=None):
                 seen.add(sfile.resolve())
                 pool.append(sfile)
 
+        def is_score_candidate(sfile):
+            return sfile.name != "report.tsv" and not any(
+                sfile.name.startswith(p) for p in ["report_", "em_", "states_"]
+            )
+
         for b in canonical_bases:
             if not b.exists():
                 continue
@@ -1919,17 +1928,12 @@ def parse_arguments(argv=None):
             if target_name:
                 for td in b.glob(f"**/{target_name}"):
                     if td.is_dir():
-                        for sfile in td.rglob("scores.tsv"):
-                            add(flat_candidates, sfile)
                         for sfile in td.rglob("*.tsv"):
-                            if not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                            if is_score_candidate(sfile):
                                 add(flat_candidates, sfile)
             else:
-                # chunk_scores.tsv is --pair's scores.tsv-equivalent (see
-                # caster.py's run_caster_pair) -- included here so `-r` can
-                # find it under out/c<chunk>_s<step>/<node_name>/ too.
-                for pattern in ("scores.tsv", "chunk_scores.tsv"):
-                    for sfile in b.rglob(pattern):
+                for sfile in b.rglob("*.tsv"):
+                    if is_score_candidate(sfile):
                         add(flat_candidates, sfile)
 
         for candidates in (flat_candidates, canonical_candidates):
@@ -1957,6 +1961,14 @@ def parse_arguments(argv=None):
             args.caster_scores = resolved
         else:
             sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
+
+    if args.step_size is None:
+        import re as _re
+        for part in pathlib.Path(args.caster_scores).parts:
+            m = _re.fullmatch(r'[cw]\w+_s(\w+)', part)
+            if m:
+                args.step_size = int_or_abbrev(m.group(1))
+                break
 
     # Check if --plot is supplied
     check_argv = argv if argv is not None else sys.argv[1:]
