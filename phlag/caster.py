@@ -33,6 +33,15 @@ def int_or_abbrev(val_str):
         return int(float(val_str[:-1]) * 1000000)
     return int(val_str)
 
+def step_size_or_fraction(val_str):
+    val_str = str(val_str).strip().lower()
+    if val_str.endswith('k') or val_str.endswith('m'):
+        return int_or_abbrev(val_str)
+    frac = float(val_str)
+    if 0 < frac < 1:
+        return frac
+    return int_or_abbrev(val_str)
+
 def get_fasta_length(fasta_path):
     length = 0
     with open(fasta_path, "r") as f:
@@ -129,33 +138,43 @@ class CasterPlotter:
             }
         return self.params
 
-    def plot_topology_scatter(self):
-        # caster-pair's chunk_scores.tsv carries both raw per-window quartet-support
-        # sums (c*ABBA/c*BABA/c*AABB, unbounded, scale with window size) and their
-        # normalized proportions (q1/q2/q3, in [0,1], positionally ABBA/BABA/AABB --
-        # see caster-pair.cpp's scoreChunksForBranch). Prefer q1/q2/q3 when present
-        # so the plotted "Score" is comparable in scale to dstar's own already-
-        # normalized c*ABBA/c*BABA/c*AABB columns.
+    @staticmethod
+    def resolve_topology_columns(df, topologies=None):
+        """
+        Shared topology-column resolution for both the scatter plot and
+        write_ground_truth_stats: caster-pair's chunk_scores.tsv carries both
+        raw per-window quartet-support sums (c*ABBA/c*BABA/c*AABB, unbounded,
+        scale with window size) and their normalized proportions (q1/q2/q3,
+        in [0,1], positionally ABBA/BABA/AABB -- see caster-pair.cpp's
+        scoreChunksForBranch). Prefer q1/q2/q3 when present so values stay
+        comparable in scale to dstar's own already-normalized
+        c*ABBA/c*BABA/c*AABB columns. Returns (avg_cols, rename_map).
+        """
         pair_cols = ['q1', 'q2', 'q3']
-        if all(c in self.df.columns for c in pair_cols):
+        if all(c in df.columns for c in pair_cols):
             avg_cols = pair_cols
             rename_map = {'q1': 'ABBA', 'q2': 'BABA', 'q3': 'AABB'}
         else:
-            avg_cols = [c for c in self.df.columns if 'avg' in c or 'c*' in c]
+            avg_cols = [c for c in df.columns if 'avg' in c or 'c*' in c]
             rename_map = {}
             for col in avg_cols:
                 match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
                 rename_map[col] = match.group(1).upper() if match else col
 
-        if self.topologies is not None:
+        if topologies is not None:
             filtered_cols = []
             for col in avg_cols:
                 mapped_name = rename_map.get(col, col)
-                for t in self.topologies:
+                for t in topologies:
                     if t.lower() in mapped_name.lower():
                         filtered_cols.append(col)
                         break
             avg_cols = filtered_cols
+
+        return avg_cols, rename_map
+
+    def plot_topology_scatter(self):
+        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
 
         if not avg_cols:
             print("No matching topology columns found to scatter plot.")
@@ -227,6 +246,73 @@ class CasterPlotter:
         plt.close()
 
 
+def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None):
+    """
+    Writes gt_stats.txt (Null/Alt/Overall mean+covariance across the 3
+    topology dimensions, ABBA/BABA/AABB order) next to scores_file, so
+    downstream ground-truth-divergence consumers (phlag.py's em_gt_hd) can
+    read the joint mean/covariance directly instead of re-loading and
+    re-splitting scores_file themselves every time.
+
+    Called unconditionally after scores.tsv/chunk_scores.tsv is finalized,
+    independent of --plot (CasterPlotter itself is only constructed when
+    plotting is requested, but this data artifact -- like scores.tsv itself
+    -- should exist regardless). Overall needs only >=2 windows total, always
+    computable; Null/Alt additionally need a resolvable ground-truth locus
+    pattern and >=2 windows in each class. Any missing piece degrades
+    gracefully (skips that section, or writes nothing at all) rather than
+    raising, same convention as phlag.py's own ground-truth handling.
+    """
+    from .utils import parse_pattern_string, write_gt_stats_file, GT_STATS_FILENAME
+
+    try:
+        df = pd.read_csv(scores_file, sep='\t')
+    except Exception:
+        return
+
+    avg_cols, rename_map = CasterPlotter.resolve_topology_columns(df, topologies)
+    topo_order = ['ABBA', 'BABA', 'AABB']
+    col_for_topo = {}
+    for col in avg_cols:
+        mapped = rename_map.get(col, col)
+        if mapped in topo_order and mapped not in col_for_topo:
+            col_for_topo[mapped] = col
+    if 'pos' not in df.columns or not all(t in col_for_topo for t in topo_order):
+        return
+
+    Y = df[[col_for_topo[t] for t in topo_order]].to_numpy(dtype=float)
+    if len(Y) < 2:
+        return
+
+    stats = {"Overall": (Y.mean(axis=0), np.cov(Y, rowvar=False).reshape(3, 3))}
+
+    pattern_str = locus_pattern
+    if not pattern_str:
+        m = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', str(scores_file))
+        pattern_str = m.group(1) if m else None
+
+    if pattern_str:
+        positions = df['pos'].to_numpy()
+        total_span = positions.max() if len(positions) else None
+        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+        if blocks:
+            y_true = np.zeros(len(positions), dtype=int)
+            for idx, pos in enumerate(positions):
+                for start_bp, end_bp in anomaly_intervals:
+                    if start_bp <= pos <= end_bp:
+                        y_true[idx] = 1
+                        break
+            null_vals = Y[y_true == 0]
+            alt_vals = Y[y_true == 1]
+            if len(null_vals) > 1:
+                stats["Null"] = (null_vals.mean(axis=0), np.cov(null_vals, rowvar=False).reshape(3, 3))
+            if len(alt_vals) > 1:
+                stats["Alt"] = (alt_vals.mean(axis=0), np.cov(alt_vals, rowvar=False).reshape(3, 3))
+
+    output_path = pathlib.Path(output_dir) / GT_STATS_FILENAME
+    write_gt_stats_file(output_path, stats)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Caster: Load scores and generate topology distribution and scatter plots."
@@ -282,9 +368,11 @@ def build_parser():
     parser.add_argument(
         "-s",
         dest="step_size",
-        type=int_or_abbrev,
+        type=step_size_or_fraction,
         default=1000,
-        help="Step size (default: 1000 / 1k)"
+        help="Step size (default: 1000 / 1k). A value strictly between 0 and 1 "
+             "is treated as a fraction of -w and multiplied out (e.g. -w 50000 "
+             "-s 0.1 -> step=5000)."
     )
 
     parser.add_argument(
@@ -392,8 +480,7 @@ def build_parser():
 
 def parse_arguments(argv=None):
     parser = build_parser()
-    from .utils import apply_cli_config
-    return apply_cli_config(parser, argv, "caster")
+    return parser.parse_args(argv)
 
 
 def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern):
@@ -498,6 +585,13 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
 
     print(f"Success: chunk scores written to: {chunk_scores_path}")
 
+    write_ground_truth_stats(
+        scores_file=str(chunk_scores_path.resolve()),
+        output_dir=str(plot_data_dir.resolve()),
+        locus_pattern=locus_pattern,
+        topologies=args.topologies,
+    )
+
     if args.plot and "scores" in args.plot:
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-pair.cpp to mirror dstar's scores.tsv exactly, so the same
@@ -521,6 +615,8 @@ def main(argv=None):
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
         args.step_size = args.window_size
+    elif isinstance(args.step_size, float):
+        args.step_size = max(1, round(args.step_size * args.window_size))
 
     if not args.bench:
         flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
@@ -573,7 +669,15 @@ def main(argv=None):
         # writes the same cached scores.tsv here instead of each getting its
         # own copy recomputed from scratch. Lives in its own store/caster/
         # tree, not nested under store/phlag/, since it isn't a phlag output.
-        caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}"
+        # --pair keys this the same way it keys the standalone tree
+        # (c<chunk>_s<step>, see below) -- otherwise a --pair run sharing a
+        # dstar run's -w/-s values would collide on the exact same cached
+        # scores.tsv, silently mixing quartet-branch scores with D* scores.
+        if args.pair:
+            pair_chunk = args.chunk_size if args.chunk_size is not None else args.window_size
+            caster_root = data_dir / "caster" / f"c{format_val(pair_chunk)}_s{step_str}"
+        else:
+            caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}"
         if parsed:
             rel_dir = parsed["relative_dir_no_window"]
             final_output_path = caster_root / rel_dir / "scores.tsv"
@@ -833,6 +937,13 @@ def main(argv=None):
         shutil.rmtree(temp_dir)
 
     print(f"Using scores file: {final_output_path}")
+
+    write_ground_truth_stats(
+        scores_file=str(final_output_path.resolve()),
+        output_dir=str(plot_data_dir.resolve()),
+        locus_pattern=locus_pattern,
+        topologies=args.topologies,
+    )
 
     if args.plot:
         plot_scores = "scores" in args.plot

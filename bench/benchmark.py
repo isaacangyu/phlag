@@ -127,13 +127,16 @@ _RE_METRICS_WITH_PRECISION = re.compile(
 )
 _RE_METRICS_WITH_PRECISION_AUC = re.compile(
     r'^TPR:\s*([-\d.eE+]+),\s*FPR:\s*([-\d.eE+]+),\s*Precision:\s*([-\d.eE+]+),\s*'
-    r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+),\s*AUC:\s*([-\d.eE+]+)\s*$'
+    r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+),\s*(?:ROC-)?AUC:\s*([-\d.eE+]+)\s*$'
 )
 _RE_RELERR_ROW = re.compile(
     r'^(\w+)\t(Null|Alt)\t(mean|std)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
     re.IGNORECASE,
 )
 _RE_EM_DIVERGENCE = re.compile(
+    r'^em_hd:\s*([-\d.eE+]+)\s*$'
+)
+_RE_EM_DIVERGENCE_LEGACY_HD_LABEL = re.compile(
     r'^EM divergence \(Hellinger\^2\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_EM_DIVERGENCE_LEGACY_HELLINGER = re.compile(
@@ -143,6 +146,9 @@ _RE_EM_DIVERGENCE_LEGACY = re.compile(
     r'^EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_GT_EM_DIVERGENCE = re.compile(
+    r'^em_gt_hd:\s*([-\d.eE+]+)\s*$'
+)
+_RE_GT_EM_DIVERGENCE_LEGACY_HD_LABEL = re.compile(
     r'^Ground truth EM divergence \(Hellinger\^2\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_GT_EM_DIVERGENCE_LEGACY_HELLINGER = re.compile(
@@ -258,6 +264,7 @@ def parse_report(report_path):
         "fitted_alt_mean": None, "fitted_alt_cov": None,
         "em_hd": None,
         "em_gt_hd": None,
+        "em_gt_hd_is_joint": False,
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
         "caster_source_mtime": None, "phlag_source_mtime": None,
@@ -359,6 +366,7 @@ def parse_report(report_path):
 
             m = (
                 _RE_EM_DIVERGENCE.match(line)
+                or _RE_EM_DIVERGENCE_LEGACY_HD_LABEL.match(line)
                 or _RE_EM_DIVERGENCE_LEGACY_HELLINGER.match(line)
                 or _RE_EM_DIVERGENCE_LEGACY.match(line)
             )
@@ -366,11 +374,13 @@ def parse_report(report_path):
                 parsed["em_hd"] = float(m.group(1))
                 continue
 
-            m = (
-                _RE_GT_EM_DIVERGENCE.match(line)
-                or _RE_GT_EM_DIVERGENCE_LEGACY_HELLINGER.match(line)
-                or _RE_GT_EM_DIVERGENCE_LEGACY.match(line)
-            )
+            m = _RE_GT_EM_DIVERGENCE.match(line) or _RE_GT_EM_DIVERGENCE_LEGACY_HD_LABEL.match(line)
+            if m:
+                parsed["em_gt_hd"] = float(m.group(1))
+                parsed["em_gt_hd_is_joint"] = True
+                continue
+
+            m = _RE_GT_EM_DIVERGENCE_LEGACY_HELLINGER.match(line) or _RE_GT_EM_DIVERGENCE_LEGACY.match(line)
             if m:
                 parsed["em_gt_hd"] = float(m.group(1))
                 continue
@@ -443,15 +453,18 @@ def parse_report(report_path):
     if parsed["auc"] is None and parsed["tpr"] is not None and parsed["fpr"] is not None:
         parsed["auc"] = (parsed["tpr"] + (1.0 - parsed["fpr"])) / 2.0
 
-    # em_gt_hd: always recompute from the per-topology GroundTruth mean/std
-    # this table has always carried, rather than trusting a pre-existing
-    # "Ground truth EM divergence" header line -- that line's number could be
-    # from a report written under an earlier convention (Bhattacharyya
-    # coefficient, or -log(BC) distance, before the current Hellinger
-    # distance), and there's no reliable way to tell which just by looking at
-    # the number. Recomputing from the raw per-topology stats sidesteps that
-    # ambiguity entirely and works identically for every report era.
-    if parsed["ground_truth_stats"]:
+    # em_gt_hd: trust the header line when it's the current joint (all-
+    # topologies-at-once, full-covariance) convention -- em_gt_hd_is_joint is
+    # only set by the em_hd:/em_gt_hd: or legacy "(Hellinger^2)"-labeled
+    # regex, both of which are now guaranteed joint (see phlag.py's
+    # compute_output). Only fall back to recomputing from the per-topology
+    # GroundTruth mean/std -- a marginals-only average that ignores
+    # cross-topology covariance entirely, strictly less accurate than the
+    # joint value -- when no such line is present at all (older reports, or
+    # a genuinely legacy Bhattacharyya/plain-Hellinger-labeled line, which
+    # predates the joint-vs-marginal distinction and can't be trusted either
+    # way).
+    if not parsed["em_gt_hd_is_joint"] and parsed["ground_truth_stats"]:
         topologies = sorted({topo for (topo, _state, _stat) in parsed["ground_truth_stats"]})
         distances = []
         for topo in topologies:
@@ -577,6 +590,12 @@ class RunRecord:
     covar_relerr_agg: Optional[float] = None
     em_hd: Optional[float] = None
     em_gt_hd: Optional[float] = None
+    null_mean_norm: Optional[float] = None
+    null_cov_norm: Optional[float] = None
+    alt_mean_norm: Optional[float] = None
+    alt_cov_norm: Optional[float] = None
+    pooled_mean_norm: Optional[float] = None
+    pooled_cov_norm: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -941,6 +960,29 @@ class BenchmarkStats:
 
         record.em_hd = parsed["em_hd"]
         record.em_gt_hd = parsed["em_gt_hd"]
+
+        # Global mean/covariance norms (Null, Alt, Overall/pooled) -- from
+        # caster's gt_stats.txt (see phlag/caster.py's write_ground_truth_stats),
+        # not report.tsv itself: that file carries the joint (cross-topology)
+        # mean/covariance this needs, computed once by caster rather than
+        # re-split from scores.tsv per report. Only present for runs whose
+        # caster scores were (re)generated after gt_stats.txt was introduced --
+        # missing for older/unregenerated ones, left as None rather than
+        # recomputed here.
+        from phlag.utils import read_gt_stats_file
+        leaf_dir = self.sim_root / rel_leaf
+        caster_dir = get_expected_caster_sim_dir(
+            leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
+        )
+        gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
+        for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
+            if label not in gt_stats:
+                continue
+            mean_arr = np.asarray(gt_stats[label][0], dtype=float)
+            cov_arr = np.asarray(gt_stats[label][1], dtype=float)
+            setattr(record, f"{prefix}_mean_norm", float(np.linalg.norm(mean_arr)))
+            setattr(record, f"{prefix}_cov_norm", float(np.linalg.norm(cov_arr)))
+
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
         record.n_trainable_params = parsed["n_trainable_params"]
@@ -1224,11 +1266,15 @@ class BenchmarkStats:
         "x_variable", "x_value", "x_bin", "branch_length_cu",
         "clade_name", "clade_number",
         "tpr", "fpr", "precision", "f1", "accuracy", "roc_auc", "tp", "fp", "fn", "tn",
+        "alt_prop_pred",
         "n_windows", "label_flipped",
         "in_panel_a", "in_panel_b", "in_panel_relerr", "in_panel_em_divergence",
         "in_panel_hd_alt", "hd_bin",
         "mean_relerr_agg", "covar_relerr_agg",
         "em_hd", "em_gt_hd",
+        "null_mean_norm", "null_cov_norm",
+        "alt_mean_norm", "alt_cov_norm",
+        "pooled_mean_norm", "pooled_cov_norm",
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
@@ -1291,6 +1337,12 @@ class BenchmarkStats:
                     "roc_auc": record.auc,
                     "tp": record.tp, "fp": record.fp,
                     "fn": record.fn, "tn": record.tn,
+                    "alt_prop_pred": (
+                        (record.tp + record.fn) / total
+                        if None not in (record.tp, record.fp, record.fn, record.tn)
+                        and (total := record.tp + record.fp + record.fn + record.tn) > 0
+                        else None
+                    ),
                     "n_windows": record.n_windows,
                     "label_flipped": record.label_flipped,
                     "in_panel_a": record.in_panel_a,
@@ -1303,6 +1355,12 @@ class BenchmarkStats:
                     "covar_relerr_agg": record.covar_relerr_agg,
                     "em_hd": record.em_hd,
                     "em_gt_hd": record.em_gt_hd,
+                    "null_mean_norm": record.null_mean_norm,
+                    "null_cov_norm": record.null_cov_norm,
+                    "alt_mean_norm": record.alt_mean_norm,
+                    "alt_cov_norm": record.alt_cov_norm,
+                    "pooled_mean_norm": record.pooled_mean_norm,
+                    "pooled_cov_norm": record.pooled_cov_norm,
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -2025,6 +2083,70 @@ def _parse_skip_arg(value):
     return stages
 
 
+# Caster/phlag flags mirrored onto benchmark.py's own parser -- recorded per
+# run into <out_dir>/args.json -- (dest, forwarded flag string, is_store_true_flag).
+# Each dest matches caster.py's/phlag.py's own build_parser() dest exactly, so
+# vars(args) values can be forwarded straight through. step_size is caster's
+# alone here but shared with phlag (see _build_forward_args's callers in
+# run_all()) since phlag's plotting step-size requirement is satisfied
+# separately from this list.
+CASTER_ARG_SPECS = [
+    ("window_size", "-w", False),
+    ("step_size", "-s", False),
+    ("dist_type", "-d", False),
+    ("normalize", "-n", True),
+    ("shift_caster", "--shift-caster", True),
+    ("pair", "--pair", True),
+    ("chunk_size", "--chunk", False),
+    ("chunk_scores", "--chunk-scores", False),
+]
+PHLAG_ARG_SPECS = [
+    ("null_emission_parameterization", "--np", False),
+    ("alt_emission_parameterization", "--ap", False),
+    ("n_iters", "-L", False),
+    ("emission_lambda", "--lam", False),
+    ("double_variance_init", "--double-variance-init", True),
+    ("repulsion_optimizer", "--repulsion-optimizer", False),
+    ("annealing", "--annealing", True),
+    ("lm_damping", "--mu", False),
+    ("silhouette_threshold", "-t", False),
+    ("best_paths", "-p", False),
+    ("correct_transition", "--correct-transition", False),
+]
+MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, _ in PHLAG_ARG_SPECS]
+
+
+def _build_forward_args(args, specs):
+    """Builds a flat CLI token list from args' mirrored-flag dests, per specs
+    (see CASTER_ARG_SPECS/PHLAG_ARG_SPECS) -- store_true flags are included
+    only when true, everything else is included whenever set (not None)."""
+    tokens = []
+    for dest, flag, is_store_true in specs:
+        value = getattr(args, dest)
+        if is_store_true:
+            if value:
+                tokens.append(flag)
+        elif value is not None:
+            tokens += [flag, str(value)]
+    return tokens
+
+
+def _explicit_dests(argv, parser):
+    """The set of option dests actually set by argv (as opposed to left at
+    their parser default) -- every non-positional default is swapped for a
+    unique sentinel first, so a dest surviving parse_known_args with a
+    non-sentinel value must have come from argv itself, even if that value
+    happens to equal the flag's real default. Used by --rerun (to refuse
+    replaying a run while also passing one of its recorded flags directly)
+    and --copy (to know which recorded values POS1's leaves should have
+    overridden with this invocation's own flags)."""
+    sentinel = object()
+    dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
+    empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
+    ns, _ = parser.parse_known_args(argv, namespace=empty_ns)
+    return {dest for dest in dests if getattr(ns, dest) is not sentinel}
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         description="Benchmark: run caster and phlag over every dataset in simulations/ "
@@ -2038,9 +2160,9 @@ def _build_parser():
         default=[],
         help="Reuse existing output instead of rerunning, for the named stage(s), "
              "comma-separated (e.g. 'caster,phlag') (default: rerun everything -- "
-             "config.json flags can change what a stage does without touching any "
-             "source file, so existing output is never assumed to still be current "
-             "unless you say so here)",
+             "the mirrored caster/phlag flags below can change what a stage does "
+             "without touching any source file, so existing output is never "
+             "assumed to still be current unless you say so here)",
     )
     parser.add_argument(
         "--create",
@@ -2054,26 +2176,19 @@ def _build_parser():
              "repulsion/w50k_s1k/benchmark/annealing/tau2x'. This is exactly "
              "what an earlier command's own printed output paths, or shell "
              "tab-completion from the repo root, produce -- paste/complete "
-             "straight from there. PATH must NOT already exist -- errors out "
-             "instead of reusing an existing dir (use --rerun for that; "
-             "--create is always a single new run, never a batch of them). "
-             "The live bench/config.json is snapshotted into the new run "
-             "dir immediately, before any processing, and used to drive "
-             "caster/phlag for the rest of this invocation -- editing "
-             "config.json afterwards for a different benchmark run doesn't "
-             "affect this one. Exactly one of --create/--rerun/--copy is required.",
-    )
-    parser.add_argument(
-        "--config",
-        dest="config",
-        type=pathlib.Path,
-        default=None,
-        metavar="PATH",
-        help="Only valid with --create: use the config.json at PATH instead of "
-             "the live bench/config.json to drive this run (snapshotted into "
-             "the new run dir immediately, same as the live-config default). "
-             "PATH must exist and be a valid config.json (fixed/variable "
-             "sections, same shape as bench/config.json).",
+             "straight from there. PATH must NOT already be a FINISHED run "
+             "(one with analysis.tsv) -- errors out instead of reusing one "
+             "(use --rerun for that; --create is always a single new run, "
+             "never a batch of them). An UNFINISHED PATH (no analysis.tsv "
+             "yet, whether it has no reports/ at all or a partial one from "
+             "an interrupted prior invocation) resumes instead, replaying "
+             "that prior invocation's own recorded args.json -- any "
+             "mirrored flag passed directly in that case is an error (use "
+             "--copy to override). This invocation's resolved caster/phlag "
+             "flags (see below) are recorded into the new run dir's "
+             "args.json immediately, before any processing, so a later "
+             "--rerun replays them exactly. Exactly one of --create/--rerun/"
+             "--copy is required.",
     )
     parser.add_argument(
         "--rerun",
@@ -2083,17 +2198,32 @@ def _build_parser():
         metavar="PATH",
         help="Reruns an existing run at PATH (same full-repo-root-relative-"
              "path form as --create). PATH must already exist and have its "
-             "own config.json (from an earlier --create/--rerun) -- drives "
-             "caster/phlag with THAT frozen config.json rather than the "
-             "live bench/config.json, so a rerun replays the run's own "
-             "original settings. If PATH names a container instead of a "
-             "single run (no config.json/reports/ of its own, but runs "
+             "own args.json (from an earlier --create/--rerun) -- drives "
+             "caster/phlag with THOSE recorded flag values rather than "
+             "whatever's passed on this invocation, so a rerun replays the "
+             "run's own original settings (passing one of the mirrored flags "
+             "directly on a --rerun invocation is an error -- use --copy to "
+             "override instead). If PATH names a container instead of a "
+             "single run (no args.json/reports/ of its own, but runs "
              "found nested underneath it -- e.g. 'annealing' holding "
              "'annealing/base', 'annealing/boost=1', ...), every run found "
              "underneath is processed this way instead, each with its own "
-             "frozen config -- batch processing like this is --rerun-only, "
+             "recorded args.json -- batch processing like this is --rerun-only, "
              "--create is always a single new run. Exactly one of "
              "--create/--rerun/--copy is required.",
+    )
+    parser.add_argument(
+        "--batch",
+        dest="batch",
+        action="store_true",
+        default=False,
+        help="With --rerun on a container PATH, restrict batch processing to "
+             "runs found directly underneath PATH (its immediate "
+             "subdirectories) instead of recursively searching every nested "
+             "leaf at any depth -- use when PATH's own children are "
+             "themselves containers you don't want expanded further this "
+             "invocation. Ignored without --rerun on a container. Default: "
+             "omitted, i.e. full recursive discovery.",
     )
     parser.add_argument(
         "--copy",
@@ -2101,15 +2231,14 @@ def _build_parser():
         nargs=2,
         metavar=("POS1", "POS2"),
         default=None,
-        help="Copies every run under POS1 into POS2, merging config: for each "
-             "leaf found under POS1 (a single run, or a container batch exactly "
-             "like --rerun's container handling), the merged config.json starts "
-             "as an exact copy of that leaf's own frozen config, then for every "
-             "flag BOTH the live bench/config.json AND that leaf's config "
-             "already set, substitutes in the live bench/config.json's current "
-             "value (POS2's own config.json, if any, is never consulted -- POS2 "
-             "leaves typically don't exist yet, that's the point of copying; "
-             "best-effort -- POS2 never adds flags POS1 didn't already have). "
+        help="Copies every run under POS1 into POS2, overriding recorded flags: "
+             "for each leaf found under POS1 (a single run, or a container batch "
+             "exactly like --rerun's container handling), the merged flag values "
+             "start as an exact copy of that leaf's own recorded args.json, then "
+             "any of the mirrored caster/phlag flags passed directly on THIS "
+             "invocation override the recorded value for that flag (POS2's own "
+             "args.json, if any, is never consulted -- POS2 leaves typically "
+             "don't exist yet, that's the point of copying). "
              "A leaf whose POS2 side already has a populated reports/ archive "
              "is left alone (resummarized only, not recomputed) -- rerunning "
              "--copy after a partial prior run only fills in what's still "
@@ -2119,12 +2248,115 @@ def _build_parser():
              "is required.",
     )
     parser.add_argument(
+        "--sweep",
+        dest="sweep",
+        default=None,
+        metavar="FLAG=V1,V2,...",
+        help="Only valid with --create: runs one leaf per comma-separated value "
+             "of FLAG (one of the mirrored caster/phlag flags below), nested "
+             "under --create's PATH as one container (each leaf named "
+             "'<dest>=<value>/') instead of a single run -- a later plain "
+             "--rerun PATH (naming the container) replays every swept leaf. "
+             "Must be given as one glued token, '--sweep=FLAG=V1,V2,...' (e.g. "
+             "'--sweep=-w=500k,250k,100k') -- a space before FLAG makes argparse "
+             "mistake it for another flag, since FLAG itself starts with '-'. "
+             "FLAG must not also be passed directly on this invocation. "
+             "Single-axis only -- --sweep can't be repeated.",
+    )
+    parser.add_argument(
         "--errorbar",
         dest="errorbar",
         default="sd",
         choices=list(ERRORBAR_KINDS),
         help="Error bar shown on each aggregated cell (default: sd)",
     )
+
+    from phlag.caster import int_or_abbrev
+    caster_group = parser.add_argument_group(
+        "caster flags", "Forwarded to caster (and, when both stages run, to phlagster)."
+    )
+    caster_group.add_argument(
+        "-w", "--window-size", dest="window_size", type=int_or_abbrev, default=50000,
+        help="Forwarded to caster's -w (default: 50000 / 50k).",
+    )
+    caster_group.add_argument(
+        "-s", "--step-size", dest="step_size", type=int_or_abbrev, default=1000,
+        help="Forwarded to both caster's -s and phlag's -s/--step-size (default: 1000 / 1k).",
+    )
+    caster_group.add_argument(
+        "-d", "--dist-type", dest="dist_type", default="gaussian", choices=["gaussian", "gmm"],
+        help="Forwarded to caster's -d/--dist-type (default: gaussian).",
+    )
+    caster_group.add_argument(
+        "-n", "--normalize", dest="normalize", action="store_true",
+        help="Forwarded to caster's -n.",
+    )
+    caster_group.add_argument(
+        "--shift-caster", dest="shift_caster", action="store_true",
+        help="Forwarded to caster's --shift-caster.",
+    )
+    caster_group.add_argument(
+        "--pair", dest="pair", action="store_true",
+        help="Forwarded to caster's --pair (caster-pair/quartet-scoring mode instead of dstar).",
+    )
+    caster_group.add_argument(
+        "--chunk", dest="chunk_size", type=int_or_abbrev, default=None,
+        help="Forwarded to caster's --chunk (default: -w's window size).",
+    )
+    caster_group.add_argument(
+        "--chunk-scores", dest="chunk_scores", type=str, default=None,
+        help="Forwarded to caster's --chunk-scores.",
+    )
+
+    phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
+    phlag_group.add_argument(
+        "--np", dest="null_emission_parameterization", type=str.lower,
+        default="free", choices=["free", "repulsion"],
+        help="Forwarded to phlag's --np (default: free).",
+    )
+    phlag_group.add_argument(
+        "--ap", dest="alt_emission_parameterization", type=str.lower,
+        default="free", choices=["free", "repulsion"],
+        help="Forwarded to phlag's --ap (default: free).",
+    )
+    phlag_group.add_argument(
+        "-L", "--n-iters", dest="n_iters", type=int_or_abbrev, default=10,
+        help="Forwarded to phlag's -L/--n-iters (default: 10).",
+    )
+    phlag_group.add_argument(
+        "--lam", dest="emission_lambda", type=float, default=1.0,
+        help="Forwarded to phlag's --lam (default: 1.0).",
+    )
+    phlag_group.add_argument(
+        "--double-variance-init", dest="double_variance_init", action="store_true",
+        help="Forwarded to phlag's --double-variance-init.",
+    )
+    phlag_group.add_argument(
+        "--repulsion-optimizer", dest="repulsion_optimizer", type=str.lower,
+        default="lm", choices=["lm", "gd"],
+        help="Forwarded to phlag's --repulsion-optimizer (default: lm).",
+    )
+    phlag_group.add_argument(
+        "--annealing", dest="annealing", action="store_true",
+        help="Forwarded to phlag's --annealing.",
+    )
+    phlag_group.add_argument(
+        "--mu", dest="lm_damping", type=float, default=1.0,
+        help="Forwarded to phlag's --mu (default: 1.0).",
+    )
+    phlag_group.add_argument(
+        "-t", "--silhouette-threshold", dest="silhouette_threshold", type=float, default=0.5,
+        help="Forwarded to phlag's -t/--silhouette-threshold (default: 0.5).",
+    )
+    phlag_group.add_argument(
+        "-p", "--best-paths", dest="best_paths", type=int, default=1,
+        help="Forwarded to phlag's -p/--best-paths (default: 1).",
+    )
+    phlag_group.add_argument(
+        "--correct-transition", dest="correct_transition", nargs="?", const="auto", default=None,
+        help="Forwarded to phlag's --correct-transition.",
+    )
+
     parser.add_argument(
         "change",
         nargs="?",
@@ -2135,16 +2367,40 @@ def _build_parser():
     return parser
 
 
+def _resolve_sweep_spec(raw, parser, explicit_dests):
+    """Parses --sweep's 'FLAG=V1,V2,...' into (dest, [(raw_value, converted_value), ...]),
+    converting each raw value through FLAG's own argparse action type (so
+    int_or_abbrev-typed flags like -w/-s/-L parse '500k' etc. correctly).
+    Errors (via parser.error) on an unrecognized/non-mirrored FLAG, no values,
+    or FLAG also being passed directly on this invocation."""
+    if "=" not in raw:
+        parser.error(f"--sweep {raw!r} must be of the form FLAG=V1,V2,...")
+    flag_str, values_str = raw.split("=", 1)
+    action = parser._option_string_actions.get(flag_str)
+    if action is None or action.dest not in MIRRORED_DESTS:
+        parser.error(f"--sweep flag {flag_str!r} is not one of this parser's mirrored caster/phlag flags")
+    dest = action.dest
+    if dest in explicit_dests:
+        parser.error(f"--sweep {flag_str}=... can't be combined with passing {flag_str} directly")
+    raw_values = [v for v in values_str.split(",") if v]
+    if not raw_values:
+        parser.error(f"--sweep {raw!r}: no values given")
+    type_fn = action.type or (lambda v: v)
+    return dest, [(v, type_fn(v)) for v in raw_values]
+
+
 def parse_arguments(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
     parser = _build_parser()
-    from phlag.utils import apply_cli_config
-    args = apply_cli_config(parser, argv, "benchmark")
+    args = parser.parse_args(argv)
     if sum(bool(x) for x in (args.create, args.rerun, args.copy)) != 1:
         parser.error("exactly one of --create, --rerun, or --copy is required")
-    if args.config and not args.create:
-        parser.error("--config is only valid with --create")
-    if args.config and not args.config.exists():
-        parser.error(f"--config {args.config}: file not found")
+    args.explicit_dests = _explicit_dests(argv, _build_parser())
+    if args.sweep is not None:
+        if not args.create:
+            parser.error("--sweep is only valid with --create")
+        args.sweep = _resolve_sweep_spec(args.sweep, parser, args.explicit_dests)
     return args
 
 
@@ -2197,7 +2453,8 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
-                                window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
+                                window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                                pair=False, chunk_size=None):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2208,6 +2465,10 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     tree reads the same cached scores.tsv instead of each getting its own
     copy recomputed from scratch.
 
+    ``pair``/``chunk_size`` mirror phlag/caster.py's own --bench keying:
+    when pair is set, the tree is keyed store/caster/c<chunk>_s<S>/ instead,
+    so a --pair run never collides with a dstar run sharing the same -w/-s.
+
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
     from phlag.utils import get_data_dir, get_simulation_categories, get_short_sim_name
@@ -2216,21 +2477,27 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     cats = get_simulation_categories(str(sim_path))
     short_sim = get_short_sim_name(leaf_dir.name)
 
-    window_str = format_val(window_size)
     step_str = format_val(step_size)
-    base = get_data_dir() / "caster" / f"w{window_str}_s{step_str}"
+    if pair:
+        pair_chunk = chunk_size if chunk_size is not None else window_size
+        size_prefix = f"c{format_val(pair_chunk)}_s{step_str}"
+    else:
+        size_prefix = f"w{format_val(window_size)}_s{step_str}"
+    base = get_data_dir() / "caster" / size_prefix
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
 
 
 def get_expected_scores_path(fasta_path, leaf_dir,
-                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE):
+                             window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                             pair=False, chunk_size=None):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
+        pair=pair, chunk_size=chunk_size,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2275,20 +2542,13 @@ def run_step(cmd, label, cwd=None, env=None):
     return True, result.stdout
 
 
-def create_source_snapshot(config_override=None):
+def create_source_snapshot():
     """
     Copies both phlag/ (the package caster/phlag run out of) and bench/ (this
-    module, phlagster.py, and config.json) into a temp dir, so a run_all()
-    call's subprocess invocations -- including the phlagster path, and
-    config.json's CLI defaults -- stay frozen against whatever the source
-    tree looked like when the run started, immune to concurrent edits.
-
-    config_override: a path to an alternate config.json to use in place of
-    the live repo's -- e.g. a previously-frozen <run_dir>/config.json for
-    --rerun (so a rerun replays that run's own original settings rather than
-    whatever bench/config.json currently says), or --create's own --config
-    PATH (so a fresh run is driven by an arbitrary config.json instead of
-    the live one).
+    module, phlagster.py) into a temp dir, so a run_all() call's subprocess
+    invocations -- including the phlagster path -- stay frozen against
+    whatever the source tree looked like when the run started, immune to
+    concurrent edits.
     """
     import os
     import tempfile
@@ -2300,14 +2560,12 @@ def create_source_snapshot(config_override=None):
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".ipynb_checkpoints")
     shutil.copytree(repo_root / "phlag", snapshot_root / "phlag", ignore=ignore)
     shutil.copytree(repo_root / "bench", snapshot_root / "bench", ignore=ignore)
-    if config_override is not None:
-        shutil.copy2(config_override, snapshot_root / "bench" / "config.json")
     snapshot_env = dict(os.environ)
     snapshot_env["PHLAG_REPO_ROOT"] = str(repo_root)
     return snapshot_root, snapshot_env
 
 
-def run_all(args, sim_root, out_dir, config_override=None):
+def run_all(args, sim_root, out_dir):
     """
     Runs phlagster (caster + phlag) over every complete simulation leaf x concat-fasta
     combination, restricted to the current affected-fraction sweep (DEFAULT_CONCAT_PATTERNS).
@@ -2316,28 +2574,21 @@ def run_all(args, sim_root, out_dir, config_override=None):
     left alone: it is neither run here nor counted by summarize().
 
     Caster and phlag are rerun by default, since both draw their actual CLI flags
-    from config.json rather than only from source code -- a flag change there
-    doesn't touch any .py file's mtime, so file-mtime-based staleness detection
-    can't be trusted to notice it. --skip caster and/or --skip phlag opt back
-    into reusing existing output for the named stage(s), if present. When both
+    from args (the mirrored caster/phlag flags on benchmark.py's own parser, see
+    CASTER_ARG_SPECS/PHLAG_ARG_SPECS) rather than only from source code -- a flag
+    change there doesn't touch any .py file's mtime, so file-mtime-based staleness
+    detection can't be trusted to notice it. --skip caster and/or --skip phlag opt
+    back into reusing existing output for the named stage(s), if present. When both
     stages are running, they run as a single `phlagster` invocation (in-process
     caster-then-phlag, avoiding two separate interpreter/JAX startups); when
     only phlag is running (caster skipped), `phlag` alone is invoked directly
     against the existing scores.tsv.
 
-    Neither invocation path passes --np/--ap: both phlag and phlagster fall
-    through to phlag's own emission-parameterization default, so the sweep
-    always matches whatever that default currently is without needing to be
-    kept in sync here.
-
-    config_override: None for a plain --create (a fresh run) -- the live
-    bench/config.json is snapshotted as usual; --create --config PATH passes
-    PATH here instead, using it in place of the live file. Either way, that
-    snapshot's copy is immediately persisted to <out_dir>/config.json (before
-    any processing), freezing it against concurrent edits to the live file
-    made for some OTHER benchmark run started later. For --rerun, the caller
-    passes <out_dir>/config.json itself back in here, so the snapshot replays this
-    run's own original settings instead of whatever's currently live.
+    args' mirrored-flag values (already fully resolved by the caller -- a
+    plain --create's parsed args, or --rerun/--copy/--sweep's args with the
+    relevant dests overridden onto a copy) are written to <out_dir>/args.json
+    immediately, before any processing, so a later --rerun/--copy can read
+    them back.
 
     Caster's scores.tsv stays canonical/shared in its own store/caster/
     w<W>_s<S> tree regardless (see get_expected_caster_sim_dir/caster.py),
@@ -2350,22 +2601,22 @@ def run_all(args, sim_root, out_dir, config_override=None):
     """
     from phlag.utils import find_mapping_file
 
-    snapshot_root, snapshot_env = create_source_snapshot(config_override=config_override)
-    snapshot_config = snapshot_root / "bench" / "config.json"
-    if snapshot_config.exists():
-        out_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snapshot_config, out_dir / "config.json")
-        print(f"Wrote config:         {out_dir / 'config.json'}")
+    snapshot_root, snapshot_env = create_source_snapshot()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mirrored_values = {dest: getattr(args, dest) for dest in MIRRORED_DESTS}
+    args_json_path = out_dir / "args.json"
+    args_json_path.write_text(json.dumps(mirrored_values, indent=2, default=str) + "\n")
+    print(f"Wrote args:           {args_json_path}")
 
     # Persist a cheap copy of the phlag/ source snapshot (just the .py files
     # this invocation actually ran, already assembled above) into the run
-    # dir, overwritten every call -- unlike config.json (frozen once at
+    # dir, overwritten every call -- unlike args.json (frozen once at
     # --create so --rerun replays it), this always reflects the code as of
-    # the MOST RECENT invocation, since --rerun replays old config against
+    # the MOST RECENT invocation, since --rerun replays old flags against
     # whatever code is currently live, not old code. That's the only place
     # to see what code produced a given run after the fact -- the temp
     # snapshot_root itself is deleted at the end of this function.
-    out_dir.mkdir(parents=True, exist_ok=True)
     source_snapshot_dir = out_dir / "source"
     if source_snapshot_dir.exists():
         shutil.rmtree(source_snapshot_dir)
@@ -2399,66 +2650,17 @@ def run_all(args, sim_root, out_dir, config_override=None):
         for fasta_path in fasta_paths:
             work_items.append((leaf_dir, rel_path, fasta_path))
 
-    # Read straight from snapshot_config (the effective config for THIS run --
-    # config_override's content when given, the live bench/config.json
-    # otherwise) rather than phlag.utils.load_cli_config, which always
-    # resolves relative to its own __file__: called from here (the live
-    # process, not one of the subprocess invocations below that actually run
-    # out of snapshot_root), that would silently report the live repo's
-    # bench/config.json even during a --rerun replaying a different frozen
-    # one -- correct for what actually executes, misleading for what's shown.
-    def _read_config_tokens(tool_name, kind):
-        import json
-        if not snapshot_config.exists():
-            return []
-        try:
-            config = json.loads(snapshot_config.read_text())
-        except Exception:
-            return []
-        return config.get(tool_name, {}).get(kind, [])
-
-    def _effective_args(tool_name, build_parser_fn):
-        """Full effective flags for tool_name (every arg, defaults included --
-        same shape as caster.py's/phlag.py's own '[caster]/[phlag] Effective
-        flags: ...' self-print), computed the same way apply_cli_config()
-        would from THIS run's frozen snapshot_config specifically (not
-        phlag.utils.load_cli_config, which -- called from here rather than
-        from inside the subprocess -- would read the live repo's
-        bench/config.json instead, wrong during a --rerun/--copy replaying a
-        different frozen one). Positional/per-file args (fasta_file,
-        caster_scores) are left at their parser defaults since no single
-        file is "current" at this point in the run.
-        """
-        variable_tokens = _read_config_tokens(tool_name, "variable")
-        fixed_tokens = _read_config_tokens(tool_name, "fixed")
-        parser = build_parser_fn()
-        if variable_tokens:
-            variable_ns, _ = parser.parse_known_args(variable_tokens)
-            parser.set_defaults(**vars(variable_ns))
-        effective_args = parser.parse_args([])
-        if fixed_tokens:
-            sentinel = object()
-            dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
-            empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
-            fixed_ns, _ = parser.parse_known_args(fixed_tokens, namespace=empty_ns)
-            for key in dests:
-                value = getattr(fixed_ns, key)
-                if value is not sentinel:
-                    setattr(effective_args, key, value)
-        return effective_args
-
-    from phlag import caster as caster_module
-    from phlag import phlag as phlag_module
-    caster_effective = _effective_args("caster", caster_module.build_parser)
-    phlag_effective = _effective_args("phlag", phlag_module.build_parser)
     report_base_override = get_run_reports_base_override(out_dir)
+
+    caster_forward_args = _build_forward_args(args, CASTER_ARG_SPECS)
+    phlag_forward_args = _build_forward_args(args, PHLAG_ARG_SPECS)
 
     config_lines = [
         f"{len(work_items)} file(s) to process -- "
         f"{'skipping ' + ', '.join(args.skip) if args.skip else 'rerunning all outputs'}",
         f"phlag reports write directly to {out_dir / 'reports'} (--bench)",
-        "[caster] Effective flags: " + " ".join(f"{k}={v}" for k, v in vars(caster_effective).items()),
-        "[phlag] Effective flags: " + " ".join(f"{k}={v}" for k, v in vars(phlag_effective).items()),
+        "[caster] Effective flags: " + " ".join(f"{d}={getattr(args, d)}" for d, _, _ in CASTER_ARG_SPECS),
+        "[phlag] Effective flags: " + " ".join(f"{d}={getattr(args, d)}" for d, _, _ in PHLAG_ARG_SPECS),
     ]
     # Printed once, plainly, before the bar starts -- multiple stacked
     # position= bars (the previous approach) rely on the terminal supporting
@@ -2477,7 +2679,10 @@ def run_all(args, sim_root, out_dir, config_override=None):
     for leaf_dir, rel_path, fasta_path in progress:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
 
-        scores_path = get_expected_scores_path(fasta_path, leaf_dir)
+        scores_path = get_expected_scores_path(
+            fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
+            pair=args.pair, chunk_size=args.chunk_size
+        )
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
         )
@@ -2490,11 +2695,12 @@ def run_all(args, sim_root, out_dir, config_override=None):
             continue
 
         if caster_done:
-            progress.set_description(f"[phlag] {pattern_rel} is being processed")
+            progress.set_description(f"[phlag] {pattern_rel} is being processed", refresh=False)
             phlag_ok, phlag_out = run_step(
                 [sys.executable, "-m", "phlag.phlag", str(scores_path)]
                 + ["--output-base", report_base_override, "--bench"]
-                + ["--plot", "-s", "1000"],
+                + phlag_forward_args
+                + ["--plot", "-s", str(args.step_size)],
                 "phlag",
                 cwd=str(snapshot_root), env=snapshot_env,
             )
@@ -2504,10 +2710,11 @@ def run_all(args, sim_root, out_dir, config_override=None):
                 failures.append(msg)
                 continue
         else:
-            progress.set_description(f"[caster] {pattern_rel} is being processed")
+            progress.set_description(f"[caster] {pattern_rel} is being processed", refresh=False)
             phlagster_ok, phlagster_out = run_step(
                 [sys.executable, "-m", "bench.phlagster", str(fasta_path)]
                 + ["--output-base", report_base_override, "--bench"]
+                + caster_forward_args + phlag_forward_args
                 + ["--no-plots"],
                 "phlagster",
                 cwd=str(snapshot_root), env=snapshot_env,
@@ -2555,6 +2762,10 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["
     for state in RELERR_STATES
     for stat in RELERR_STATISTICS
 ] + ["em_hd", "em_gt_hd"] + [
+    "null_mean_norm", "null_cov_norm",
+    "alt_mean_norm", "alt_cov_norm",
+    "pooled_mean_norm", "pooled_cov_norm",
+] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
 ] + ["bic"] + ["clip_activation_count", "clip_activation_rate"]
@@ -2688,28 +2899,33 @@ def resolve_run_dir(args):
     This fully determines out_dir (validated as falling under the phlag
     output tree, nothing more specific than that -- there's no separate
     --base to join it against, and so nothing left to accidentally double
-    up). --create errors out if out_dir already has a populated reports/
-    archive (not merely if out_dir exists -- run_all() itself may have
-    already mkdir'd it and written config.json/source/ there on a prior
-    invocation that didn't get as far as producing any report.tsv, and
-    --create should be able to resume into that); --rerun errors out
-    if out_dir has no analysis.tsv directly under it (a prior --create/
-    --rerun that got as far as summarize()). reuse is just bool(args.rerun)
-    -- --create guarantees out_dir had no reports/ archive yet, --rerun
-    guarantees out_dir/analysis.tsv did.
+    up). --create errors out only if out_dir is already *finished*
+    (has analysis.tsv, written by a prior --create/--rerun's summarize());
+    a populated-but-unfinished reports/ archive (run_all() got partway
+    through phlag on a prior invocation that never reached summarize())
+    is resumable too, same as an out_dir with no reports/ at all yet --
+    both are reported back via resume_unfinished so main() can reload
+    that prior invocation's args.json before continuing. --rerun errors
+    out if out_dir has no analysis.tsv directly under it (a prior
+    --create/--rerun that got as far as summarize()). reuse is just
+    bool(args.rerun) -- --create guarantees out_dir/analysis.tsv didn't
+    exist yet, --rerun guarantees it did.
     """
     flag, run_path = ("--create", args.create) if args.create else ("--rerun", args.rerun)
     out_dir = _validate_store_path(flag, run_path)
 
-    if args.create and _has_reports_archive(out_dir):
-        sys.exit(f"{RED}--create {run_path}: already has a reports/ archive at {out_dir} -- use --rerun instead.{RESET}")
-    if args.rerun and not (out_dir / "analysis.tsv").exists():
+    resume_unfinished = False
+    if args.create:
+        if _is_finished_run(out_dir):
+            sys.exit(f"{RED}--create {run_path}: already finished (has analysis.tsv) at {out_dir} -- use --rerun instead.{RESET}")
+        resume_unfinished = _has_reports_archive(out_dir)
+    if args.rerun and not _is_finished_run(out_dir):
         sys.exit(
             f"{RED}--rerun {run_path}: no analysis.tsv found directly under {out_dir} "
             f"-- use --create instead.{RESET}"
         )
 
-    return out_dir, bool(args.rerun)
+    return out_dir, bool(args.rerun), resume_unfinished
 
 
 def resolve_copy_dirs(args):
@@ -2729,6 +2945,17 @@ def _has_reports_archive(run_dir):
     return reports_dir.exists() and any(reports_dir.rglob("*.tsv"))
 
 
+def _is_finished_run(run_dir):
+    """True only once summarize() has actually completed for run_dir (it
+    writes analysis.tsv last) -- unlike _has_reports_archive, this is False
+    for a reports/ archive that's merely non-empty but incomplete (e.g. an
+    interrupted prior invocation, or missing gaps within it), so callers
+    that shortcut straight to resummarizing-from-archive (skipping a fresh
+    run_all() pass) only take that shortcut when there's truly nothing left
+    for run_all() to fill in."""
+    return (run_dir / "analysis.tsv").exists()
+
+
 def _skips_all_stages(args):
     """True when --skip names both caster and phlag -- nothing could
     possibly get (re)computed this invocation, so run_all()'s full
@@ -2738,7 +2965,7 @@ def _skips_all_stages(args):
     return "caster" in args.skip and "phlag" in args.skip
 
 
-def discover_archived_run_dirs(prefix_dir):
+def discover_archived_run_dirs(prefix_dir, direct_only=False):
     """
     Recursively finds every directory under prefix_dir that is itself a
     completed run -- i.e. has its own populated reports/ tree (phlag writes
@@ -2748,7 +2975,17 @@ def discover_archived_run_dirs(prefix_dir):
     'annealing/boost=1', ...) rather than a single leaf run. Each match's own
     reports/ subtree is flat ('<pattern>.tsv' files), never itself containing
     a nested run, so matches don't overlap.
+
+    direct_only (--batch) restricts this to prefix_dir's immediate
+    subdirectories instead of recursing to arbitrary depth -- for a
+    container whose own children are themselves containers not meant to be
+    expanded further this invocation.
     """
+    if direct_only:
+        return sorted(
+            child for child in prefix_dir.iterdir()
+            if child.is_dir() and _has_reports_archive(child)
+        )
     return sorted(
         reports_dir.parent
         for reports_dir in prefix_dir.rglob("reports")
@@ -2756,213 +2993,71 @@ def discover_archived_run_dirs(prefix_dir):
     )
 
 
-def _read_config_sections(config_path):
-    """Tolerant JSON load for a run's config.json -- mirrors
-    phlag.utils.load_cli_config's tolerance: missing file or bad JSON -> {}.
-    Never synthesizes missing sections/keys; callers must .get() defensively."""
-    if not config_path.exists():
+def _read_args_json(args_json_path):
+    """Tolerant JSON load for a run's args.json: missing file or bad JSON -> {}."""
+    if not args_json_path.exists():
         return {}
     try:
-        return json.loads(config_path.read_text())
+        return json.loads(args_json_path.read_text())
     except Exception:
         return {}
 
 
-def _walk_token_spans(tokens, parser):
-    """Segments one flat CLI token list (one config.json 'fixed' or
-    'variable' list) into (kind, flag_token, action, dest, value_tokens,
-    start, end) spans, using the parser's own recognized option strings to
-    find flag boundaries -- correctly handles store_true (nargs=0),
-    single-value (nargs=None), optional (nargs='?'), and greedy (nargs='+'/
-    '*') flags, unlike a naive "peek at the next token" heuristic. end is
-    exclusive. Unrecognized tokens pass through as ("opaque", ...) rather
-    than raising -- config.json is expected to hold only real flag tokens
-    (see apply_cli_config's docstring), but this degrades gracefully instead
-    of crashing on anything unexpected.
-
-    Not a byte-for-byte reimplementation of argparse's own optional-vs-value
-    disambiguation (e.g. negative-number-looking values) -- acceptable since
-    every value observed in this repo's config.json files is a plain
-    non-dash string.
-    """
-    option_map = parser._option_string_actions
-    n = len(tokens)
-    i = 0
-    spans = []
-    while i < n:
-        tok = tokens[i]
-        action = option_map.get(tok)
-        if action is None:
-            spans.append(("opaque", tok, None, None, [tok], i, i + 1))
-            i += 1
-            continue
-        nargs = action.nargs
-        if nargs == 0:
-            j, values = i + 1, []
-        elif nargs is None:
-            j = min(i + 2, n)
-            values = tokens[i + 1:j]
-        elif nargs == "?":
-            if i + 1 < n and tokens[i + 1] not in option_map:
-                j, values = i + 2, [tokens[i + 1]]
-            else:
-                j, values = i + 1, []
-        elif nargs in ("+", "*"):
-            j = i + 1
-            while j < n and tokens[j] not in option_map:
-                j += 1
-            values = tokens[i + 1:j]
-        else:
-            j = min(i + 1 + int(nargs), n)
-            values = tokens[i + 1:j]
-        spans.append(("flag", tok, action, action.dest, values, i, j))
-        i = j
-    return spans
-
-
-def _flag_dest_set(tokens_by_kind, parser):
-    """The set of option dests a config section actually sets. Tries a real
-    argparse parse first (not a hand-rolled tokenizer) -- correct for
-    nargs='+'/'*'/'?' flags without reimplementing argparse's own logic.
-    Pooled as variable tokens then fixed tokens, fixed wins on duplicate
-    dest -- same precedence apply_cli_config already uses for real argv vs.
-    config.json.
-
-    Falls back to _walk_token_spans's dest set on a parse error (e.g. a
-    frozen config.json holds a value that was valid when written but whose
-    choices= list has since narrowed, like --plot's now-removed "dist"
-    choice) -- span-walking still gets flag boundaries/dests right even
-    though it can't validate choices the way a real parse does, so this
-    stays correct for stale-but-shaped-right configs instead of crashing."""
-    pooled = list(tokens_by_kind.get("variable", [])) + list(tokens_by_kind.get("fixed", []))
-    option_dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
-    sentinel = object()
-    ns = argparse.Namespace(**{d: sentinel for d in option_dests})
-    try:
-        parsed_ns, _ = parser.parse_known_args(pooled, namespace=ns)
-    except SystemExit:
-        return {span[3] for span in _walk_token_spans(pooled, parser) if span[0] == "flag"}
-    return {d for d in option_dests if getattr(parsed_ns, d) is not sentinel}
-
-
-def _merge_config_section(live_section, pos1_section, parser):
-    """Merges one config.json section (e.g. "phlag"): starts as an exact
-    copy of pos1_section, then for every flag both live_section and
-    pos1_section set, splices in live_section's raw value tokens -- keeping
-    the flag in whichever of fixed/variable pos1 originally placed it, only
-    the value token span changes. Raw-token splicing (not parse-value-then-
-    reserialize) so an abbreviated value like "100k" never gets silently
-    rewritten to "100000".
-
-    POS2's own config.json is never consulted -- --copy's POS2 leaves
-    typically don't exist yet (that's the point of copying), so live
-    bench/config.json's current value is the override directly, not a
-    fallback behind some usually-absent POS2 config. A dest not in
-    `overridable` (live doesn't currently set it) is left at POS1's
-    original value -- POS2 never adds flags POS1 didn't already have.
-    """
-    live_flags = _flag_dest_set(live_section, parser)
-    pos1_flags = _flag_dest_set(pos1_section, parser)
-    overridable = live_flags & pos1_flags
-
-    live_values_by_dest = {}
-    for kind in ("variable", "fixed"):
-        for span in _walk_token_spans(live_section.get(kind, []), parser):
-            if span[0] == "flag":
-                live_values_by_dest[span[3]] = span[4]
-
-    merged = {}
-    for kind in ("fixed", "variable"):
-        out_tokens = list(pos1_section.get(kind, []))
-        for span in reversed(_walk_token_spans(out_tokens, parser)):
-            if span[0] != "flag":
-                continue
-            _, _flag_token, _action, dest, _old_values, start, end = span
-            if dest in overridable:
-                out_tokens[start + 1:end] = live_values_by_dest[dest]
-        merged[kind] = out_tokens
-    return merged
-
-
-def _merge_leaf_config(live_config, pos1_config, parsers_by_section):
-    """Merges a whole leaf's config.json (all sections). Section presence
-    mirrors pos1_config's own keys -- never synthesizes a section pos1
-    doesn't have. Unrecognized top-level keys pass through from pos1
-    verbatim rather than being dropped."""
-    merged = {}
-    for section_name in pos1_config:
-        parser = parsers_by_section.get(section_name)
-        if parser is None:
-            merged[section_name] = pos1_config[section_name]
-            continue
-        merged[section_name] = _merge_config_section(
-            live_config.get(section_name, {}),
-            pos1_config[section_name],
-            parser,
-        )
-    return merged
-
-
 def handle_copy(args, sim_root, stats, start_time):
-    """--copy POS1 POS2: for every leaf found under POS1 (a container batch,
-    exactly like --rerun's container handling, or POS1 itself if it's a
-    single run), merges that leaf's own config against the live
-    bench/config.json and the SAME relative leaf under POS2 (see
-    _merge_leaf_config), writes the merged config.json under POS2, and runs
-    (or resummarizes, honoring --skip like --rerun does) there. If POS2 has
-    no leaf yet at that relative path, one is created with pos1's config
-    verbatim (no overrides available)."""
+    """--copy POS1 POS2: for every leaf found under POS1 (every nested run
+    with its own reports/ archive, including POS1 itself if it has one --
+    exactly like --rerun's container handling -- or just POS1 itself if
+    it's a single run with no archive of its own yet), starts from that
+    leaf's own recorded args.json, overrides any mirrored dest passed
+    directly on THIS invocation (args.explicit_dests, from parse_arguments()),
+    and runs into the same relative leaf under POS2 -- unless that POS2 leaf
+    is already a *finished* run (has analysis.tsv), in which case it just
+    resummarizes from the existing archive instead. Same resume behavior as
+    --create/--rerun: an unfinished POS2 leaf (no analysis.tsv yet, whether
+    it has no reports/ at all or a partial one from an interrupted prior
+    invocation) always goes through run_all(), which -- honoring --skip like
+    --rerun does -- reuses whatever per-item output already exists and only
+    computes what's missing, never blindly recomputing already-present
+    reports. If POS2 has no leaf yet at that relative path, one is created
+    with POS1's recorded values (plus this invocation's overrides)."""
     pos1_dir, pos2_dir = resolve_copy_dirs(args)
 
-    from phlag import caster as caster_module
-    from phlag import phlag as phlag_module
-    from phlag.utils import get_repo_root
-    parsers_by_section = {
-        "caster": caster_module.build_parser(),
-        "phlag": phlag_module.build_parser(),
-        "benchmark": _build_parser(),
-    }
+    overridden_dests = args.explicit_dests & set(MIRRORED_DESTS)
 
-    live_config = _read_config_sections(get_repo_root() / "bench" / "config.json")
-
-    is_container = pos1_dir.is_dir() and not _has_reports_archive(pos1_dir)
-    leaf_dirs = discover_archived_run_dirs(pos1_dir) if is_container else []
+    leaf_dirs = discover_archived_run_dirs(pos1_dir) if pos1_dir.is_dir() else []
     if not leaf_dirs:
         leaf_dirs = [pos1_dir]
-
-    skip_run_all = _skips_all_stages(args)
 
     for pos1_leaf in leaf_dirs:
         rel = pos1_leaf.relative_to(pos1_dir)
         pos2_leaf = pos2_dir / rel
         print(f"\n=== {rel} ===")
 
-        pos1_leaf_config_path = pos1_leaf / "config.json"
-        if not pos1_leaf_config_path.exists():
-            print(f"{RED}[skip] {pos1_leaf}: no config.json of its own -- can't --copy it.{RESET}")
+        pos1_args_json = pos1_leaf / "args.json"
+        if not pos1_args_json.exists():
+            print(f"{RED}[skip] {pos1_leaf}: no args.json of its own -- can't --copy it.{RESET}")
             continue
-        pos1_config = _read_config_sections(pos1_leaf_config_path)
-        if not pos1_config:
-            print(f"{RED}[skip] {pos1_leaf}: config.json unreadable/invalid JSON.{RESET}")
+        pos1_recorded = _read_args_json(pos1_args_json)
+        if not pos1_recorded:
+            print(f"{RED}[skip] {pos1_leaf}: args.json unreadable/invalid JSON.{RESET}")
             continue
 
         pos2_leaf_existed = pos2_leaf.exists()
 
-        merged_config = _merge_leaf_config(live_config, pos1_config, parsers_by_section)
+        leaf_args = argparse.Namespace(**vars(args))
+        for dest, value in pos1_recorded.items():
+            setattr(leaf_args, dest, value)
+        for dest in overridden_dests:
+            setattr(leaf_args, dest, getattr(args, dest))
 
-        pos2_leaf.mkdir(parents=True, exist_ok=True)
-        merged_config_path = pos2_leaf / "config.json"
-        merged_config_path.write_text(json.dumps(merged_config, indent=2) + "\n")
-        print(f"Wrote merged config: {merged_config_path}")
-
-        if skip_run_all or _has_reports_archive(pos2_leaf):
+        if _is_finished_run(pos2_leaf):
             print(f"[skip caster,phlag] resummarizing directly from {pos2_leaf / 'reports'}")
         else:
-            run_all(args, sim_root, pos2_leaf, config_override=merged_config_path)
+            run_all(leaf_args, sim_root, pos2_leaf)
             if "caster" not in args.skip:
                 args.skip = args.skip + ["caster"]
                 print("[copy] caster generated -- skipping caster for remaining leaves")
-        summarize(args, sim_root, stats, pos2_leaf, pos2_leaf_existed, start_time=start_time)
+        summarize(leaf_args, sim_root, stats, pos2_leaf, pos2_leaf_existed, start_time=start_time)
 
 
 def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
@@ -2989,8 +3084,14 @@ def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    phlag_cmd = " ".join(
+        ["phlag", "<scores.tsv>", "--output-base", get_run_reports_base_override(out_dir), "--bench"]
+        + _build_forward_args(args, PHLAG_ARG_SPECS)
+        + ["--plot", "-s", str(args.step_size)]
+    )
+
     run_at = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
-    report_lines = [f"Run at: {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}"]
+    report_lines = [f"Run at: {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}", f"phlag cmd: {phlag_cmd}"]
     if args.change:
         report_lines.append(args.change)
     if start_time is not None:
@@ -3035,7 +3136,9 @@ def main(argv=None):
     start_time = time.perf_counter()
     args = parse_arguments(argv)
 
-    flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
+    flags_str = " ".join(
+        f"{k}={v}" for k, v in vars(args).items() if k not in ("explicit_dests", "sweep")
+    )
     print(f"[benchmark] Effective flags: {flags_str}")
 
     from phlag.utils import get_data_dir
@@ -3053,27 +3156,65 @@ def main(argv=None):
         handle_copy(args, sim_root, stats, start_time)
         return
 
-    out_dir, reuse = resolve_run_dir(args)
+    out_dir, reuse, resume_unfinished = resolve_run_dir(args)
+
+    if resume_unfinished:
+        args_json_path = out_dir / "args.json"
+        if not args_json_path.exists():
+            print(f"[create] {out_dir}: unfinished reports found but no args.json to resume from -- continuing with this invocation's own flags.")
+        else:
+            overridden = args.explicit_dests & set(MIRRORED_DESTS)
+            if overridden:
+                sys.exit(
+                    f"{RED}--create {args.create}: {out_dir} has unfinished reports from a "
+                    f"prior run -- can't also pass {', '.join(sorted(overridden))} directly. "
+                    f"Use --copy instead to override, or omit them to resume with the "
+                    f"recorded args.json.{RESET}"
+                )
+            for dest, value in _read_args_json(args_json_path).items():
+                setattr(args, dest, value)
+            print(f"[create] {out_dir}: resuming unfinished run using recorded args.json")
+            reuse = True
+
+    if args.sweep is not None:
+        dest, value_pairs = args.sweep
+        for raw_value, value in value_pairs:
+            leaf_dir = out_dir / f"{dest}={raw_value}"
+            print(f"\n=== {dest}={raw_value} ===")
+            leaf_args = argparse.Namespace(**vars(args))
+            setattr(leaf_args, dest, value)
+            run_all(leaf_args, sim_root, leaf_dir)
+            summarize(leaf_args, sim_root, stats, leaf_dir, False, start_time=start_time)
+        return
 
     # --rerun given a container path (e.g. 'annealing', holding
     # 'annealing/base', 'annealing/boost=1', ...) rather than a single leaf
-    # run: it exists but has no reports/ archive of its own. Batch
-    # processing like this is --rerun-only -- --create always targets a
-    # single new run (guaranteed not to exist yet, so it can't have nested
-    # runs under it either; this check is gated on args.rerun directly, not
-    # just the already-equivalent `reuse`, so that stays true even if
-    # reuse's definition ever changes). Process every leaf run found nested
-    # underneath the container instead of the container path itself, each
-    # with its OWN frozen config.json (not today's live bench/config.json,
-    # and not each other's either).
-    if args.rerun and out_dir.is_dir() and not _has_reports_archive(out_dir):
-        leaf_dirs = discover_archived_run_dirs(out_dir)
-        if leaf_dirs:
+    # run: it may or may not have a reports/ archive of its own in addition
+    # to the nested ones (a run can be both a leaf and a container of
+    # further sub-experiments). Batch processing like this is --rerun-only --
+    # --create always targets a single new run (guaranteed not to exist yet,
+    # so it can't have nested runs under it either; this check is gated on
+    # args.rerun directly, not just the already-equivalent `reuse`, so that
+    # stays true even if reuse's definition ever changes). Process every
+    # leaf run found nested underneath the container (including the
+    # container path itself, if it has its own archive), each with its OWN
+    # recorded args.json (not this invocation's own mirrored flags, and not
+    # each other's either).
+    if args.rerun and out_dir.is_dir():
+        leaf_dirs = discover_archived_run_dirs(out_dir, direct_only=args.batch)
+        if leaf_dirs and leaf_dirs != [out_dir]:
             print(
-                f"--rerun {args.rerun!r} has no reports/ archive of its own -- "
-                f"treating it as a container and processing {len(leaf_dirs)} "
-                f"run(s) found underneath it instead."
+                f"--rerun {args.rerun!r} has {len(leaf_dirs)} "
+                f"run(s) nested underneath it -- processing each of those "
+                f"(including its own archive, if any) instead of just itself."
             )
+            overridden = args.explicit_dests & set(MIRRORED_DESTS)
+            if overridden:
+                sys.exit(
+                    f"{RED}--rerun replays each run's original settings -- can't "
+                    f"also pass {', '.join(sorted(overridden))} directly. Use "
+                    f"--copy instead to override.{RESET}"
+                )
             skip_run_all = _skips_all_stages(args)
             for leaf_dir in leaf_dirs:
                 print(f"\n=== {leaf_dir.relative_to(out_dir)} ===")
@@ -3085,25 +3226,34 @@ def main(argv=None):
                 if skip_run_all:
                     print(f"[skip caster,phlag] resummarizing directly from {leaf_dir / 'reports'}")
                 else:
-                    leaf_config = leaf_dir / "config.json"
-                    if not leaf_config.exists():
-                        print(f"{RED}[skip] {leaf_dir}: no config.json of its own -- can't --rerun it.{RESET}")
+                    leaf_args_json = leaf_dir / "args.json"
+                    if not leaf_args_json.exists():
+                        print(f"{RED}[skip] {leaf_dir}: no args.json of its own -- can't --rerun it.{RESET}")
                         continue
-                    run_all(args, sim_root, leaf_dir, config_override=leaf_config)
+                    leaf_args = argparse.Namespace(**vars(args))
+                    for dest, value in _read_args_json(leaf_args_json).items():
+                        setattr(leaf_args, dest, value)
+                    run_all(leaf_args, sim_root, leaf_dir)
                 summarize(args, sim_root, stats, leaf_dir, True, start_time=start_time)
             return
 
-    config_override = None
-    if args.create and args.config:
-        config_override = args.config
     if args.rerun:
-        config_override = out_dir / "config.json"
-        if not config_override.exists():
+        args_json_path = out_dir / "args.json"
+        if not args_json_path.exists():
             sys.exit(
-                f"{RED}--rerun {args.rerun}: no config.json found at {config_override} "
-                f"-- this run predates --rerun's config-freezing, or was never "
+                f"{RED}--rerun {args.rerun}: no args.json found at {args_json_path} "
+                f"-- this run predates --rerun's args-recording, or was never "
                 f"created with --create. Nothing to replay.{RESET}"
             )
+        overridden = args.explicit_dests & set(MIRRORED_DESTS)
+        if overridden:
+            sys.exit(
+                f"{RED}--rerun replays this run's original settings -- can't "
+                f"also pass {', '.join(sorted(overridden))} directly. Use "
+                f"--copy instead to override.{RESET}"
+            )
+        for dest, value in _read_args_json(args_json_path).items():
+            setattr(args, dest, value)
 
     # Same shortcut as the batch-container path above: both stages skipped
     # on an existing run that already has its own reports/ archive means
@@ -3112,7 +3262,7 @@ def main(argv=None):
     if args.rerun and _skips_all_stages(args) and _has_reports_archive(out_dir):
         print(f"[skip caster,phlag] resummarizing directly from {out_dir / 'reports'}")
     else:
-        run_all(args, sim_root, out_dir, config_override=config_override)
+        run_all(args, sim_root, out_dir)
     summarize(args, sim_root, stats, out_dir, reuse, start_time=start_time)
 
 

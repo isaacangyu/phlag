@@ -570,7 +570,7 @@ class PhlagHMMEmissions(HMMEmissions):
         d = xbar.shape[0]
         eps = 1e-6
         # precomputed before optimization
-        S = Sxx - n * jnp.outer(xbar, xbar)
+        weighted_scatter_about_xbar = Sxx - n * jnp.outer(xbar, xbar)
 
         def neg_objective(params):
             # abstract params
@@ -578,7 +578,7 @@ class PhlagHMMEmissions(HMMEmissions):
             Sigma = L @ L.T + eps * jnp.eye(d)
             Sigma_inv = jnp.linalg.inv(Sigma)
             diff = xbar - mu
-            weighted_scatter_about_mu = S + n * jnp.outer(diff, diff)
+            weighted_scatter_about_mu = weighted_scatter_about_xbar + n * jnp.outer(diff, diff)
 
             ll = -0.5 * (
                 n * jnp.linalg.slogdet(Sigma)[1]

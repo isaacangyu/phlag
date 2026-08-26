@@ -135,6 +135,58 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
 
     return blocks, anomaly_intervals, curr_pos
 
+GT_STATS_FILENAME = "gt_stats.txt"
+
+def write_gt_stats_file(path, stats):
+    """
+    Writes stats (a dict with any subset of keys "Null", "Alt", "Overall",
+    each an array-like (mean, covariance) pair over the 3 topology
+    dimensions) as a small ast.literal_eval-parseable text file, mirroring
+    phlag.py's old "Null/Alt fitted mean/covariance" bookkeeping convention
+    so read_gt_stats_file can recover it exactly. Writes nothing if stats
+    is empty.
+    """
+    import pathlib as _pathlib
+    lines = []
+    for label in ("Null", "Alt", "Overall"):
+        if label not in stats:
+            continue
+        mean, cov = stats[label]
+        lines.append(f"{label} mean: {list(float(x) for x in mean)}")
+        lines.append(f"{label} covariance: {[list(float(x) for x in row) for row in cov]}")
+    if lines:
+        _pathlib.Path(path).write_text("\n".join(lines) + "\n")
+
+def read_gt_stats_file(path):
+    """
+    Reads back a gt_stats.txt written by write_gt_stats_file. Returns
+    {"Null": (mean, cov), "Alt": (mean, cov), "Overall": (mean, cov)} for
+    whichever sections are present (each mean/cov a plain nested list), or
+    {} if the file doesn't exist or has no parseable sections.
+    """
+    import re
+    import ast
+    import pathlib as _pathlib
+    p = _pathlib.Path(path)
+    if not p.exists():
+        return {}
+    means, covs = {}, {}
+    for line in p.read_text().splitlines():
+        m = re.match(r'^(Null|Alt|Overall) mean:\s*(\[.+\])\s*$', line)
+        if m:
+            try:
+                means[m.group(1)] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+            continue
+        m = re.match(r'^(Null|Alt|Overall) covariance:\s*(\[\[.+\]\])\s*$', line)
+        if m:
+            try:
+                covs[m.group(1)] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+    return {label: (means[label], covs[label]) for label in ("Null", "Alt", "Overall") if label in means and label in covs}
+
 def clean_locus_name(locus_str):
     """
     Cleans locus strings by stripping 'concat' patterns, prefixes, and file extension tokens.
@@ -609,82 +661,6 @@ def get_repo_root():
     if override:
         return pathlib.Path(override)
     return pathlib.Path(__file__).resolve().parent.parent
-
-
-def load_cli_config(tool_name):
-    """
-    Returns (variable_tokens, fixed_tokens) -- flat lists of raw CLI flag
-    tokens -- for tool_name ("caster" or "phlag") from bench/config.json,
-    sibling to phlag/ in whichever tree this module is physically running
-    from. Deliberately resolved relative to this file rather than via
-    get_repo_root() (which honors a PHLAG_REPO_ROOT override) -- that keeps
-    config.json frozen together with the code when running from one of
-    benchmark.py's run_all() source snapshots, instead of picking up live
-    edits to the real repo's config.json mid-run. Missing file or missing
-    tool key returns ([], []), matching get_data_dir()'s tolerance for a
-    missing .env.
-    """
-    import json
-    import pathlib
-
-    config_path = pathlib.Path(__file__).resolve().parent.parent / "bench" / "config.json"
-    if not config_path.exists():
-        return [], []
-
-    try:
-        config = json.loads(config_path.read_text())
-    except Exception:
-        return [], []
-
-    tool_config = config.get(tool_name, {})
-    return tool_config.get("variable", []), tool_config.get("fixed", [])
-
-
-def apply_cli_config(parser, argv, tool_name):
-    """
-    Parses argv with parser, with defaults sourced from config.json's
-    "variable"/"fixed" sections for tool_name (see load_cli_config).
-
-    Deliberately does NOT splice config tokens into argv before parsing --
-    "variable" flags with nargs="*" (e.g. --plot) would then greedily swallow
-    whatever token follows them, including the real positional path, if a
-    config token list happened to be placed next to it. Instead:
-      - "variable" tokens are parsed once through the same parser (with no
-        positional present -- every positional here is nargs="?", so that's
-        a valid parse on its own) and applied via parser.set_defaults(), so
-        they only take effect for flags argv doesn't already specify.
-      - "fixed" tokens are parsed the same way, but only the destinations
-        they actually set (detected via a sentinel default) are then forced
-        onto the final parsed args, overriding anything argv specified.
-
-    Positional actions (option_strings == []) are excluded from the "fixed"
-    destination set -- argparse always assigns nargs="?" positionals their
-    own default when no positional token is present, even overwriting an
-    already-sentineled namespace attribute, so they can't be sentinel-
-    detected the way optional flags can. Config should never carry a
-    positional's value anyway (paths always come from real argv).
-    """
-    import argparse
-
-    variable_tokens, fixed_tokens = load_cli_config(tool_name)
-
-    if variable_tokens:
-        variable_ns, _ = parser.parse_known_args(variable_tokens)
-        parser.set_defaults(**vars(variable_ns))
-
-    args = parser.parse_args(argv)
-
-    if fixed_tokens:
-        sentinel = object()
-        dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
-        empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
-        fixed_ns, _ = parser.parse_known_args(fixed_tokens, namespace=empty_ns)
-        for key in dests:
-            value = getattr(fixed_ns, key)
-            if value is not sentinel:
-                setattr(args, key, value)
-
-    return args
 
 
 def get_data_dir():

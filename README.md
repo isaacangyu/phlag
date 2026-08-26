@@ -97,9 +97,12 @@ benchmark --create store/phlag/gaussian/w50k_s1k/benchmark/my-run -d gaussian --
 
 ### Arguments
 
-* **`--create PATH`**: Creates a fresh run at `PATH` (a repo-relative path starting with `store/`); errors out if `PATH` already exists. Exactly one of `--create`/`--rerun` is required.
-* **`--rerun PATH`**: Reruns an existing run at `PATH` using that run's own frozen `config.json` (or, if `PATH` holds several runs nested under it, reruns all of them). Exactly one of `--create`/`--rerun` is required.
+* **`--create PATH`**: Creates a fresh run at `PATH` (a repo-relative path starting with `store/`); errors out if `PATH` already exists. Exactly one of `--create`/`--rerun`/`--copy` is required.
+* **`--rerun PATH`**: Reruns an existing run at `PATH` using that run's own recorded `args.json` (or, if `PATH` holds several runs nested under it, reruns all of them). Exactly one of `--create`/`--rerun`/`--copy` is required.
+* **`--copy POS1 POS2`**: Copies every run under `POS1` into `POS2`, overriding any mirrored flag passed directly on this invocation.
+* **`--sweep FLAG=V1,V2,...`**: Only with `--create` -- runs one leaf per value of `FLAG` under `PATH` as a container (e.g. `--sweep=-w=500k,250k,100k`).
 * **`--skip`**: Reuse existing output instead of rerunning, for the named stage(s), comma-separated (e.g. `caster,phlag`).
 * **`-d, --dist-type`** (default: `gaussian`): Distribution type (`gaussian`, `gmm`), threaded through to `caster`/`phlag`.
 * **`--errorbar`** (default: `sd`): Error bar shown on each aggregated cell (`sd`, `sem`, or `ci95`).
 * **`change`** (optional): Short description of what's different in this run, written to the run's report.
+* Every other `caster`/`phlag` flag (`-w`/`--window-size`, `-s`/`--step-size`, `--np`, `--ap`, `--lam`, `--annealing`, `--pair`, etc.) is also mirrored directly onto `benchmark` -- run `benchmark --help` for the full list.

@@ -424,11 +424,16 @@ class Phlag:
         Reads CASTER scores file with guaranteed schema:
         pos  avg*ABBA  avg*BABA  avg*AABB  sliding_D* QuartetCnt
         Drops sliding_D* and QuartetCnt, mapping pos to the three topology scores.
-        For --pair's chunk_scores.tsv (which also carries q1/q2/q3, the
-        normalized ABBA/BABA/AABB proportions -- see CasterPlotter's own
-        preference for the same columns), q1/q2/q3 are used instead of the
-        unnormalized c*ABBA/c*BABA/c*AABB sums, whose scale grows with window
-        size and isn't comparable to a Gaussian/GMM emission model's expectations.
+        For --pair's chunk_scores.tsv (identified by the presence of q1/q2/q3,
+        its normalized-proportion columns -- see CasterPlotter's own preference
+        for the same columns), the raw c*ABBA/c*BABA/c*AABB sums are used
+        (like dstar) rather than q1/q2/q3: q1/q2/q3 divide out almost all of
+        the real signal (the three sums move nearly in lockstep, so their
+        proportions cluster tightly around 1/3), and z-scored per-topology
+        (mean 0, std 1, computed once over the whole file in float64) so the
+        ~1e11-scale raw sums (which cause float32 catastrophic cancellation
+        in the Gaussian fit's covariance) become numerically tractable
+        without losing the real relative variation between windows.
         Preserves the partial-based defaultdict structure for JAX consistency.
         Raises FileNotFoundError if the file path does not exist.
         """
@@ -458,21 +463,22 @@ class Phlag:
             lower_parts = [h.lower() for h in header_parts]
             is_file_header = bool(header_parts) and lower_parts[0] == "file"
             is_locus_header = bool(header_parts) and lower_parts[0] == "locus"
+            has_q123 = all(q in lower_parts for q in ("q1", "q2", "q3"))
 
-            if all(q in lower_parts for q in ("q1", "q2", "q3")):
+            abba_idx = next((i for i, n in enumerate(lower_parts) if 'abba' in n), None)
+            baba_idx = next((i for i, n in enumerate(lower_parts) if 'baba' in n), None)
+            aabb_idx = next((i for i, n in enumerate(lower_parts) if 'aabb' in n), None)
+            if abba_idx is not None and baba_idx is not None and aabb_idx is not None:
+                score_indices = [abba_idx, baba_idx, aabb_idx]
+            elif has_q123:
                 score_indices = [lower_parts.index("q1"), lower_parts.index("q2"), lower_parts.index("q3")]
-                self.used_pair_scores = True
             else:
-                abba_idx = next((i for i, n in enumerate(lower_parts) if 'abba' in n), None)
-                baba_idx = next((i for i, n in enumerate(lower_parts) if 'baba' in n), None)
-                aabb_idx = next((i for i, n in enumerate(lower_parts) if 'aabb' in n), None)
-                if abba_idx is not None and baba_idx is not None and aabb_idx is not None:
-                    score_indices = [abba_idx, baba_idx, aabb_idx]
-                else:
-                    score_indices = [2, 3, 4] if (is_file_header or is_locus_header) else [1, 2, 3]
+                score_indices = [2, 3, 4] if (is_file_header or is_locus_header) else [1, 2, 3]
 
             pos_idx = lower_parts.index("pos") if "pos" in lower_parts else (1 if (is_file_header or is_locus_header) else 0)
 
+            pos_keys = []
+            raw_scores = []
             for line in f:
                 if not line.strip():
                     continue
@@ -481,19 +487,30 @@ class Phlag:
 
                 try:
                     pos_key = int(values[pos_idx])
-                    scores = jnp.array([
+                    triplet = [
                         float(values[score_indices[0]]),
                         float(values[score_indices[1]]),
-                        float(values[score_indices[2]])
-                    ], dtype=jnp.float32)
-                    self.pos_to_caster[pos_key] = scores
-                    if self.source_fasta_path is None and is_file_header:
-                        self.source_fasta_path = values[0]
+                        float(values[score_indices[2]]),
+                    ]
                 except (ValueError, IndexError):
                     continue
+                pos_keys.append(pos_key)
+                raw_scores.append(triplet)
+                if self.source_fasta_path is None and is_file_header:
+                    self.source_fasta_path = values[0]
 
-        if len(self.pos_to_caster) == 0:
+        if len(pos_keys) == 0:
             sys.exit(f"Error: No valid window scores parsed from CASTER score file '{path}'. Please check that sequence headers in the FASTA match the species in the mapping file.")
+
+        raw_scores = np.array(raw_scores, dtype=np.float64)
+        if has_q123:
+            self.used_pair_scores = True
+            std = raw_scores.std(axis=0)
+            std = np.where(std == 0, 1.0, std)
+            raw_scores = (raw_scores - raw_scores.mean(axis=0)) / std
+
+        for pos_key, triplet in zip(pos_keys, raw_scores):
+            self.pos_to_caster[pos_key] = jnp.array(triplet, dtype=jnp.float32)
 
     def compute_emissions(self):
         sorted_positions = sorted(self.pos_to_caster.keys())
@@ -844,6 +861,24 @@ class Phlag:
             initial_probs_np, transition_matrix_np, log_likelihoods_np, n_paths
         )
 
+        # An EM run can diverge (transition matrix -> NaN, usually one state
+        # starved of data during annealing/repulsion) -- log(NaN) is NaN, so
+        # every Viterbi score compares false against -inf and get_n_best_
+        # viterbi_paths returns no path at all rather than a bad one. Retry
+        # once against the pre-EM initial transition matrix (always finite,
+        # see fit_em) instead of crashing on paths[0]; the fitted emissions
+        # are unaffected; note this fallback in the report so it's visible.
+        viterbi_fallback_used = False
+        if not paths:
+            print(
+                "\nWarning: EM's fitted transition matrix diverged to NaN -- "
+                "falling back to the initial transition matrix for Viterbi decoding.\n"
+            )
+            paths, path_likelihoods = self.get_n_best_viterbi_paths(
+                initial_probs_np, self.initial_transition_matrix, log_likelihoods_np, n_paths
+            )
+            viterbi_fallback_used = True
+
         from .utils import format_number
 
         # Calculate metrics for primary Viterbi path (Path 1) -- only
@@ -851,11 +886,15 @@ class Phlag:
         # one, skip evaluation entirely (flipping to "match" an all-null
         # y_true would silently relabel states based on nothing) rather than
         # report misleading numbers.
-        y_pred = np.array(paths[0])
         flipped_for_eval = False
         tp = fp = fn = tn = 0
 
-        if self.has_ground_truth:
+        if not paths:
+            print("Warning: Viterbi decoding produced no valid path (even with the initial transition matrix) -- skipping evaluation metrics.")
+            y_pred = None
+            metrics_str = "N/A (Viterbi decoding failed -- no valid path found)"
+        elif self.has_ground_truth:
+            y_pred = np.array(paths[0])
             # Flip the state assignments according to whichever has smaller hamming distance
             hamming_dist = np.sum(y_pred != y_true)
             hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
@@ -897,7 +936,7 @@ class Phlag:
             metrics_str = (
                 f"TPR: {format_number(tpr)}, FPR: {format_number(fpr)}, "
                 f"Precision: {format_number(precision)}, F1: {format_number(f1)}, "
-                f"Accuracy: {format_number(accuracy)}, AUC: {format_number(auc)}"
+                f"Accuracy: {format_number(accuracy)}, ROC-AUC: {format_number(auc)}"
             )
         else:
             metrics_str = "N/A (no ground truth pattern)"
@@ -968,14 +1007,19 @@ class Phlag:
 
         headers.append("State divergence: " + emission_divergence_str)
         if em_hellinger2_distance is not None:
-            headers.append(f"EM divergence (Hellinger^2): {format_number(em_hellinger2_distance)}")
+            headers.append(f"em_hd: {format_number(em_hellinger2_distance)}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
             tm_before_str = ", ".join(f"[{', '.join(format_number(x) for x in row)}]" for row in self.initial_transition_matrix.tolist())
             headers.append(f"Initial transition matrix (before EM): [{tm_before_str}]")
-        tm_after_str = ", ".join(f"[{', '.join(format_number(x) for x in row)}]" for row in transition_matrix_np.tolist())
+        tm_after_str = ", ".join(f"[{', '.join(str(format_number(x)) for x in row)}]" for row in transition_matrix_np.tolist())
         headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
+        if viterbi_fallback_used:
+            headers.append(
+                "Viterbi decoding: EM's final transition matrix diverged to NaN -- "
+                "decoded against the initial transition matrix instead"
+            )
         if correct_trans_arg is not None:
             headers.append("Corrected transition matrix applied: True")
 
@@ -1008,15 +1052,6 @@ class Phlag:
             # comparison it actually corresponds to instead of assuming
             # state 0 is always Null.
             null_state, alt_state = (1, 0) if flipped_for_eval else (0, 1)
-            # Per-topology (marginal, univariate) ground-truth squared
-            # Hellinger distance, averaged across topologies -- the
-            # ground-truth split only gives per-topology mean/std (no
-            # cross-topology covariance), so unlike the fitted EM divergence
-            # (joint over all topologies at once) this is an average of
-            # marginals. Same measure hmm.PhlagHMMEmissions.em_divergence
-            # uses (bounded [0, 1], 0 = statistically identical, 1 = fully
-            # separated), so the two numbers are on a comparable scale.
-            gt_divergences = []
             for d in sorted(self.ground_truth_fits.keys()):
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
                 mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, null_state, d, np.array([0.0]))
@@ -1030,13 +1065,43 @@ class Phlag:
                 headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
                 headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(mu_alt_fit)}\t{format_rel_err(mu_alt_gt)}\t{format_rel_err(rel_mu_alt)}")
                 headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(std_alt_fit)}\t{format_rel_err(std_alt_gt)}\t{format_rel_err(rel_std_alt)}")
-                hellinger2_gt = hmm.gaussian_hellinger2(
-                    jnp.array([mu_null_gt]), jnp.array([[std_null_gt ** 2]]),
-                    jnp.array([mu_alt_gt]), jnp.array([[std_alt_gt ** 2]]),
+            # Joint (all-topologies-at-once) ground-truth squared Hellinger
+            # distance -- including cross-topology covariance, unlike the
+            # per-topology marginal fits above -- so it's directly comparable
+            # to the fitted EM divergence (hmm.PhlagHMMEmissions.em_divergence),
+            # which is also a joint, full-covariance Hellinger distance
+            # between the two states. Prefer caster's own gt_stats.txt
+            # (written alongside caster_scores by write_ground_truth_stats)
+            # when present -- same Null/Alt split, computed once by caster
+            # instead of every phlag run re-loading and re-splitting
+            # caster_scores itself. Falls back to computing it here from
+            # Y_np/y_true when gt_stats.txt is missing (e.g. an older
+            # scores.tsv from before caster started writing it).
+            from .utils import read_gt_stats_file
+            gt_stats_path = pathlib.Path(self.args.caster_scores).parent / "gt_stats.txt"
+            gt_stats = read_gt_stats_file(gt_stats_path)
+
+            if "Null" in gt_stats and "Alt" in gt_stats:
+                mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
+                mu_alt_gt_joint, cov_alt_gt_joint = gt_stats["Alt"]
+                have_gt_joint = True
+            else:
+                null_vals = Y_np[y_true == 0]
+                alt_vals = Y_np[y_true == 1]
+                have_gt_joint = len(null_vals) > 1 and len(alt_vals) > 1
+                if have_gt_joint:
+                    emission_dim = Y_np.shape[-1]
+                    mu_null_gt_joint = null_vals.mean(axis=0)
+                    mu_alt_gt_joint = alt_vals.mean(axis=0)
+                    cov_null_gt_joint = np.cov(null_vals, rowvar=False).reshape(emission_dim, emission_dim)
+                    cov_alt_gt_joint = np.cov(alt_vals, rowvar=False).reshape(emission_dim, emission_dim)
+
+            if have_gt_joint:
+                gt_hellinger2_joint = hmm.gaussian_hellinger2(
+                    jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
+                    jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
                 )
-                gt_divergences.append(float(hellinger2_gt))
-            if gt_divergences:
-                headers.append(f"Ground truth EM divergence (Hellinger^2): {format_number(sum(gt_divergences) / len(gt_divergences))}")
+                headers.append(f"em_gt_hd: {format_number(float(gt_hellinger2_joint))}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
@@ -1125,7 +1190,6 @@ class Phlag:
             penalty_lambda_anneal=self.args.annealing,
             n_iters=self.args.n_iters,
             increment_steps=self.args.increment_steps,
-            sigma_min=1e-5 if getattr(self, "used_pair_scores", False) else 1e-2,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1856,7 +1920,7 @@ def build_parser():
 
 def parse_arguments(argv=None):
     parser = build_parser()
-    args = utils.apply_cli_config(parser, argv, "phlag")
+    args = parser.parse_args(argv)
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
