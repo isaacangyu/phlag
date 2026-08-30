@@ -429,11 +429,12 @@ class Phlag:
         for the same columns), the raw c*ABBA/c*BABA/c*AABB sums are used
         (like dstar) rather than q1/q2/q3: q1/q2/q3 divide out almost all of
         the real signal (the three sums move nearly in lockstep, so their
-        proportions cluster tightly around 1/3), and z-scored per-topology
-        (mean 0, std 1, computed once over the whole file in float64) so the
-        ~1e11-scale raw sums (which cause float32 catastrophic cancellation
-        in the Gaussian fit's covariance) become numerically tractable
-        without losing the real relative variation between windows.
+        proportions cluster tightly around 1/3). `self.used_pair_scores` just
+        records that q1/q2/q3 were present -- no rescaling happens here
+        anymore; caster.py's own -z/--zscale flag (applied at write time,
+        before this ever reads the file) is now the way to keep --pair's
+        ~1e11-scale raw sums from causing float32 catastrophic cancellation
+        in the Gaussian fit's covariance.
         Preserves the partial-based defaultdict structure for JAX consistency.
         Raises FileNotFoundError if the file path does not exist.
         """
@@ -505,9 +506,6 @@ class Phlag:
         raw_scores = np.array(raw_scores, dtype=np.float64)
         if has_q123:
             self.used_pair_scores = True
-            std = raw_scores.std(axis=0)
-            std = np.where(std == 0, 1.0, std)
-            raw_scores = (raw_scores - raw_scores.mean(axis=0)) / std
 
         for pos_key, triplet in zip(pos_keys, raw_scores):
             self.pos_to_caster[pos_key] = jnp.array(triplet, dtype=jnp.float32)
@@ -525,17 +523,28 @@ class Phlag:
         parsed = parse_filename_to_dir_structure(input_path.stem)
 
         if not getattr(self.args, "bench", False):
-            # Standalone use (the default): <repo_root>/out/w<W>_s<S>/<node_name>/,
-            # no dist_type/category/pattern nesting, so ad-hoc runs never
-            # write into the tree benchmark runs share/read. The scores file
-            # may come from either layout -- caster.py's own
-            # w<W>_s<S>/<node_name>/<node_name>.tsv (the common case; node_name
-            # is right there as the parent dir), or (found via -r's broadened
-            # search, or passed explicitly) the canonical --bench tree's
-            # <node_name>/<pattern>/scores.tsv under a caster/ ancestor,
-            # where node_name sits one level further up -- get_simulation_node_name
-            # handles that fixed two-directories-up offset. parsed (synthetic
-            # null/alt filenames) takes precedence over both.
+            # Standalone use (the default): mirror whatever nesting caster.py
+            # wrote under out/w<W>_s<S>[_z][_n]/ or
+            # out/c<chunk>_s<step>[_site][_z][_n]/ -- <node_name>/ for
+            # sim/plain-file inputs, <node_name>/<pattern>/ for experiment
+            # (parsed null/alt) inputs -- by locating that size-dir segment
+            # in the input path and reusing everything between it and the
+            # scores filename, so report.tsv/plots land alongside the scores
+            # file exactly, regardless of nesting depth. A 'caster' ancestor
+            # instead means the file was found (via -r's broadened search, or
+            # passed explicitly) in the canonical --bench tree's
+            # <node_name>/<pattern>/scores.tsv, where node_name sits a fixed
+            # two directories up (get_simulation_node_name) -- that flattens
+            # to out/<node_name>/, same as any other input with no
+            # recognizable size-dir segment.
+            parts = input_path.parts
+            size_dir_idx = None
+            for i, part in enumerate(parts[:-1]):
+                if re.fullmatch(r'[cw]\w+_s\w+', part, re.IGNORECASE):
+                    size_dir_idx = i
+                    break
+            if size_dir_idx is not None and "caster" not in parts:
+                return get_repo_root() / "out" / pathlib.Path(*parts[size_dir_idx:-1])
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
             elif "caster" in input_path.parts:
@@ -543,14 +552,6 @@ class Phlag:
                 node_name = get_simulation_node_name(input_path) or input_path.parent.name
             else:
                 node_name = input_path.parent.name
-            # caster's dstar and --pair paths both nest one level deeper,
-            # under out/w<W>_s<S>/<node_name>/ or out/c<chunk>_s<step>/<node_name>/
-            # respectively (see caster.py) -- preserve that prefix so
-            # report.tsv/plots land alongside the scores file instead of
-            # flattening back to out/<node_name>/.
-            grandparent_name = input_path.parent.parent.name
-            if not parsed and re.fullmatch(r'[cw]\w+_s\w+', grandparent_name):
-                return get_repo_root() / "out" / grandparent_name / node_name
             return get_repo_root() / "out" / node_name
 
         # --bench (set only by benchmark's own subprocess invocations) keeps
@@ -1168,8 +1169,39 @@ class Phlag:
         self.emission_lambda = self.args.emission_lambda
         self.nu = 1.1
 
-        # Generic Dirichlet structure setup for continuous emission tracking
-        self.psi = jnp.ones((NUM_STATES, NUM_STATES)) + PSI_EPS
+        # Sticky Dirichlet prior on the transition matrix, parameterized directly
+        # in pseudo-observation terms: rho is the expected fraction of windows
+        # that are null (so rho*n_windows/(1-rho)*n_windows are the expected
+        # null/alt window counts) and beta is the expected number of
+        # state-to-state transitions each way (e.g. null->alt, alt->null) --
+        # used as-is as the off-diagonal pseudocounts -- subtracted out of each
+        # state's expected window count to give that state's diagonal
+        # (self-transition, i.e. windows that don't transition out)
+        # pseudocount. Floored by PSI_EPS. Omitting both --rho and --beta
+        # disables the prior entirely: concentration 1 (not 0!) is the
+        # no-prior case here, since Dirichlet.mode() is (alpha - 1) /
+        # (sum(alpha) - k) -- that -1/-k is intrinsic to the mode formula, so
+        # a uniform concentration of 1 exactly cancels it, making the mode
+        # equal the EM's raw expected-count proportions with zero net
+        # influence from the prior. Concentration 0 does NOT cancel that -1
+        # and so is actually biased away from the raw proportions -- not a
+        # neutral choice. Omitting only one of --rho/--beta is an error since
+        # alpha_0/alpha_1 need both.
+        self.n_windows = self.Y.shape[0]
+        self.rho = self.args.rho
+        self.beta = self.args.beta
+        if self.rho is None and self.beta is None:
+            # neutral for Dirichlet mode, would be zeros for mean
+            self.psi = jnp.ones((2, 2)) + PSI_EPS
+        elif self.rho is None or self.beta is None:
+            raise ValueError("--rho and --beta must both be set, or both omitted "
+                              "(omitting both disables the transition prior)")
+        else:
+            self.alpha_0 = self.n_windows * self.rho - self.beta
+            self.alpha_1 = self.n_windows * (1 - self.rho) - self.beta
+            self.beta_0 = self.beta
+            self.beta_1 = self.beta
+            self.psi = jnp.array([[self.alpha_0, self.beta_0], [self.beta_1, self.alpha_1]]) + PSI_EPS
 
         self.emission_parameterization = (
             self.args.null_emission_parameterization,
@@ -1908,6 +1940,30 @@ def build_parser():
         help="Number of best Viterbi paths to calculate and plot (default: 1)",
     )
     hmm_group.add_argument(
+        "--rho",
+        dest="rho",
+        type=float,
+        default=None,
+        help="""Expected fraction of windows that are null, for the transition
+                    matrix's sticky Dirichlet prior -- scaled by the run's window
+                    count and combined with --beta into per-row pseudocounts added
+                    to the EM M-step's expected transition counts. Must be set
+                    together with --beta; omitting both disables the transition
+                    prior entirely (default: unset, no prior).""",
+    )
+    hmm_group.add_argument(
+        "--beta",
+        dest="beta",
+        type=float,
+        default=None,
+        help="""Expected number of state-to-state transitions each way (e.g.
+                    null->alt, alt->null) -- used directly as the off-diagonal
+                    pseudocounts of the transition matrix's sticky Dirichlet prior,
+                    see --rho. Must be set together with --rho; omitting both
+                    disables the transition prior entirely (default: unset,
+                    no prior).""",
+    )
+    hmm_group.add_argument(
         "--correct-transition",
         dest="correct_transition",
         nargs="?",
@@ -2029,7 +2085,11 @@ def parse_arguments(argv=None):
     if args.step_size is None:
         import re as _re
         for part in pathlib.Path(args.caster_scores).parts:
-            m = _re.fullmatch(r'[cw]\w+_s(\w+)', part)
+            # Non-greedy prefix + digit-only step group: a plain \w+ greedily
+            # over-matches into any trailing _n/_site suffix (e.g. captures
+            # 'ite' out of 'c50k_s1k_site' instead of '1k') since it prefers
+            # the last '_s' in the string.
+            m = _re.match(r'^[cw]\w+?_s(\d+[km]?)(?:_|$)', part)
             if m:
                 args.step_size = int_or_abbrev(m.group(1))
                 break

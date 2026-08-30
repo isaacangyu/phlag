@@ -375,6 +375,7 @@ class PhlagHMMTransitions(HMMTransitions):
             if method.lower() == "prior":
                 if key is None:
                     raise ValueError("A key required if transition matrix not provided")
+                # sample each cell, given the expected counts in each row
                 tm_sample = tfd.Dirichlet(self.concentration).sample(seed=key)
                 transition_matrix = cast(Float[Array, "num_states num_states"], tm_sample)
             else:
@@ -388,7 +389,9 @@ class PhlagHMMTransitions(HMMTransitions):
         return params, props
 
     def log_prior(self, params: ParamsStandardHMMTransitions) -> Scalar:
-        return 0.0
+        if self.num_states == 1:
+            return 0.0
+        return tfd.Dirichlet(self.concentration).log_prob(params.transition_matrix).sum()
 
     def _compute_transition_matrices(
         self, params: ParamsStandardHMMTransitions, inputs=None
@@ -416,9 +419,25 @@ class PhlagHMMTransitions(HMMTransitions):
             if self.num_states == 1:
                 transition_matrix = jnp.array([[1.0]])
             else:
-                # batch_stats
+                # batch_stats: raw Baum-Welch expected transition counts, biased
+                # toward self.concentration (sticky Dirichlet prior pseudocounts,
+                # see PhlagHMM's rho/beta). Posterior is Dirichlet(concentration +
+                # expected_trans_counts); using its mode (MAP) for now instead of
+                # its mean, to match the Beta-mode formula p1 = (a-1)/(a+b-2) this
+                # was checked against. Note the mean is always well-defined (any
+                # nonnegative concentration), while the mode requires every entry
+                # of concentration + expected_trans_counts > 1 -- not guaranteed in
+                # general (e.g. arbitrary --beta; concentration=1, the --rho/--beta
+                # omitted/no-prior case, satisfies this whenever counts >= 0 since
+                # 1 + count >= 1, with PSI_EPS as the >1 floor), in which case TFP's
+                # Dirichlet.mode() returns NaN and the NaN
+                # fallback in Phlag.compute_output (retry Viterbi against the
+                # pre-EM initial transition matrix) kicks in. Mean formula,
+                # for reference:
+                #   expected_trans_counts = batch_stats.sum(axis=0) + self.concentration
+                #   transition_matrix = expected_trans_counts / (expected_trans_counts.sum(axis=-1, keepdims=True) + 1e-12)
                 expected_trans_counts = batch_stats.sum(axis=0)
-                transition_matrix = expected_trans_counts / (expected_trans_counts.sum(axis=-1, keepdims=True) + 1e-12)
+                transition_matrix = tfd.Dirichlet(self.concentration + expected_trans_counts).mode()
             params = params._replace(transition_matrix=transition_matrix)
         return params, m_step_state
 
@@ -934,7 +953,7 @@ class PhlagHMM(HMM):
         )
 
     def log_prior(self, params: HMMParameterSet) -> Scalar:
-        return 0.0
+        return self.transition_component.log_prior(params.transitions) + self.emission_component.log_prior(params.emissions)
 
     def state_emission_divergence(self, params: HMMParameterSet) -> Float[Array, "emission_dim"]:
         return self.emission_component.state_divergence(params.emissions)

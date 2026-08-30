@@ -42,6 +42,140 @@ def step_size_or_fraction(val_str):
         return frac
     return int_or_abbrev(val_str)
 
+def recover_source_fasta(scores_path):
+    """
+    Recovers the source FASTA path from a scores.tsv's 'file' column (its
+    first data row) -- the same convention read_caster_scores relies on in
+    phlag.py. Returns None if the file has no 'file'-led header or no data
+    rows.
+    """
+    with open(scores_path, "r") as f:
+        header = f.readline().strip().split("\t")
+        if not header or header[0].lower() != "file":
+            return None
+        for line in f:
+            if line.strip():
+                return pathlib.Path(line.split("\t")[0])
+    return None
+
+
+def parse_ws_from_path(path):
+    """
+    Recovers (mode, window_or_chunk, step, is_site, is_zscale, is_normalize)
+    from a 'w<...>_s<...>' (dstar), 'c<...>_s<...>' (--pair), or
+    'c<...>_s<...>[_site][_z][_n]' (--site/--zscale/--normalize) path
+    segment, as written by both caster.py's standalone out/ tree and the
+    canonical store/caster/ tree. Returns None if no such segment is found
+    anywhere in path's parts.
+    """
+    for part in path.parts:
+        m = re.match(r'^([wc])(\d+[km]?)_s(\d+[km]?)(_site)?(_z)?(_n)?$', part, re.IGNORECASE)
+        if m:
+            return (
+                m.group(1).lower(), int_or_abbrev(m.group(2)), int_or_abbrev(m.group(3)),
+                bool(m.group(4)), bool(m.group(5)), bool(m.group(6)),
+            )
+    return None
+
+
+def apply_zscale(rows, keys):
+    """
+    Rescales each of `keys` (dict keys into `rows`, a list of dicts) to mean
+    0.5, std 0.5 across the whole file: z-score to mean 0/std 1, then
+    0.5 + 0.5*z. Computed once over all rows in float64, in place. Not
+    clipped, so outlier windows can still land outside [0,1]. A zero-std
+    column is left at a constant 0.5 rather than dividing by zero.
+    """
+    if not rows:
+        return rows
+    arr = np.array([[r[k] for k in keys] for r in rows], dtype=np.float64)
+    mean = arr.mean(axis=0)
+    std = arr.std(axis=0)
+    std = np.where(std == 0, 1.0, std)
+    scaled = 0.5 + 0.5 * (arr - mean) / std
+    for row, vals in zip(rows, scaled):
+        for k, v in zip(keys, vals):
+            row[k] = float(v)
+    return rows
+
+
+def apply_zscale_to_scores_file(path, has_q123):
+    """
+    Rescales c*ABBA/c*BABA/c*AABB in an already-written scores TSV (used by
+    run_caster_pair/run_caster_site, after their own K-rollup) to mean
+    0.5/std 0.5 via apply_zscale, rewriting the file in place. If q1/q2/q3
+    are also present (--pair), recomputes them as proportions of the
+    rescaled sums to keep the file internally consistent -- their values are
+    no longer literal proportions once the base sums are recentered, but
+    CasterPlotter/read_caster_scores still just treat them as a derived
+    per-topology column.
+    """
+    df = pd.read_csv(path, sep="\t")
+    rows = df.to_dict("records")
+    apply_zscale(rows, ["c*ABBA", "c*BABA", "c*AABB"])
+    if has_q123:
+        for row in rows:
+            s0, s1, s2 = row["c*ABBA"], row["c*BABA"], row["c*AABB"]
+            tot = s0 + s1 + s2
+            if tot != 0:
+                row["q1"], row["q2"], row["q3"] = s0 / tot, s1 / tot, s2 / tot
+            else:
+                row["q1"] = row["q2"] = row["q3"] = 1.0 / 3
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+
+
+def apply_normalize(rows, keys):
+    """
+    Normalizes each row's `keys` (dict keys into `rows`, a list of dicts) to
+    proportions of that row's own sum (1/3 each if the sum is 0), in place.
+    Mirrors caster-pair.cpp's q1/q2/q3 -- NOT the same as dividing by
+    QuartetCnt (dstar.cpp's quartetCnt(), a per-site sequence-depth product
+    unrelated to the sum of the three D* topology scores). D* itself is
+    invariant to this rescaling (same denominator cancels), so it is left
+    untouched by callers.
+    """
+    for row in rows:
+        vals = [row[k] for k in keys]
+        denom = sum(vals)
+        if denom == 0:
+            for k in keys:
+                row[k] = 1.0 / len(keys)
+        else:
+            for k, v in zip(keys, vals):
+                row[k] = v / denom
+    return rows
+
+
+def apply_normalize_to_scores_file(src_path, dst_path, has_q123):
+    """
+    Reads an already-written scores TSV at `src_path` (un-normalized), applies
+    apply_normalize to c*ABBA/c*BABA/c*AABB, and writes the result to
+    `dst_path` -- used by the --normalize short-circuit (see main()) to avoid
+    recomputing dstar/caster-pair/caster-site when an un-normalized scores.tsv
+    for the same window/step (or chunk/step) already exists. If q1/q2/q3 are
+    also present (--pair), they collapse to exactly the normalized
+    c*ABBA/c*BABA/c*AABB values (a row's proportions summed to 1).
+    """
+    df = pd.read_csv(src_path, sep="\t")
+    rows = df.to_dict("records")
+    apply_normalize(rows, ["c*ABBA", "c*BABA", "c*AABB"])
+    if has_q123:
+        for row in rows:
+            row["q1"], row["q2"], row["q3"] = row["c*ABBA"], row["c*BABA"], row["c*AABB"]
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(dst_path.parent), prefix=".scores_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            pd.DataFrame(rows).to_csv(f, sep="\t", index=False)
+        os.replace(tmp_path, dst_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def get_fasta_length(fasta_path):
     length = 0
     with open(fasta_path, "r") as f:
@@ -65,14 +199,35 @@ class CasterPlotter:
 
         os.makedirs(self.data_dir, exist_ok=True)
 
-        base_name = pathlib.Path(scores_file).name
-        name_part, _ = os.path.splitext(base_name)
-        self.is_normalized_file = name_part.endswith('_n')
-
         from .utils import get_locus_description
         self.gene_name = get_locus_description(scores_file)
 
         self.load_data()
+
+        # Transform/source tag for the plot title -- recovered from the
+        # w<W>_s<S>[_z][_n]/c<chunk>_s<step>[_site][_z][_n] path segment
+        # (see parse_ws_from_path) so the plot always states which columns
+        # and which rescaling it's actually showing, matching what
+        # phlag.py's read_caster_scores feeds the HMM. Falls back to
+        # detecting q1/q2/q3 presence (--pair's own tell, since --site never
+        # writes those columns) when the path doesn't encode it (e.g. a
+        # custom -o path), and says nothing rather than guessing wrong.
+        ws = parse_ws_from_path(pathlib.Path(scores_file))
+        has_q123 = self.df is not None and all(c in self.df.columns for c in ('q1', 'q2', 'q3'))
+        if ws:
+            mode, _, _, is_site, is_zscale, is_normalize = ws
+            source = "site" if (mode == "c" and is_site) else ("pair" if mode == "c" else "dstar")
+            transform_bits = [b for b, on in (("zscaled", is_zscale), ("normalized", is_normalize)) if on]
+            tag_parts = [source] + (transform_bits or ["raw"])
+        else:
+            # Path doesn't encode a recognizable size-dir segment (e.g. a
+            # custom -o destination) -- q1/q2/q3 presence still identifies
+            # --pair, but whether -z/-n were applied isn't recoverable from
+            # the file alone, so leave the transform unstated rather than
+            # guessing "raw" and risking a mislabeled plot.
+            source = "pair" if has_q123 else None
+            tag_parts = [source] if source else []
+        self.data_tag = ", ".join(tag_parts) if tag_parts else None
 
         if self.df is not None:
             # High-contrast, vibrant, and highly distinguishable color palette for the 3 topologies
@@ -144,22 +299,27 @@ class CasterPlotter:
         Shared topology-column resolution for both the scatter plot and
         write_ground_truth_stats: caster-pair's chunk_scores.tsv carries both
         raw per-window quartet-support sums (c*ABBA/c*BABA/c*AABB, unbounded,
-        scale with window size) and their normalized proportions (q1/q2/q3,
-        in [0,1], positionally ABBA/BABA/AABB -- see caster-pair.cpp's
-        scoreChunksForBranch). Prefer q1/q2/q3 when present so values stay
-        comparable in scale to dstar's own already-normalized
-        c*ABBA/c*BABA/c*AABB columns. Returns (avg_cols, rename_map).
+        scale with window size, possibly rescaled at write time by -z/-n) and
+        their normalized proportions (q1/q2/q3, in [0,1], positionally
+        ABBA/BABA/AABB -- see caster-pair.cpp's scoreChunksForBranch). Prefer
+        the raw c*/avg* columns whenever present, matching phlag.py's
+        read_caster_scores exactly (it always reads those over q1/q2/q3 when
+        both exist), so the plot shows the same values the HMM actually
+        fits on -- q1/q2/q3 divide out nearly all real signal (the three
+        sums move almost in lockstep) and are only a fallback for files that
+        never had c*/avg* columns to begin with. Returns (avg_cols, rename_map).
         """
-        pair_cols = ['q1', 'q2', 'q3']
-        if all(c in df.columns for c in pair_cols):
-            avg_cols = pair_cols
-            rename_map = {'q1': 'ABBA', 'q2': 'BABA', 'q3': 'AABB'}
-        else:
-            avg_cols = [c for c in df.columns if 'avg' in c or 'c*' in c]
-            rename_map = {}
-            for col in avg_cols:
-                match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
-                rename_map[col] = match.group(1).upper() if match else col
+        avg_cols = [c for c in df.columns if 'avg' in c or 'c*' in c]
+        rename_map = {}
+        for col in avg_cols:
+            match = re.search(r'(ABBA|BABA|AABB)', col, re.IGNORECASE)
+            rename_map[col] = match.group(1).upper() if match else col
+
+        if not avg_cols:
+            pair_cols = ['q1', 'q2', 'q3']
+            if all(c in df.columns for c in pair_cols):
+                avg_cols = pair_cols
+                rename_map = {'q1': 'ABBA', 'q2': 'BABA', 'q3': 'AABB'}
 
         if topologies is not None:
             filtered_cols = []
@@ -232,7 +392,10 @@ class CasterPlotter:
                 plt.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
 
         # Format names for cleaner legend and title
-        plt.title(f'Genomic Topology Profile: {self.gene_name}', fontsize=13, fontweight='bold', pad=10)
+        title = f'Genomic Topology Profile: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        plt.title(title, fontsize=13, fontweight='bold', pad=10)
         plt.xlabel('Genomic Position (pos)', fontsize=11, labelpad=8)
         plt.ylabel('Topology Score Value', fontsize=11, labelpad=8)
         plt.legend(loc='upper right', framealpha=0.9)
@@ -363,7 +526,7 @@ def build_parser():
         "-n",
         dest="normalize",
         action="store_true",
-        help="Apply min-max normalization to D* scores"
+        help="Normalize each site's c*ABBA/c*BABA/c*AABB by their sum into proportions (like caster-pair's q1/q2/q3), before window averaging"
     )
     parser.add_argument(
         "-s",
@@ -393,9 +556,10 @@ def build_parser():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["scores"],
+        choices=["scores", "scatter"],
         default=["scores"],
-        help="List of plots to generate (choices: scores. Default: scores)",
+        help="List of plots to generate (choices: scores/scatter, aliases for "
+             "the same topology scatter plot. Default: scores)",
     )
     parser.add_argument(
         "-t",
@@ -462,18 +626,46 @@ def build_parser():
         dest="chunk_scores",
         type=pathlib.Path,
         default=None,
-        help="Output path for --pair's per-chunk quartet scores TSV (default: "
-             "wherever --pair's scores file would normally go)."
+        help="Output path for --pair's/--site's per-chunk quartet scores TSV (default: "
+             "wherever the scores file would normally go)."
     )
     parser.add_argument(
+        "-c",
         "--chunk",
         dest="chunk_size",
         type=int_or_abbrev,
         default=None,
-        help="Window size (in sites) for --pair's per-window quartet scores, rolled up "
-             "from caster-pair's own fine-grained -s-sized chunks the same way dstar's "
-             "window/step aggregation works below (default: -w's window size). See -s "
-             "for the step/stride between windows -- when -s < --chunk, windows overlap."
+        help="Window size (in sites) for --pair's/--site's per-window quartet scores, "
+             "rolled up from caster-pair's/caster-site's own fine-grained -s-sized chunks "
+             "the same way dstar's window/step aggregation works below (default: -w's "
+             "window size). See -s for the step/stride between windows -- when -s < "
+             "--chunk, windows overlap."
+    )
+    parser.add_argument(
+        "--site",
+        dest="site",
+        action="store_true",
+        default=False,
+        help="Run ./caster/bin/caster-site (auto-(re)compiling from "
+             "caster/caster-site.cpp if missing/stale) instead of dstar -- scores one "
+             "fixed quartet branch's CASTER-site topology per genomic chunk, instead of "
+             "D*/ABBA-BABA-AABB windows or a species tree. The branch is the -m/--mapping "
+             "population mapping file (auto-detected the same way as for dstar), which "
+             "must assign every taxon to exactly one of 4 groups. Mutually exclusive with "
+             "--pair. See --chunk-scores."
+    )
+    parser.add_argument(
+        "-z",
+        "--zscale",
+        dest="zscale",
+        action="store_true",
+        default=False,
+        help="Rescale each output c*ABBA/c*BABA/c*AABB column to mean 0.5, std 0.5 across "
+             "the whole file (z-score to mean 0/std 1, then 0.5 + 0.5*z; not clipped, so "
+             "outlier windows can still land outside [0,1]). Mainly for --pair's/--site's "
+             "raw quartet sums (~1e11-scale for --pair), which cause float32 catastrophic "
+             "cancellation in phlag's Gaussian fit otherwise; works for dstar's D* output "
+             "too, though its own raw sums are already a numerically-safe ~1e4-1e5 scale."
     )
     return parser
 
@@ -583,6 +775,12 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
                 })
         pd.DataFrame(agg_rows).to_csv(chunk_scores_path, sep="\t", index=False)
 
+    if args.normalize:
+        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True)
+
+    if args.zscale:
+        apply_zscale_to_scores_file(chunk_scores_path, has_q123=True)
+
     print(f"Success: chunk scores written to: {chunk_scores_path}")
 
     write_ground_truth_stats(
@@ -592,7 +790,7 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
         topologies=args.topologies,
     )
 
-    if args.plot and "scores" in args.plot:
+    if args.plot and ("scores" in args.plot or "scatter" in args.plot):
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-pair.cpp to mirror dstar's scores.tsv exactly, so the same
         # CasterPlotter -- same palette, same ground-truth shading -- renders
@@ -609,9 +807,134 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
     return chunk_scores_path
 
 
+def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern):
+    plot_data_dir = final_output_path.parent
+    binary_name = "caster-site.exe" if sys.platform == "win32" else "caster-site"
+    binary_candidates = [
+        data_dir / "bin" / binary_name,
+        repo_root / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "caster" / "bin" / binary_name,
+        pathlib.Path.cwd() / "bin" / binary_name,
+    ]
+    which_path = shutil.which(binary_name)
+    if which_path:
+        binary_candidates.append(pathlib.Path(which_path))
+
+    binary_path = None
+    for candidate in binary_candidates:
+        if candidate.exists():
+            binary_path = candidate
+            break
+
+    if not binary_path:
+        binary_path = repo_root / "caster" / "bin" / binary_name
+
+    caster_site_cpp = repo_root / "caster" / "caster-site.cpp"
+    if caster_site_cpp.exists():
+        if not binary_path.exists() or os.path.getmtime(caster_site_cpp) > os.path.getmtime(binary_path):
+            target_bin = repo_root / "caster" / "bin" / binary_name
+            os.makedirs(target_bin.parent, exist_ok=True)
+            print(f"Compiling 'caster-site' binary from {caster_site_cpp}...")
+            includes_dir = repo_root / "caster" / "includes"
+            compile_cmd = ["g++", "-std=gnu++17", "-O2", "-I", str(includes_dir), str(caster_site_cpp), "-o", str(target_bin)]
+            try:
+                subprocess.run(compile_cmd, check=True)
+                binary_path = target_bin
+                print(f"Successfully compiled 'caster-site' binary at {binary_path}")
+            except Exception as e:
+                print(f"Warning: Could not auto-compile 'caster-site': {e}")
+
+    if sys.platform != "win32" and binary_path.exists() and not os.access(binary_path, os.X_OK):
+        try:
+            os.chmod(binary_path, os.stat(binary_path).st_mode | 0o755)
+        except Exception as e:
+            print(f"Warning: Failed to set executable permission on '{binary_path}': {e}")
+
+    if not binary_path.exists():
+        sys.exit(f"Error: 'caster-site' binary not found and could not be compiled (looked for source at {caster_site_cpp}).")
+
+    if not args.mapping.exists():
+        sys.exit(f"Error: Mapping file not found at '{args.mapping}'")
+
+    chunk_scores_path = args.chunk_scores if args.chunk_scores else final_output_path
+    chunk_scores_path.parent.mkdir(parents=True, exist_ok=True)
+    window_size = args.chunk_size if args.chunk_size is not None else args.window_size
+    site_step = min(args.step_size, window_size)
+
+    print(f"Running caster-site on '{args.fasta_file}' with branch mapping '{args.mapping}', chunk(window)={window_size}, step={site_step}...")
+    cmd = [
+        str(binary_path),
+        "--branch-mapping", str(args.mapping.resolve()),
+        "--chunk-scores", str(chunk_scores_path.resolve()),
+        "--chunk", str(site_step),
+        str(args.fasta_file.resolve()),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Error running 'caster-site' binary:\nCommand: {e.cmd}\nExit Code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
+
+    # caster-site itself only ever partitions a locus into non-overlapping
+    # --chunk-sized blocks -- same rolling fine-grained-rows -> sliding-window
+    # trick as run_caster_pair, since it has no native step/stride concept.
+    K = max(1, window_size // site_step)
+    if K > 1:
+        raw_df = pd.read_csv(chunk_scores_path, sep="\t")
+        agg_rows = []
+        for source_file, locus_df in raw_df.groupby("file", sort=False):
+            locus_df = locus_df.sort_values("pos").reset_index(drop=True)
+            for i in range(len(locus_df) - K + 1):
+                window = locus_df.iloc[i:i + K]
+                pos_val = int(locus_df.iloc[i]["pos"])
+                if args.shift_caster:
+                    pos_val += window_size // 2
+                agg_rows.append({
+                    "file": source_file,
+                    "pos": pos_val,
+                    "c*ABBA": window["c*ABBA"].sum(),
+                    "c*BABA": window["c*BABA"].sum(),
+                    "c*AABB": window["c*AABB"].sum(),
+                })
+        pd.DataFrame(agg_rows).to_csv(chunk_scores_path, sep="\t", index=False)
+
+    if args.normalize:
+        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
+
+    if args.zscale:
+        apply_zscale_to_scores_file(chunk_scores_path, has_q123=False)
+
+    print(f"Success: chunk scores written to: {chunk_scores_path}")
+
+    write_ground_truth_stats(
+        scores_file=str(chunk_scores_path.resolve()),
+        output_dir=str(plot_data_dir.resolve()),
+        locus_pattern=locus_pattern,
+        topologies=args.topologies,
+    )
+
+    if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+        # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
+        # by caster-site.cpp to mirror dstar's scores.tsv exactly, so the same
+        # CasterPlotter -- same palette, same ground-truth shading -- renders
+        # it directly instead of a separate plotting path.
+        CasterPlotter(
+            scores_file=str(chunk_scores_path.resolve()),
+            distribution=args.dist_type,
+            data_dir=str(plot_data_dir.resolve()),
+            topologies=args.topologies,
+            plot_scores=True,
+            locus_pattern=locus_pattern,
+        )
+
+    return chunk_scores_path
+
+
 def main(argv=None):
     args = parse_arguments(argv)
-    
+
+    if args.pair and args.site:
+        sys.exit("Error: --pair and --site are mutually exclusive.")
+
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
         args.step_size = args.window_size
@@ -637,10 +960,56 @@ def main(argv=None):
             sys.exit("Error: No input file found in store/msa/concat or candidate MSA directories.")
         args.fasta_file = recent_fasta
 
+    # Regenerate mode: a scores.tsv (or chunk_scores.tsv) path was passed
+    # instead of a FASTA. Recover the source FASTA from its 'file' column
+    # (same convention phlag.py's read_caster_scores relies on) and the
+    # window/step (or chunk/step) that produced it from a 'w<...>_s<...>'/
+    # 'c<...>_s<...>'/'c<...>_s<...>_site' path segment, then recompute and
+    # overwrite that exact path -- regardless of --bench, since the
+    # destination is already given.
+    if args.fasta_file.suffix == ".tsv" and args.fasta_file.exists():
+        regen_output_path = args.fasta_file.resolve()
+        source_fasta = recover_source_fasta(regen_output_path)
+        if source_fasta is None:
+            sys.exit(f"Error: Could not recover source FASTA path from 'file' column in '{regen_output_path}'.")
+        if not source_fasta.is_absolute():
+            for base in (pathlib.Path.cwd(), repo_root):
+                candidate = base / source_fasta
+                if candidate.exists():
+                    source_fasta = candidate
+                    break
+        if not source_fasta.exists():
+            sys.exit(f"Error: Source FASTA '{source_fasta}' (recovered from '{regen_output_path}') no longer exists.")
+
+        ws = parse_ws_from_path(regen_output_path)
+        if ws:
+            mode, val, step, is_site, is_zscale, is_normalize = ws
+            args.step_size = step
+            args.zscale = is_zscale
+            args.normalize = is_normalize
+            if mode == "c" and is_site:
+                args.site = True
+                args.pair = False
+                args.chunk_size = val
+            elif mode == "c":
+                args.pair = True
+                args.site = False
+                args.chunk_size = val
+            else:
+                args.pair = False
+                args.site = False
+                args.window_size = val
+
+        print(f"Regenerating '{regen_output_path}' from source FASTA '{source_fasta}'...")
+        args.fasta_file = source_fasta
+        args.output_file = regen_output_path
+        args.bench = False
+
     # Ground-truth locus pattern (e.g. '37-62') for CasterPlotter's scatter.png shading.
     window_str = format_val(args.window_size)
     step_str = format_val(args.step_size)
     norm_suffix = "_n" if args.normalize else ""
+    zscale_suffix = "_z" if args.zscale else ""
     clean_stem = clean_locus_name(args.fasta_file.stem)
     left_str = format_val(args.left)
     right_str = format_val(args.right if args.right is not None else 0)
@@ -660,61 +1029,91 @@ def main(argv=None):
         cats = get_simulation_categories(args.fasta_file)
         short_sim = get_short_sim_name(sim_dir.name)
 
-    if args.bench:
-        # --bench (set only by benchmark's own subprocess invocations) keeps
-        # scores.tsv in the shared canonical tree, keyed only by window/step
-        # -- caster's windowed dstar statistics don't depend on dist_type or
-        # --output-base/--base at all (those only select a phlag-side
-        # model/variant tree), so every dist_type/--base variant reads and
-        # writes the same cached scores.tsv here instead of each getting its
-        # own copy recomputed from scratch. Lives in its own store/caster/
-        # tree, not nested under store/phlag/, since it isn't a phlag output.
-        # --pair keys this the same way it keys the standalone tree
-        # (c<chunk>_s<step>, see below) -- otherwise a --pair run sharing a
-        # dstar run's -w/-s values would collide on the exact same cached
-        # scores.tsv, silently mixing quartet-branch scores with D* scores.
-        if args.pair:
-            pair_chunk = args.chunk_size if args.chunk_size is not None else args.window_size
-            caster_root = data_dir / "caster" / f"c{format_val(pair_chunk)}_s{step_str}"
-        else:
-            caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}"
-        if parsed:
-            rel_dir = parsed["relative_dir_no_window"]
-            final_output_path = caster_root / rel_dir / "scores.tsv"
-        elif is_sim:
-            pattern_stem = clean_stem
-            if cats:
-                final_output_path = caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
+    def _derive_output_path(normalize_flag):
+        """
+        Same derivation as below, parameterized on the normalize flag so the
+        --normalize short-circuit (see below) can also derive the sibling
+        un-normalized path (normalize_flag=False) that it reads from,
+        without duplicating this whole tree.
+        """
+        local_norm_suffix = "_n" if normalize_flag else ""
+        if args.bench:
+            # --bench (set only by benchmark's own subprocess invocations) keeps
+            # scores.tsv in the shared canonical tree, keyed only by window/step
+            # -- caster's windowed dstar statistics don't depend on dist_type or
+            # --output-base/--base at all (those only select a phlag-side
+            # model/variant tree), so every dist_type/--base variant reads and
+            # writes the same cached scores.tsv here instead of each getting its
+            # own copy recomputed from scratch. Lives in its own store/caster/
+            # tree, not nested under store/phlag/, since it isn't a phlag output.
+            # --pair/--site key this the same way they key the standalone tree
+            # (c<chunk>_s<step>[_site], see below) -- otherwise a --pair/--site
+            # run sharing a dstar run's -w/-s values would collide on the exact
+            # same cached scores.tsv, silently mixing quartet-branch scores with
+            # D* scores; the '_site' suffix likewise keeps --site from colliding
+            # with a --pair run sharing the same chunk/step. --normalize appends
+            # norm_suffix ("_n") to the size prefix for the same reason --
+            # normalized and raw scores are numerically different outputs and
+            # must not share a cache entry; --zscale appends zscale_suffix ("_z")
+            # for the same reason.
+            if args.pair or args.site:
+                chunk = args.chunk_size if args.chunk_size is not None else args.window_size
+                site_suffix = "_site" if args.site else ""
+                caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{site_suffix}{zscale_suffix}{local_norm_suffix}"
             else:
-                final_output_path = caster_root / short_sim / pattern_stem / "scores.tsv"
+                caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}{local_norm_suffix}"
+            if parsed:
+                rel_dir = parsed["relative_dir_no_window"]
+                return caster_root / rel_dir / "scores.tsv"
+            elif is_sim:
+                pattern_stem = clean_stem
+                if cats:
+                    return caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
+                else:
+                    return caster_root / short_sim / pattern_stem / "scores.tsv"
+            else:
+                pattern_stem = clean_stem
+                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{local_norm_suffix}.tsv"
+                return caster_root / pattern_stem / final_output_name
         else:
-            pattern_stem = clean_stem
-            final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{norm_suffix}.tsv"
-            final_output_path = caster_root / pattern_stem / final_output_name
-    else:
-        # Standalone use (the default): no shared/canonical tree, no
-        # dist_type/category/pattern nesting -- everything for a node lands
-        # under <repo_root>/out/w<W>_s<S>/<node_name>/<node_name>.tsv,
-        # alongside phlag's report.tsv for the same node (see phlag.py).
-        # Node name is the short simulation name for sim inputs, the alt
-        # name for parsed null/alt filenames, or the cleaned stem otherwise.
-        if parsed:
-            node_name = get_short_sim_name(parsed["alt"])
-        elif is_sim:
-            node_name = short_sim
-        else:
-            node_name = clean_stem
-        if args.pair:
-            # --pair's chunk-rollup granularity is an independent axis from
-            # dstar's window/step (it may not even be run for the same node),
-            # so its output gets its own out/c<chunk>_s<step>/<node_name>/
-            # prefix instead of colliding with dstar's out/w<W>_s<S>/<node_name>/.
-            pair_chunk = args.chunk_size if args.chunk_size is not None else args.window_size
-            pair_chunk_str = format_val(pair_chunk)
-            pair_step_str = format_val(args.step_size)
-            final_output_path = repo_root / "out" / f"c{pair_chunk_str}_s{pair_step_str}" / node_name / f"{node_name}.tsv"
-        else:
-            final_output_path = repo_root / "out" / f"w{window_str}_s{step_str}" / node_name / f"{node_name}.tsv"
+            # Standalone use (the default): no shared/canonical tree, no
+            # dist_type/category nesting -- everything for a node lands under
+            # <repo_root>/out/w<W>_s<S>[_z][_n]/<node_name>/<node_name>.tsv,
+            # alongside phlag's report.tsv for the same node (see phlag.py).
+            # Node name is the short simulation name for sim inputs, the alt
+            # name for parsed null/alt filenames, or the cleaned stem otherwise.
+            # Experiment (parsed null/alt) files additionally nest a <pattern>
+            # subdir under node_name -- <node_name>/<pattern>/<node_name>.tsv --
+            # mirroring the canonical tree's relative_dir_no_window, since
+            # multiple loci/patterns can share one node_name; sim/plain-file
+            # inputs stay flat (no pattern-equivalent worth nesting on).
+            if parsed:
+                node_name = get_short_sim_name(parsed["alt"])
+            elif is_sim:
+                node_name = short_sim
+            else:
+                node_name = clean_stem
+            node_rel = pathlib.Path(node_name, parsed["pattern"]) if parsed else pathlib.Path(node_name)
+            if args.pair or args.site:
+                # --pair's/--site's chunk-rollup granularity is an independent
+                # axis from dstar's window/step (it may not even be run for the
+                # same node), so their output gets its own
+                # out/c<chunk>_s<step>[_site][_z][_n]/<node_name>/ prefix instead
+                # of colliding with dstar's out/w<W>_s<S>/<node_name>/ -- the
+                # '_site' suffix keeps --site from colliding with a --pair run
+                # sharing the same chunk/step, and '_z'/'_n' (--zscale/--normalize)
+                # keep those from colliding with raw/un-zscaled output the same
+                # way the canonical tree distinguishes them.
+                chunk = args.chunk_size if args.chunk_size is not None else args.window_size
+                chunk_str = format_val(chunk)
+                step_str_local = format_val(args.step_size)
+                site_suffix = "_site" if args.site else ""
+                size_dir = f"c{chunk_str}_s{step_str_local}{site_suffix}{zscale_suffix}{local_norm_suffix}"
+            else:
+                size_dir = f"w{window_str}_s{step_str}{zscale_suffix}{local_norm_suffix}"
+            return repo_root / "out" / size_dir / node_rel / f"{node_name}.tsv"
+
+    final_output_path = _derive_output_path(args.normalize)
 
     # -o override (standalone use only -- ignored under --bench, where the
     # canonical tree always wins): redirects where scores.tsv itself gets
@@ -722,6 +1121,24 @@ def main(argv=None):
     if args.output_file and not args.bench:
         final_output_path = args.output_file
     plot_data_dir = final_output_path.parent
+
+    # --normalize short-circuit: if the un-normalized sibling scores.tsv (same
+    # -w/-s or --pair/--site chunk/step, same --bench canonical cache) already
+    # exists, just normalize its rows into final_output_path instead of
+    # re-running dstar/caster-pair/caster-site from scratch.
+    if args.normalize and args.bench:
+        unnormalized_path = _derive_output_path(False)
+        if unnormalized_path != final_output_path and unnormalized_path.exists():
+            print(f"Found un-normalized scores at '{unnormalized_path}' -- normalizing without recomputing caster...")
+            apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair)
+            print(f"Success: TSV output file generated at: {final_output_path}")
+            write_ground_truth_stats(
+                scores_file=str(final_output_path.resolve()),
+                output_dir=str(plot_data_dir.resolve()),
+                locus_pattern=locus_pattern,
+                topologies=args.topologies,
+            )
+            return final_output_path
 
     if not args.fasta_file.exists():
         sys.exit(f"Error: FASTA file not found at '{args.fasta_file}'")
@@ -795,6 +1212,8 @@ def main(argv=None):
 
     if args.pair:
         return run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
+    if args.site:
+        return run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
 
     # Run dstar binary on original fasta file directly, then aggregate its
     # fine-grained (step_size-spaced) rows into rolling window_size averages
@@ -893,19 +1312,22 @@ def main(argv=None):
                         'qcnt': avg_qcnt
                     })
 
-        # If normalization is requested, apply min-max scaling to [0, 1] for each score column
-        if args.normalize and len(results) > 0:
-            for key in ['abba', 'baba', 'aabb', 'dstar']:
-                vals = [r[key] for r in results]
-                min_val = min(vals)
-                max_val = max(vals)
-                diff = max_val - min_val
-                if diff == 0:
-                    for r in results:
-                        r[key] = 0.0
-                else:
-                    for r in results:
-                        r[key] = (r[key] - min_val) / diff
+        if args.normalize:
+            # D* itself is invariant to this rescaling (same denominator
+            # cancels) -- only the c*ABBA/c*BABA/c*AABB columns change, into
+            # proportions of their own row sum (mirroring caster-pair.cpp's
+            # q1/q2/q3; NOT the same as dividing by QuartetCnt, a per-site
+            # sequence-depth product unrelated to this sum -- see dstar.cpp's
+            # quartetCnt()). Applied at write time (after window
+            # rolling-average, like --zscale below) so the --normalize
+            # short-circuit above can reproduce it exactly from an
+            # already-window-averaged un-normalized scores.tsv.
+            apply_normalize(results, ['abba', 'baba', 'aabb'])
+
+        if args.zscale:
+            # D* itself is left as originally computed from the raw sums --
+            # only the c*ABBA/c*BABA/c*AABB columns phlag reads get rescaled.
+            apply_zscale(results, ['abba', 'baba', 'aabb'])
 
         output_lines = ["file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"]
         for r in results:
@@ -946,7 +1368,7 @@ def main(argv=None):
     )
 
     if args.plot:
-        plot_scores = "scores" in args.plot
+        plot_scores = "scores" in args.plot or "scatter" in args.plot
 
         if plot_scores:
             CasterPlotter(

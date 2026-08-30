@@ -592,10 +592,19 @@ class RunRecord:
     em_gt_hd: Optional[float] = None
     null_mean_norm: Optional[float] = None
     null_cov_norm: Optional[float] = None
+    null_mean_ABBA: Optional[float] = None
+    null_mean_BABA: Optional[float] = None
+    null_mean_AABB: Optional[float] = None
     alt_mean_norm: Optional[float] = None
     alt_cov_norm: Optional[float] = None
+    alt_mean_ABBA: Optional[float] = None
+    alt_mean_BABA: Optional[float] = None
+    alt_mean_AABB: Optional[float] = None
     pooled_mean_norm: Optional[float] = None
     pooled_cov_norm: Optional[float] = None
+    pooled_mean_ABBA: Optional[float] = None
+    pooled_mean_BABA: Optional[float] = None
+    pooled_mean_AABB: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -961,7 +970,9 @@ class BenchmarkStats:
         record.em_hd = parsed["em_hd"]
         record.em_gt_hd = parsed["em_gt_hd"]
 
-        # Global mean/covariance norms (Null, Alt, Overall/pooled) -- from
+        # Global mean/covariance norms (Null, Alt, Overall/pooled), plus the
+        # raw per-topology mean vector itself (ABBA/BABA/AABB, matching
+        # phlag/caster.py's write_ground_truth_stats topo_order) -- from
         # caster's gt_stats.txt (see phlag/caster.py's write_ground_truth_stats),
         # not report.tsv itself: that file carries the joint (cross-topology)
         # mean/covariance this needs, computed once by caster rather than
@@ -982,6 +993,8 @@ class BenchmarkStats:
             cov_arr = np.asarray(gt_stats[label][1], dtype=float)
             setattr(record, f"{prefix}_mean_norm", float(np.linalg.norm(mean_arr)))
             setattr(record, f"{prefix}_cov_norm", float(np.linalg.norm(cov_arr)))
+            for topo, val in zip(TOPOLOGY_NAMES, mean_arr):
+                setattr(record, f"{prefix}_mean_{topo}", float(val))
 
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
@@ -1273,8 +1286,11 @@ class BenchmarkStats:
         "mean_relerr_agg", "covar_relerr_agg",
         "em_hd", "em_gt_hd",
         "null_mean_norm", "null_cov_norm",
+        "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
         "alt_mean_norm", "alt_cov_norm",
+        "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
         "pooled_mean_norm", "pooled_cov_norm",
+        "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
@@ -1357,10 +1373,19 @@ class BenchmarkStats:
                     "em_gt_hd": record.em_gt_hd,
                     "null_mean_norm": record.null_mean_norm,
                     "null_cov_norm": record.null_cov_norm,
+                    "null_mean_ABBA": record.null_mean_ABBA,
+                    "null_mean_BABA": record.null_mean_BABA,
+                    "null_mean_AABB": record.null_mean_AABB,
                     "alt_mean_norm": record.alt_mean_norm,
                     "alt_cov_norm": record.alt_cov_norm,
+                    "alt_mean_ABBA": record.alt_mean_ABBA,
+                    "alt_mean_BABA": record.alt_mean_BABA,
+                    "alt_mean_AABB": record.alt_mean_AABB,
                     "pooled_mean_norm": record.pooled_mean_norm,
                     "pooled_cov_norm": record.pooled_cov_norm,
+                    "pooled_mean_ABBA": record.pooled_mean_ABBA,
+                    "pooled_mean_BABA": record.pooled_mean_BABA,
+                    "pooled_mean_AABB": record.pooled_mean_AABB,
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -2097,8 +2122,10 @@ CASTER_ARG_SPECS = [
     ("normalize", "-n", True),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
+    ("site", "--site", True),
     ("chunk_size", "--chunk", False),
     ("chunk_scores", "--chunk-scores", False),
+    ("zscale", "-z", True),
 ]
 PHLAG_ARG_SPECS = [
     ("null_emission_parameterization", "--np", False),
@@ -2112,6 +2139,8 @@ PHLAG_ARG_SPECS = [
     ("silhouette_threshold", "-t", False),
     ("best_paths", "-p", False),
     ("correct_transition", "--correct-transition", False),
+    ("rho", "--rho", False),
+    ("beta", "--beta", False),
 ]
 MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, _ in PHLAG_ARG_SPECS]
 
@@ -2300,12 +2329,20 @@ def _build_parser():
         help="Forwarded to caster's --pair (caster-pair/quartet-scoring mode instead of dstar).",
     )
     caster_group.add_argument(
-        "--chunk", dest="chunk_size", type=int_or_abbrev, default=None,
-        help="Forwarded to caster's --chunk (default: -w's window size).",
+        "--site", dest="site", action="store_true",
+        help="Forwarded to caster's --site (caster-site mode instead of dstar; mutually exclusive with --pair).",
+    )
+    caster_group.add_argument(
+        "-c", "--chunk", dest="chunk_size", type=int_or_abbrev, default=None,
+        help="Forwarded to caster's -c/--chunk (default: -w's window size).",
     )
     caster_group.add_argument(
         "--chunk-scores", dest="chunk_scores", type=str, default=None,
         help="Forwarded to caster's --chunk-scores.",
+    )
+    caster_group.add_argument(
+        "-z", "--zscale", dest="zscale", action="store_true",
+        help="Forwarded to caster's -z/--zscale.",
     )
 
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
@@ -2355,6 +2392,16 @@ def _build_parser():
     phlag_group.add_argument(
         "--correct-transition", dest="correct_transition", nargs="?", const="auto", default=None,
         help="Forwarded to phlag's --correct-transition.",
+    )
+    phlag_group.add_argument(
+        "--rho", dest="rho", type=float, default=None,
+        help="Forwarded to phlag's --rho. Must be set together with --beta; "
+             "omitting both disables the transition prior (default: unset, no prior).",
+    )
+    phlag_group.add_argument(
+        "--beta", dest="beta", type=float, default=None,
+        help="Forwarded to phlag's --beta. Must be set together with --rho; "
+             "omitting both disables the transition prior (default: unset, no prior).",
     )
 
     parser.add_argument(
@@ -2454,7 +2501,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                                pair=False, chunk_size=None):
+                                pair=False, site=False, chunk_size=None, normalize=False, zscale=False):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2465,9 +2512,13 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     tree reads the same cached scores.tsv instead of each getting its own
     copy recomputed from scratch.
 
-    ``pair``/``chunk_size`` mirror phlag/caster.py's own --bench keying:
-    when pair is set, the tree is keyed store/caster/c<chunk>_s<S>/ instead,
-    so a --pair run never collides with a dstar run sharing the same -w/-s.
+    ``pair``/``site``/``chunk_size`` mirror phlag/caster.py's own --bench
+    keying: when pair or site is set, the tree is keyed
+    store/caster/c<chunk>_s<S>[_site]/ instead, so a --pair/--site run never
+    collides with a dstar run (or each other) sharing the same -w/-s.
+    ``normalize`` similarly appends "_n" to the size prefix, since normalized
+    and raw D* scores are numerically different outputs and must not share
+    a cache entry; ``zscale`` appends "_z" for the same reason.
 
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
@@ -2478,11 +2529,14 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     short_sim = get_short_sim_name(leaf_dir.name)
 
     step_str = format_val(step_size)
-    if pair:
+    site_suffix = "_site" if site else ""
+    zscale_suffix = "_z" if zscale else ""
+    norm_suffix = "_n" if normalize else ""
+    if pair or site:
         pair_chunk = chunk_size if chunk_size is not None else window_size
-        size_prefix = f"c{format_val(pair_chunk)}_s{step_str}"
+        size_prefix = f"c{format_val(pair_chunk)}_s{step_str}{site_suffix}{zscale_suffix}{norm_suffix}"
     else:
-        size_prefix = f"w{format_val(window_size)}_s{step_str}"
+        size_prefix = f"w{format_val(window_size)}_s{step_str}{zscale_suffix}{norm_suffix}"
     base = get_data_dir() / "caster" / size_prefix
     if cats:
         return base / cats[0] / cats[1] / short_sim
@@ -2491,13 +2545,13 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                             pair=False, chunk_size=None):
+                             pair=False, site=False, chunk_size=None, normalize=False, zscale=False):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
-        pair=pair, chunk_size=chunk_size,
+        pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2681,7 +2735,7 @@ def run_all(args, sim_root, out_dir):
 
         scores_path = get_expected_scores_path(
             fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
-            pair=args.pair, chunk_size=args.chunk_size
+            pair=args.pair, site=args.site, chunk_size=args.chunk_size, normalize=args.normalize, zscale=args.zscale,
         )
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
@@ -2763,8 +2817,11 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["
     for stat in RELERR_STATISTICS
 ] + ["em_hd", "em_gt_hd"] + [
     "null_mean_norm", "null_cov_norm",
+    "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
     "alt_mean_norm", "alt_cov_norm",
+    "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
     "pooled_mean_norm", "pooled_cov_norm",
+    "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
 ] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
