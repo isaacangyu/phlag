@@ -61,19 +61,38 @@ def recover_source_fasta(scores_path):
 
 def parse_ws_from_path(path):
     """
-    Recovers (mode, window_or_chunk, step, is_site, is_zscale, is_normalize)
+    Recovers (mode, window_or_chunk, step, is_site, is_zscale, is_ilr, is_normalize)
     from a 'w<...>_s<...>' (dstar), 'c<...>_s<...>' (--pair), or
-    'c<...>_s<...>[_site][_z][_n]' (--site/--zscale/--normalize) path
-    segment, as written by both caster.py's standalone out/ tree and the
-    canonical store/caster/ tree. Returns None if no such segment is found
-    anywhere in path's parts.
+    'c<...>_s<...>[_site][_z][_i][_n]' (--site/--zscale/--ilr/--normalize) path
+    segment, as written by caster.py's standalone out/ tree (flat suffixes)
+    and older canonical store/caster/ runs (same flat suffixes). The current
+    canonical store/caster/ tree instead nests 'site'/'ilr'/'normalize' as
+    their own path components right after the size segment (zscale stays a
+    flat '_z' suffix there) -- so after matching the size segment, also
+    consume any immediately-following 'site'/'ilr'/'normalize' components,
+    OR'd into whatever the flat suffixes already captured. Returns None if
+    no 'w'/'c'-prefixed size segment is found anywhere in path's parts.
     """
-    for part in path.parts:
-        m = re.match(r'^([wc])(\d+[km]?)_s(\d+[km]?)(_site)?(_z)?(_n)?$', part, re.IGNORECASE)
+    parts = path.parts
+    for i, part in enumerate(parts):
+        m = re.match(r'^([wc])(\d+[km]?)_s(\d+[km]?)(_site)?(_z)?(_i)?(_n)?$', part, re.IGNORECASE)
         if m:
+            is_site = bool(m.group(4))
+            is_zscale = bool(m.group(5))
+            is_ilr = bool(m.group(6))
+            is_normalize = bool(m.group(7))
+            for nested in parts[i + 1:]:
+                if nested == "site":
+                    is_site = True
+                elif nested == "ilr":
+                    is_ilr = True
+                elif nested == "normalize":
+                    is_normalize = True
+                else:
+                    break
             return (
                 m.group(1).lower(), int_or_abbrev(m.group(2)), int_or_abbrev(m.group(3)),
-                bool(m.group(4)), bool(m.group(5)), bool(m.group(6)),
+                is_site, is_zscale, is_ilr, is_normalize,
             )
     return None
 
@@ -176,6 +195,133 @@ def apply_normalize_to_scores_file(src_path, dst_path, has_q123):
         raise
 
 
+class _SkbioDeviceArray(np.ndarray):
+    """
+    Zero-copy ndarray view exposing a `.device` property. skbio 0.7.0's
+    `ilr()` unconditionally reads `mat.device` (part of the Python array API
+    standard) -- a real ndarray only gained that attribute in numpy 2.0, but
+    this project is pinned to numpy<2.0 (via jax==0.4.30), so calling
+    `ilr()` on a plain ndarray raises AttributeError. This shim (verified
+    numerically identical to a working `ilr()` call) works around that
+    version mismatch without touching the pinned numpy/skbio versions.
+    """
+    @property
+    def device(self):
+        return "cpu"
+
+
+def apply_ilr(rows, keys, out_keys):
+    """
+    Replaces rows' `keys` (dict keys into `rows`, a list of dicts) with
+    their len(keys)-1 isometric-log-ratio (ILR) coordinates under `out_keys`
+    (must have length len(keys) - 1), computed via skbio.stats.composition:
+      0. per-row shift -- dstar's raw counts are genuine non-negative
+         site-pattern counts, but caster-pair's/caster-site's raw c*ABBA/
+         c*BABA/c*AABB are CASTER's internal scoreCnt() quartet-support
+         statistic instead (a signed evidence score, not a count) and can
+         be negative -- verified directly against a real --site run.
+         closure()/ilr() require strictly positive parts, so any row with a
+         non-positive component is shifted up by that row's own
+         |min| (relative-scaled, plus a tiny absolute floor) before closure,
+         preserving the relative differences between the 3 parts within
+         that row (an additive shift, not a rescale). Rows already all
+         positive are left untouched.
+      1. closure -- close each row to proportions summing to 1.
+      2. multi_replace -- replace exact zeros with a small value,
+         proportionally shrinking the other parts so the row still sums to
+         1 (standard compositional-data-analysis zero handling; ilr's log
+         step is undefined at 0).
+      3. ilr -- map to len(keys)-1 real-valued coordinates (default
+         Egozcue/Gram-Schmidt orthonormal basis).
+    A row whose `keys` sum to exactly 0 (e.g. a window with no informative
+    sites for any of the 3 topologies) is remapped to a uniform composition
+    *before* closure -- closure's own 0/0 division would otherwise produce
+    NaN, which multi_replace/ilr would silently propagate. This mirrors
+    apply_normalize's identical "1/N each if the sum is 0" fallback for the
+    same edge case, just applied one step earlier (as input to closure
+    rather than as the final value).
+    Mutates `rows` in place: pops `keys` and inserts `out_keys` (in row-dict
+    insertion order, i.e. at the end) in their place, preserving every
+    other key. Do not call this after apply_zscale, whose rescaled values
+    can be negative in a way that no longer reflects the underlying
+    scoreCnt() statistic (this is exactly why -i/--ilr and -z/--zscale are
+    mutually exclusive at the CLI level).
+    """
+    if not rows:
+        return rows
+    from skbio.stats.composition import closure, multi_replace, ilr as skbio_ilr
+
+    arr = np.array([[row[k] for k in keys] for row in rows], dtype=np.float64)
+
+    # Only genuinely negative rows are shifted -- exact zeros are left for
+    # multi_replace below (its proportional zero-replacement, not an
+    # arbitrary additive shift, is the more standard CoDA treatment for a
+    # part that's legitimately absent rather than negative-valued).
+    row_min = arr.min(axis=1, keepdims=True)
+    needs_shift = row_min[:, 0] < 0
+    if needs_shift.any():
+        arr = arr.copy()
+        shift_amount = np.abs(row_min) * 1e-6 + 1e-9
+        shift = np.where(row_min < 0, -row_min + shift_amount, 0.0)
+        arr += shift
+
+    zero_rows = arr.sum(axis=1) == 0
+    if zero_rows.any():
+        arr = arr.copy()
+        arr[zero_rows] = 1.0  # closes to a uniform composition below
+
+    # multi_replace squeezes a single-row (1, D) input down to (D,) (an
+    # skbio 0.7.0 quirk) -- atleast_2d restores the batch dimension so a
+    # file with exactly one window doesn't break the ilr() call below.
+    closed = np.atleast_2d(np.asarray(multi_replace(closure(arr))))
+    coords = np.asarray(skbio_ilr(closed.view(_SkbioDeviceArray)))
+    assert coords.shape[1] == len(out_keys)
+
+    for row, vals in zip(rows, coords):
+        for k in keys:
+            del row[k]
+        for k, v in zip(out_keys, vals):
+            row[k] = float(v)
+    return rows
+
+
+def apply_ilr_to_scores_file(src_path, dst_path, has_q123):
+    """
+    Reads an already-written scores TSV at `src_path` (raw, un-transformed
+    c*ABBA/c*BABA/c*AABB counts), replaces those 3 columns with their 2 ILR
+    coordinates (c*ILR1/c*ILR2) via apply_ilr, and writes the result to
+    `dst_path` atomically -- mirrors apply_normalize_to_scores_file's
+    split-path/atomic-write shape exactly (not apply_zscale_to_scores_file's
+    simpler in-place-only shape), since this is used both in-place
+    (run_caster_pair/run_caster_site, src_path == dst_path == chunk_scores_path,
+    right after their own K-rollup) and out-of-place (the --bench --ilr
+    short-circuit in main(), src_path = a cached raw sibling, dst_path =
+    final_output_path, to avoid re-running dstar/caster-pair/caster-site
+    from scratch).
+    If q1/q2/q3 are also present (--pair), they are dropped entirely --
+    they were proportions of the original 3-part composition and have no
+    meaningful equivalent once it's replaced by 2 ILR coordinates.
+    """
+    df = pd.read_csv(src_path, sep="\t")
+    rows = df.to_dict("records")
+    apply_ilr(rows, ["c*ABBA", "c*BABA", "c*AABB"], ["c*ILR1", "c*ILR2"])
+    if has_q123:
+        for row in rows:
+            del row["q1"], row["q2"], row["q3"]
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(dst_path.parent), prefix=".scores_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            pd.DataFrame(rows).to_csv(f, sep="\t", index=False)
+        os.replace(tmp_path, dst_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def get_fasta_length(fasta_path):
     length = 0
     with open(fasta_path, "r") as f:
@@ -205,9 +351,9 @@ class CasterPlotter:
         self.load_data()
 
         # Transform/source tag for the plot title -- recovered from the
-        # w<W>_s<S>[_z][_n]/c<chunk>_s<step>[_site][_z][_n] path segment
-        # (see parse_ws_from_path) so the plot always states which columns
-        # and which rescaling it's actually showing, matching what
+        # w<W>_s<S>[_z][_i][_n]/c<chunk>_s<step>[_site][_z][_i][_n] path
+        # segment (see parse_ws_from_path) so the plot always states which
+        # columns and which rescaling it's actually showing, matching what
         # phlag.py's read_caster_scores feeds the HMM. Falls back to
         # detecting q1/q2/q3 presence (--pair's own tell, since --site never
         # writes those columns) when the path doesn't encode it (e.g. a
@@ -215,9 +361,9 @@ class CasterPlotter:
         ws = parse_ws_from_path(pathlib.Path(scores_file))
         has_q123 = self.df is not None and all(c in self.df.columns for c in ('q1', 'q2', 'q3'))
         if ws:
-            mode, _, _, is_site, is_zscale, is_normalize = ws
+            mode, _, _, is_site, is_zscale, is_ilr, is_normalize = ws
             source = "site" if (mode == "c" and is_site) else ("pair" if mode == "c" else "dstar")
-            transform_bits = [b for b, on in (("zscaled", is_zscale), ("normalized", is_normalize)) if on]
+            transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize)) if on]
             tag_parts = [source] + (transform_bits or ["raw"])
         else:
             # Path doesn't encode a recognizable size-dir segment (e.g. a
@@ -348,7 +494,12 @@ class CasterPlotter:
         melted_df = renamed_df.melt(id_vars=['pos'], value_vars=clean_cols,
                                  var_name='Topology', value_name='Score')
 
-        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=self.topo_colors, alpha=0.6, s=12)
+        # self.topo_colors is keyed by ABBA/BABA/AABB only -- an ILR-transformed
+        # file's clean_cols are 'c*ILR1'/'c*ILR2' (resolve_topology_columns
+        # doesn't rename those, no ABBA/BABA/AABB substring to match), so
+        # seaborn's palette= would KeyError on an unrecognized hue level.
+        palette = self.topo_colors if set(clean_cols) <= set(self.topo_colors) else None
+        sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=palette, alpha=0.6, s=12)
 
         # Draw vertical split lines and shade alt regions if a ground truth pattern is known
         pattern_str = self._ground_truth_pattern()
@@ -667,6 +818,28 @@ def build_parser():
              "cancellation in phlag's Gaussian fit otherwise; works for dstar's D* output "
              "too, though its own raw sums are already a numerically-safe ~1e4-1e5 scale."
     )
+    parser.add_argument(
+        "-i",
+        "--ilr",
+        dest="ilr",
+        action="store_true",
+        default=False,
+        help="Replace each output row's 3 c*ABBA/c*BABA/c*AABB counts with their 2 "
+             "isometric-log-ratio (ILR) coordinates (c*ILR1/c*ILR2) instead -- a 3-part "
+             "composition has only 2 independent degrees of freedom once closed to "
+             "proportions, so this is a genuine dimensionality reduction, not a rescaling "
+             "like -z/--zscale. Implies closure to proportions internally (like "
+             "-n/--normalize) regardless of whether -n is also passed (harmless if so -- "
+             "a no-op, not a double-transform). --pair/--site's raw scores are CASTER's "
+             "signed scoreCnt() support statistic (not a count) and can be negative, "
+             "unlike dstar's; any row with a non-positive part is shifted to positive "
+             "first (preserving relative differences), then zeros are handled via "
+             "skbio's multiplicative-replacement technique before taking logs. Drops "
+             "q1/q2/q3 entirely for --pair (they were proportions of the original 3-part "
+             "composition, meaningless once replaced by 2 ILR coordinates). Mutually "
+             "exclusive with -z/--zscale (rescaling before ILR corrupts the composition; "
+             "rescaling the resulting ILR coordinates themselves is not supported)."
+    )
     return parser
 
 
@@ -775,7 +948,9 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
                 })
         pd.DataFrame(agg_rows).to_csv(chunk_scores_path, sep="\t", index=False)
 
-    if args.normalize:
+    if args.ilr:
+        apply_ilr_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True)
+    elif args.normalize:
         apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True)
 
     if args.zscale:
@@ -861,12 +1036,13 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
     window_size = args.chunk_size if args.chunk_size is not None else args.window_size
     site_step = min(args.step_size, window_size)
 
-    print(f"Running caster-site on '{args.fasta_file}' with branch mapping '{args.mapping}', chunk(window)={window_size}, step={site_step}...")
+    print(f"Running caster-site on '{args.fasta_file}' with branch mapping '{args.mapping}', chunk(step)={site_step}, window={window_size}...")
     cmd = [
         str(binary_path),
         "--branch-mapping", str(args.mapping.resolve()),
         "--chunk-scores", str(chunk_scores_path.resolve()),
         "--chunk", str(site_step),
+        "--window", str(window_size),
         str(args.fasta_file.resolve()),
     ]
     try:
@@ -874,30 +1050,20 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
     except subprocess.CalledProcessError as e:
         sys.exit(f"Error running 'caster-site' binary:\nCommand: {e.cmd}\nExit Code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
-    # caster-site itself only ever partitions a locus into non-overlapping
-    # --chunk-sized blocks -- same rolling fine-grained-rows -> sliding-window
-    # trick as run_caster_pair, since it has no native step/stride concept.
-    K = max(1, window_size // site_step)
-    if K > 1:
+    # caster-site now does the fine-chunk -> sliding-window rolling itself
+    # (dividing each window's quartet sums by that window's own
+    # informative-site count, since --chunk's site-filter makes that count
+    # vary chunk to chunk -- a raw sum would bias windows with more
+    # informative sites). Only the cosmetic shift-to-window-center remains
+    # here, since it's a pure pos-column offset unrelated to aggregation.
+    if args.shift_caster:
         raw_df = pd.read_csv(chunk_scores_path, sep="\t")
-        agg_rows = []
-        for source_file, locus_df in raw_df.groupby("file", sort=False):
-            locus_df = locus_df.sort_values("pos").reset_index(drop=True)
-            for i in range(len(locus_df) - K + 1):
-                window = locus_df.iloc[i:i + K]
-                pos_val = int(locus_df.iloc[i]["pos"])
-                if args.shift_caster:
-                    pos_val += window_size // 2
-                agg_rows.append({
-                    "file": source_file,
-                    "pos": pos_val,
-                    "c*ABBA": window["c*ABBA"].sum(),
-                    "c*BABA": window["c*BABA"].sum(),
-                    "c*AABB": window["c*AABB"].sum(),
-                })
-        pd.DataFrame(agg_rows).to_csv(chunk_scores_path, sep="\t", index=False)
+        raw_df["pos"] = raw_df["pos"] + window_size // 2
+        raw_df.to_csv(chunk_scores_path, sep="\t", index=False)
 
-    if args.normalize:
+    if args.ilr:
+        apply_ilr_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
+    elif args.normalize:
         apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
 
     if args.zscale:
@@ -934,6 +1100,9 @@ def main(argv=None):
 
     if args.pair and args.site:
         sys.exit("Error: --pair and --site are mutually exclusive.")
+
+    if args.ilr and args.zscale:
+        sys.exit("Error: --ilr and --zscale are mutually exclusive.")
 
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
@@ -983,9 +1152,10 @@ def main(argv=None):
 
         ws = parse_ws_from_path(regen_output_path)
         if ws:
-            mode, val, step, is_site, is_zscale, is_normalize = ws
+            mode, val, step, is_site, is_zscale, is_ilr, is_normalize = ws
             args.step_size = step
             args.zscale = is_zscale
+            args.ilr = is_ilr
             args.normalize = is_normalize
             if mode == "c" and is_site:
                 args.site = True
@@ -1029,14 +1199,17 @@ def main(argv=None):
         cats = get_simulation_categories(args.fasta_file)
         short_sim = get_short_sim_name(sim_dir.name)
 
-    def _derive_output_path(normalize_flag):
+    def _derive_output_path(normalize_flag, ilr_flag):
         """
-        Same derivation as below, parameterized on the normalize flag so the
-        --normalize short-circuit (see below) can also derive the sibling
-        un-normalized path (normalize_flag=False) that it reads from,
-        without duplicating this whole tree.
+        Same derivation as below, parameterized on the normalize/ilr flags so
+        the --normalize/--ilr short-circuits (see below) can also derive the
+        sibling raw path (both flags False) that they read from, without
+        duplicating this whole tree. --ilr implies closure, so its keying
+        takes the place of --normalize's, never stacking with it, even if
+        --normalize was also explicitly passed.
         """
-        local_norm_suffix = "_n" if normalize_flag else ""
+        local_norm_suffix = "_n" if (normalize_flag and not ilr_flag) else ""
+        local_ilr_suffix = "_i" if ilr_flag else ""
         if args.bench:
             # --bench (set only by benchmark's own subprocess invocations) keeps
             # scores.tsv in the shared canonical tree, keyed only by window/step
@@ -1047,21 +1220,29 @@ def main(argv=None):
             # own copy recomputed from scratch. Lives in its own store/caster/
             # tree, not nested under store/phlag/, since it isn't a phlag output.
             # --pair/--site key this the same way they key the standalone tree
-            # (c<chunk>_s<step>[_site], see below) -- otherwise a --pair/--site
-            # run sharing a dstar run's -w/-s values would collide on the exact
-            # same cached scores.tsv, silently mixing quartet-branch scores with
-            # D* scores; the '_site' suffix likewise keeps --site from colliding
-            # with a --pair run sharing the same chunk/step. --normalize appends
-            # norm_suffix ("_n") to the size prefix for the same reason --
-            # normalized and raw scores are numerically different outputs and
-            # must not share a cache entry; --zscale appends zscale_suffix ("_z")
-            # for the same reason.
+            # (c<chunk>_s<step>, see below) -- otherwise a --pair/--site run
+            # sharing a dstar run's -w/-s values would collide on the exact
+            # same cached scores.tsv, silently mixing quartet-branch scores
+            # with D* scores. --site and --normalize each nest their own
+            # named subdirectory ('site'/'normalize') under the size segment
+            # instead of a flat suffix -- keeps the caster/ tree's directory
+            # names legible (c<chunk>_s<step>/site/normalize/... rather than
+            # c<chunk>_s<step>_site_n) -- '--site' likewise keeps --site from
+            # colliding with a --pair run sharing the same chunk/step, and
+            # 'normalize' keeps normalized and raw scores from sharing a
+            # cache entry. --zscale still appends a flat zscale_suffix ("_z")
+            # to the size segment itself, unchanged.
             if args.pair or args.site:
                 chunk = args.chunk_size if args.chunk_size is not None else args.window_size
-                site_suffix = "_site" if args.site else ""
-                caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{site_suffix}{zscale_suffix}{local_norm_suffix}"
+                caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
+                if args.site:
+                    caster_root = caster_root / "site"
             else:
-                caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}{local_norm_suffix}"
+                caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}"
+            if ilr_flag:
+                caster_root = caster_root / "ilr"
+            elif normalize_flag:
+                caster_root = caster_root / "normalize"
             if parsed:
                 rel_dir = parsed["relative_dir_no_window"]
                 return caster_root / rel_dir / "scores.tsv"
@@ -1073,7 +1254,7 @@ def main(argv=None):
                     return caster_root / short_sim / pattern_stem / "scores.tsv"
             else:
                 pattern_stem = clean_stem
-                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}{local_norm_suffix}.tsv"
+                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}.tsv"
                 return caster_root / pattern_stem / final_output_name
         else:
             # Standalone use (the default): no shared/canonical tree, no
@@ -1108,12 +1289,12 @@ def main(argv=None):
                 chunk_str = format_val(chunk)
                 step_str_local = format_val(args.step_size)
                 site_suffix = "_site" if args.site else ""
-                size_dir = f"c{chunk_str}_s{step_str_local}{site_suffix}{zscale_suffix}{local_norm_suffix}"
+                size_dir = f"c{chunk_str}_s{step_str_local}{site_suffix}{zscale_suffix}{local_ilr_suffix}{local_norm_suffix}"
             else:
-                size_dir = f"w{window_str}_s{step_str}{zscale_suffix}{local_norm_suffix}"
+                size_dir = f"w{window_str}_s{step_str}{zscale_suffix}{local_ilr_suffix}{local_norm_suffix}"
             return repo_root / "out" / size_dir / node_rel / f"{node_name}.tsv"
 
-    final_output_path = _derive_output_path(args.normalize)
+    final_output_path = _derive_output_path(args.normalize, args.ilr)
 
     # -o override (standalone use only -- ignored under --bench, where the
     # canonical tree always wins): redirects where scores.tsv itself gets
@@ -1122,12 +1303,68 @@ def main(argv=None):
         final_output_path = args.output_file
     plot_data_dir = final_output_path.parent
 
+    # Exact-cache check: if final_output_path itself already exists (this
+    # precise -w/-s[/--pair/--site]+ilr/normalize combination was already
+    # computed), skip regeneration entirely -- cheaper than even the
+    # raw-sibling short-circuits below, since no transform needs to be
+    # (re)applied at all. final_output_path already resolves to the
+    # mode-appropriate cache (store/caster/ under --bench, out/ standalone),
+    # so this check covers both without branching on args.bench itself.
+    if (args.ilr or args.normalize) and final_output_path.exists():
+        print(f"Found existing scores at '{final_output_path}' -- skipping regeneration.")
+        write_ground_truth_stats(
+            scores_file=str(final_output_path.resolve()),
+            output_dir=str(plot_data_dir.resolve()),
+            locus_pattern=locus_pattern,
+            topologies=args.topologies,
+        )
+        if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+            CasterPlotter(
+                scores_file=str(final_output_path.resolve()),
+                distribution=args.dist_type,
+                data_dir=str(plot_data_dir.resolve()),
+                topologies=args.topologies,
+                plot_scores=True,
+                locus_pattern=locus_pattern,
+            )
+        return final_output_path
+
+    # --ilr short-circuit: if the raw sibling scores.tsv (same -w/-s or
+    # --pair/--site chunk/step, same cache tree -- store/caster/ under
+    # --bench, out/ standalone) already exists, just compute ILR on its rows
+    # into final_output_path instead of re-running dstar/caster-pair/
+    # caster-site from scratch. Checked before --normalize's short-circuit
+    # below so --ilr wins if both are set.
+    if args.ilr:
+        raw_path = _derive_output_path(False, False)
+        if raw_path != final_output_path and raw_path.exists():
+            print(f"Found raw scores at '{raw_path}' -- computing ILR without recomputing caster...")
+            apply_ilr_to_scores_file(raw_path, final_output_path, has_q123=args.pair)
+            print(f"Success: TSV output file generated at: {final_output_path}")
+            write_ground_truth_stats(
+                scores_file=str(final_output_path.resolve()),
+                output_dir=str(plot_data_dir.resolve()),
+                locus_pattern=locus_pattern,
+                topologies=args.topologies,
+            )
+            if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+                CasterPlotter(
+                    scores_file=str(final_output_path.resolve()),
+                    distribution=args.dist_type,
+                    data_dir=str(plot_data_dir.resolve()),
+                    topologies=args.topologies,
+                    plot_scores=True,
+                    locus_pattern=locus_pattern,
+                )
+            return final_output_path
+
     # --normalize short-circuit: if the un-normalized sibling scores.tsv (same
-    # -w/-s or --pair/--site chunk/step, same --bench canonical cache) already
-    # exists, just normalize its rows into final_output_path instead of
-    # re-running dstar/caster-pair/caster-site from scratch.
-    if args.normalize and args.bench:
-        unnormalized_path = _derive_output_path(False)
+    # -w/-s or --pair/--site chunk/step, same cache tree -- store/caster/
+    # under --bench, out/ standalone) already exists, just normalize its rows
+    # into final_output_path instead of re-running dstar/caster-pair/
+    # caster-site from scratch.
+    if args.normalize:
+        unnormalized_path = _derive_output_path(False, False)
         if unnormalized_path != final_output_path and unnormalized_path.exists():
             print(f"Found un-normalized scores at '{unnormalized_path}' -- normalizing without recomputing caster...")
             apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair)
@@ -1138,6 +1375,15 @@ def main(argv=None):
                 locus_pattern=locus_pattern,
                 topologies=args.topologies,
             )
+            if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+                CasterPlotter(
+                    scores_file=str(final_output_path.resolve()),
+                    distribution=args.dist_type,
+                    data_dir=str(plot_data_dir.resolve()),
+                    topologies=args.topologies,
+                    plot_scores=True,
+                    locus_pattern=locus_pattern,
+                )
             return final_output_path
 
     if not args.fasta_file.exists():
@@ -1312,7 +1558,12 @@ def main(argv=None):
                         'qcnt': avg_qcnt
                     })
 
-        if args.normalize:
+        if args.ilr:
+            # D* itself is invariant to closure (same denominator cancels),
+            # so it's untouched by the composition being replaced entirely
+            # with its 2 ILR coordinates below.
+            apply_ilr(results, ['abba', 'baba', 'aabb'], ['ilr1', 'ilr2'])
+        elif args.normalize:
             # D* itself is invariant to this rescaling (same denominator
             # cancels) -- only the c*ABBA/c*BABA/c*AABB columns change, into
             # proportions of their own row sum (mirroring caster-pair.cpp's
@@ -1327,11 +1578,17 @@ def main(argv=None):
         if args.zscale:
             # D* itself is left as originally computed from the raw sums --
             # only the c*ABBA/c*BABA/c*AABB columns phlag reads get rescaled.
+            # (Never reached alongside --ilr -- the two are mutually exclusive.)
             apply_zscale(results, ['abba', 'baba', 'aabb'])
 
-        output_lines = ["file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"]
-        for r in results:
-            output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
+        if args.ilr:
+            output_lines = ["file\tpos\tc*ILR1\tc*ILR2\tD*\tQuartetCnt\n"]
+            for r in results:
+                output_lines.append(f"{r['file']}\t{r['pos']}\t{r['ilr1']:.6g}\t{r['ilr2']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
+        else:
+            output_lines = ["file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n"]
+            for r in results:
+                output_lines.append(f"{r['file']}\t{r['pos']}\t{r['abba']:.6g}\t{r['baba']:.6g}\t{r['aabb']:.6g}\t{r['dstar']:.6g}\t{r['qcnt']:.0f}\n")
 
         # final_output_path may be the shared, base-independent caster/
         # cache -- concurrent benchmark runs across different --base

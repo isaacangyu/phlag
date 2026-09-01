@@ -384,7 +384,7 @@ class PhlagHMMTransitions(HMMTransitions):
             assert transition_matrix.shape == (self.num_states, self.num_states)
         params = ParamsStandardHMMTransitions(transition_matrix=transition_matrix)
         props = ParamsStandardHMMTransitions(
-            transition_matrix=ParameterProperties()
+            transition_matrix=ParameterProperties(constrainer=tfb.SoftmaxCentered())
         )
         return params, props
 

@@ -36,6 +36,8 @@ def get_topology_names(dim):
     """Maps an emission dimension count to human-readable topology labels."""
     if dim == 3:
         return ["ABBA", "BABA", "AABB"]
+    if dim == 2:
+        return ["ILR1", "ILR2"]
     return [f"Coord {i+1}" for i in range(dim)]
 
 
@@ -107,7 +109,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
 
     print("\n=== K-means Clustering & Silhouette Scores ===")
 
-    topology_names = ["ABBA", "BABA", "AABB"] if Y.shape[-1] == 3 else [f"Coord_{i+1}" for i in range(Y.shape[-1])]
+    topology_names = get_topology_names(Y.shape[-1])
 
     # Topologies are always clustered together (shared multivariate mixture
     # components with full covariance across dims), never per-dimension.
@@ -451,9 +453,10 @@ class Phlag:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CASTER scores file not found at: {path}")
 
-        self.pos_to_caster = defaultdict(partial(jnp.zeros, 3))
+        import re
         self.source_fasta_path = None
         self.used_pair_scores = False
+        self.used_ilr_scores = False
 
         with open(path, "r") as f:
             header = f.readline()
@@ -469,12 +472,24 @@ class Phlag:
             abba_idx = next((i for i, n in enumerate(lower_parts) if 'abba' in n), None)
             baba_idx = next((i for i, n in enumerate(lower_parts) if 'baba' in n), None)
             aabb_idx = next((i for i, n in enumerate(lower_parts) if 'aabb' in n), None)
+
+            ilr_idx_by_num = {}
+            for i, n in enumerate(lower_parts):
+                m = re.match(r'^c?\*?ilr(\d+)$', n)
+                if m:
+                    ilr_idx_by_num[int(m.group(1))] = i
+            ilr_indices = [ilr_idx_by_num[k] for k in sorted(ilr_idx_by_num)] if ilr_idx_by_num else None
+
             if abba_idx is not None and baba_idx is not None and aabb_idx is not None:
                 score_indices = [abba_idx, baba_idx, aabb_idx]
+            elif ilr_indices:
+                score_indices = ilr_indices
             elif has_q123:
                 score_indices = [lower_parts.index("q1"), lower_parts.index("q2"), lower_parts.index("q3")]
             else:
                 score_indices = [2, 3, 4] if (is_file_header or is_locus_header) else [1, 2, 3]
+
+            self.pos_to_caster = defaultdict(partial(jnp.zeros, len(score_indices)))
 
             pos_idx = lower_parts.index("pos") if "pos" in lower_parts else (1 if (is_file_header or is_locus_header) else 0)
 
@@ -488,15 +503,11 @@ class Phlag:
 
                 try:
                     pos_key = int(values[pos_idx])
-                    triplet = [
-                        float(values[score_indices[0]]),
-                        float(values[score_indices[1]]),
-                        float(values[score_indices[2]]),
-                    ]
+                    score_vec = [float(values[i]) for i in score_indices]
                 except (ValueError, IndexError):
                     continue
                 pos_keys.append(pos_key)
-                raw_scores.append(triplet)
+                raw_scores.append(score_vec)
                 if self.source_fasta_path is None and is_file_header:
                     self.source_fasta_path = values[0]
 
@@ -506,9 +517,11 @@ class Phlag:
         raw_scores = np.array(raw_scores, dtype=np.float64)
         if has_q123:
             self.used_pair_scores = True
+        if ilr_indices:
+            self.used_ilr_scores = True
 
-        for pos_key, triplet in zip(pos_keys, raw_scores):
-            self.pos_to_caster[pos_key] = jnp.array(triplet, dtype=jnp.float32)
+        for pos_key, score_vec in zip(pos_keys, raw_scores):
+            self.pos_to_caster[pos_key] = jnp.array(score_vec, dtype=jnp.float32)
 
     def compute_emissions(self):
         sorted_positions = sorted(self.pos_to_caster.keys())
@@ -597,6 +610,15 @@ class Phlag:
             if caster_idx is not None and caster_idx + 1 < len(parts) - 1:
                 w_s_part = parts[caster_idx + 1]
                 rel_parts = list(parts[caster_idx + 2:-1])
+                # caster's tree nests site/ilr/normalize variant markers right
+                # after the size segment (get_expected_caster_sim_dir), but
+                # the report tree never carries that nesting -- reports sit
+                # flat under <category>/<subcategory>/<sim_name>/ regardless
+                # of variant, so strip them instead of mirroring them into
+                # out_dir (which otherwise doubled up with an --output-base
+                # that already names the variant, e.g. .../ilr/rho.../reports).
+                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize"):
+                    rel_parts.pop(0)
             else:
                 w_s_part = None
                 rel_parts = []

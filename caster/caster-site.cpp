@@ -180,7 +180,17 @@ struct Workflow {
     // taxon in the alignment to exactly one of 4 groups. Those 4 groups ARE
     // the branch: the two subtrees on each side of the edge being scored.
     // Mirrors caster-pair.cpp's scoreChunksForBranch.
-    void scoreChunksForBranch(const string &mappingFile, const string &outFile){
+    //
+    // windowChunks (>=1): number of consecutive --chunk-sized chunks rolled
+    // into each output window (sliding by 1 chunk each row, so windows
+    // overlap when windowChunks > 1). Each --chunk-sized chunk's informative
+    // sites are filtered independently in read() (see the R/Y >= 2 check
+    // above), so different chunks -- and therefore different windows --
+    // carry different numbers of informative sites; a raw sum would make
+    // windows with more informative sites look stronger for no biological
+    // reason, so each window's quartet sums are divided by that window's
+    // total informative-site count to get a per-site average instead.
+    void scoreChunksForBranch(const string &mappingFile, const string &outFile, int windowChunks){
         ifstream fmap(mappingFile);
         if (!fmap){
             cerr << "Error: could not open branch mapping file '" << mappingFile << "'\n";
@@ -221,10 +231,15 @@ struct Workflow {
         }
 
         map<pair<int, int>, array<score_t, 3> > chunkScores;
+        map<pair<int, int>, long long> chunkSiteCount;
+        map<int, vector<int> > locusChunks;
         for (size_t a = 0; a < quad.genes.size(); a++){
             array<score_t, 3> s = quad.genes[a].scoreCnt();
-            array<score_t, 3> &acc = chunkScores[make_pair(geneLocus[a], geneChunk[a])];
+            pair<int, int> key = make_pair(geneLocus[a], geneChunk[a]);
+            array<score_t, 3> &acc = chunkScores[key];
             acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2];
+            chunkSiteCount[key] += quad.genes[a].nSite;
+            locusChunks[geneLocus[a]].push_back(geneChunk[a]);
         }
 
         // Column names/positions mirror dstar's scores.tsv (pos, c*ABBA,
@@ -234,7 +249,7 @@ struct Workflow {
         // site-pattern meaning here -- they're just the 3 possible
         // resolutions of this branch's quartet, in a fixed order; the actual
         // group identities are logged below. Unlike caster-pair's
-        // chunk_scores.tsv, no q1/q2/q3 columns: these raw sums are already
+        // chunk_scores.tsv, no q1/q2/q3 columns: these are already
         // dstar-scale (~1e5-1e6, not caster-pair's ~1e11), so phlag's
         // read_caster_scores must not mistake this for a --pair file and
         // z-score it -- that detection keys off q1/q2/q3's presence alone.
@@ -250,12 +265,28 @@ struct Workflow {
         }
         const string &inputFile = ARG.getStringArg("input");
         fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\n";
-        for (auto &kv: chunkScores){
-            long long pos = (long long) kv.first.second * chunkSizeArg;
-            fout << inputFile << "\t" << pos << "\t"
-                 << (double) kv.second[0] << "\t" << (double) kv.second[1] << "\t" << (double) kv.second[2] << "\n";
+        long long nWindows = 0;
+        for (auto &kv: locusChunks){
+            int locusId = kv.first;
+            vector<int> &chunks = kv.second;
+            sort(chunks.begin(), chunks.end());
+            for (size_t i = 0; i + windowChunks <= chunks.size(); i++){
+                array<score_t, 3> sum = {0, 0, 0};
+                long long siteSum = 0;
+                for (int j = 0; j < windowChunks; j++){
+                    pair<int, int> key = make_pair(locusId, chunks[i + j]);
+                    array<score_t, 3> &s = chunkScores[key];
+                    sum[0] += s[0]; sum[1] += s[1]; sum[2] += s[2];
+                    siteSum += chunkSiteCount[key];
+                }
+                long long pos = (long long) chunks[i] * chunkSizeArg;
+                double denom = (siteSum > 0) ? (double) siteSum : 1.0;
+                fout << inputFile << "\t" << pos << "\t"
+                     << (double) sum[0] / denom << "\t" << (double) sum[1] / denom << "\t" << (double) sum[2] / denom << "\n";
+                nWindows++;
+            }
         }
-        cerr << "Wrote per-chunk branch scores (" << chunkScores.size() << " chunks) to: " << outFile << "\n";
+        cerr << "Wrote per-window (window=" << windowChunks << " chunk(s)) branch scores (" << nWindows << " windows) to: " << outFile << "\n";
     }
 
     Workflow(int argc, char** argv){
@@ -290,6 +321,10 @@ int main(int argc, char** argv){
         "pipeline's population mapping files, e.g. P1/P2/P3/Po). When given, skips the tree search entirely and "
         "instead scores that one branch's quartet topology per genomic chunk -- see --chunk-scores.");
     ARG.addStringArg(0, "chunk-scores", "chunk_scores.tsv", "Output TSV path for --branch-mapping's per-chunk quartet scores.");
+    ARG.addIntArg(0, "window", 0, "--branch-mapping's sliding window size, in multiples of --chunk, rolling that "
+        "many consecutive chunks (sliding by 1 chunk each row, so windows overlap when > 1 chunk) into each output "
+        "row and dividing by that window's total informative-site count instead of --chunk's raw per-chunk sum. "
+        "Must be an exact multiple of --chunk. 0 (default): equal to --chunk (one non-overlapping window per chunk).");
 
     #ifdef CUSTOMIZED_ANNOTATION_TERMINAL_LENGTH
     cerr << "Warning: This version can be much slower and require much more memory than the regular version. You might want to compute the correct topology first and add branch lengths with this version on fix topology.\n";
@@ -299,7 +334,13 @@ int main(int argc, char** argv){
 
     string branchMapping = ARG.getStringArg("branch-mapping");
     if (branchMapping != ""){
-        WF.scoreChunksForBranch(branchMapping, ARG.getStringArg("chunk-scores"));
+        long long chunkArg = ARG.getIntArg("chunk"), windowArg = ARG.getIntArg("window");
+        if (windowArg == 0) windowArg = chunkArg;
+        if (windowArg % chunkArg != 0){
+            cerr << "Error: --window (" << windowArg << ") must be an exact multiple of --chunk (" << chunkArg << ").\n";
+            exit(1);
+        }
+        WF.scoreChunksForBranch(branchMapping, ARG.getStringArg("chunk-scores"), (int) (windowArg / chunkArg));
         return 0;
     }
 

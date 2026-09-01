@@ -2126,6 +2126,7 @@ CASTER_ARG_SPECS = [
     ("chunk_size", "--chunk", False),
     ("chunk_scores", "--chunk-scores", False),
     ("zscale", "-z", True),
+    ("ilr", "-i", True),
 ]
 PHLAG_ARG_SPECS = [
     ("null_emission_parameterization", "--np", False),
@@ -2165,10 +2166,8 @@ def _explicit_dests(argv, parser):
     their parser default) -- every non-positional default is swapped for a
     unique sentinel first, so a dest surviving parse_known_args with a
     non-sentinel value must have come from argv itself, even if that value
-    happens to equal the flag's real default. Used by --rerun (to refuse
-    replaying a run while also passing one of its recorded flags directly)
-    and --copy (to know which recorded values POS1's leaves should have
-    overridden with this invocation's own flags)."""
+    happens to equal the flag's real default. Used by --sweep (to refuse
+    also passing its own FLAG directly on this invocation)."""
     sentinel = object()
     dests = [a.dest for a in parser._actions if a.dest != "help" and a.option_strings]
     empty_ns = argparse.Namespace(**{dest: sentinel for dest in dests})
@@ -2199,93 +2198,30 @@ def _build_parser():
         type=str,
         default=None,
         metavar="PATH",
-        help="Creates a fresh run at PATH -- a FULL output tree path "
-             "relative to the repo root, starting with 'store/' (the "
-             "symlink to $CONNECTION_DIR), e.g. 'store/phlag/gaussian/"
-             "repulsion/w50k_s1k/benchmark/annealing/tau2x'. This is exactly "
-             "what an earlier command's own printed output paths, or shell "
-             "tab-completion from the repo root, produce -- paste/complete "
-             "straight from there. PATH must NOT already be a FINISHED run "
-             "(one with analysis.tsv) -- errors out instead of reusing one "
-             "(use --rerun for that; --create is always a single new run, "
-             "never a batch of them). An UNFINISHED PATH (no analysis.tsv "
-             "yet, whether it has no reports/ at all or a partial one from "
-             "an interrupted prior invocation) resumes instead, replaying "
-             "that prior invocation's own recorded args.json -- any "
-             "mirrored flag passed directly in that case is an error (use "
-             "--copy to override). This invocation's resolved caster/phlag "
-             "flags (see below) are recorded into the new run dir's "
-             "args.json immediately, before any processing, so a later "
-             "--rerun replays them exactly. Exactly one of --create/--rerun/"
-             "--copy is required.",
-    )
-    parser.add_argument(
-        "--rerun",
-        dest="rerun",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Reruns an existing run at PATH (same full-repo-root-relative-"
-             "path form as --create). PATH must already exist and have its "
-             "own args.json (from an earlier --create/--rerun) -- drives "
-             "caster/phlag with THOSE recorded flag values rather than "
-             "whatever's passed on this invocation, so a rerun replays the "
-             "run's own original settings (passing one of the mirrored flags "
-             "directly on a --rerun invocation is an error -- use --copy to "
-             "override instead). If PATH names a container instead of a "
-             "single run (no args.json/reports/ of its own, but runs "
-             "found nested underneath it -- e.g. 'annealing' holding "
-             "'annealing/base', 'annealing/boost=1', ...), every run found "
-             "underneath is processed this way instead, each with its own "
-             "recorded args.json -- batch processing like this is --rerun-only, "
-             "--create is always a single new run. Exactly one of "
-             "--create/--rerun/--copy is required.",
-    )
-    parser.add_argument(
-        "--batch",
-        dest="batch",
-        action="store_true",
-        default=False,
-        help="With --rerun on a container PATH, restrict batch processing to "
-             "runs found directly underneath PATH (its immediate "
-             "subdirectories) instead of recursively searching every nested "
-             "leaf at any depth -- use when PATH's own children are "
-             "themselves containers you don't want expanded further this "
-             "invocation. Ignored without --rerun on a container. Default: "
-             "omitted, i.e. full recursive discovery.",
-    )
-    parser.add_argument(
-        "--copy",
-        dest="copy",
-        nargs=2,
-        metavar=("POS1", "POS2"),
-        default=None,
-        help="Copies every run under POS1 into POS2, overriding recorded flags: "
-             "for each leaf found under POS1 (a single run, or a container batch "
-             "exactly like --rerun's container handling), the merged flag values "
-             "start as an exact copy of that leaf's own recorded args.json, then "
-             "any of the mirrored caster/phlag flags passed directly on THIS "
-             "invocation override the recorded value for that flag (POS2's own "
-             "args.json, if any, is never consulted -- POS2 leaves typically "
-             "don't exist yet, that's the point of copying). "
-             "A leaf whose POS2 side already has a populated reports/ archive "
-             "is left alone (resummarized only, not recomputed) -- rerunning "
-             "--copy after a partial prior run only fills in what's still "
-             "missing. Both POS1 and POS2 are store/-relative paths (same form "
-             "as --create/--rerun); POS1 must already exist, POS2 need not. "
-             "Results land under POS2. Exactly one of --create/--rerun/--copy "
-             "is required.",
+        required=True,
+        help="Runs at PATH -- a FULL output tree path relative to the repo "
+             "root, starting with 'store/' (the symlink to $CONNECTION_DIR), "
+             "e.g. 'store/phlag/gaussian/repulsion/w50k_s1k/benchmark/"
+             "annealing/tau2x'. This is exactly what an earlier command's own "
+             "printed output paths, or shell tab-completion from the repo "
+             "root, produce -- paste/complete straight from there. Always "
+             "just runs against PATH with THIS invocation's flags, whether "
+             "PATH is new, partially done, or already finished -- to force a "
+             "clean redo, delete PATH's own report.txt/args.json/source/"
+             "runs.tsv/bins.tsv/analysis.tsv/reports/*.png first. This "
+             "invocation's resolved caster/phlag flags (see below) are "
+             "recorded into PATH's args.json immediately, before any "
+             "processing.",
     )
     parser.add_argument(
         "--sweep",
         dest="sweep",
         default=None,
         metavar="FLAG=V1,V2,...",
-        help="Only valid with --create: runs one leaf per comma-separated value "
+        help="Runs one leaf per comma-separated value "
              "of FLAG (one of the mirrored caster/phlag flags below), nested "
              "under --create's PATH as one container (each leaf named "
-             "'<dest>=<value>/') instead of a single run -- a later plain "
-             "--rerun PATH (naming the container) replays every swept leaf. "
+             "'<dest>=<value>/') instead of a single run. "
              "Must be given as one glued token, '--sweep=FLAG=V1,V2,...' (e.g. "
              "'--sweep=-w=500k,250k,100k') -- a space before FLAG makes argparse "
              "mistake it for another flag, since FLAG itself starts with '-'. "
@@ -2343,6 +2279,10 @@ def _build_parser():
     caster_group.add_argument(
         "-z", "--zscale", dest="zscale", action="store_true",
         help="Forwarded to caster's -z/--zscale.",
+    )
+    caster_group.add_argument(
+        "-i", "--ilr", dest="ilr", action="store_true",
+        help="Forwarded to caster's -i/--ilr.",
     )
 
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
@@ -2441,12 +2381,8 @@ def parse_arguments(argv=None):
         argv = sys.argv[1:]
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if sum(bool(x) for x in (args.create, args.rerun, args.copy)) != 1:
-        parser.error("exactly one of --create, --rerun, or --copy is required")
     args.explicit_dests = _explicit_dests(argv, _build_parser())
     if args.sweep is not None:
-        if not args.create:
-            parser.error("--sweep is only valid with --create")
         args.sweep = _resolve_sweep_spec(args.sweep, parser, args.explicit_dests)
     return args
 
@@ -2501,7 +2437,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                                pair=False, site=False, chunk_size=None, normalize=False, zscale=False):
+                                pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2514,11 +2450,15 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 
     ``pair``/``site``/``chunk_size`` mirror phlag/caster.py's own --bench
     keying: when pair or site is set, the tree is keyed
-    store/caster/c<chunk>_s<S>[_site]/ instead, so a --pair/--site run never
+    store/caster/c<chunk>_s<S>/ instead, so a --pair/--site run never
     collides with a dstar run (or each other) sharing the same -w/-s.
-    ``normalize`` similarly appends "_n" to the size prefix, since normalized
-    and raw D* scores are numerically different outputs and must not share
-    a cache entry; ``zscale`` appends "_z" for the same reason.
+    ``site``/``normalize``/``ilr`` each nest their own named subdirectory
+    ('site'/'normalize'/'ilr') under the size segment rather than a flat
+    suffix (matching phlag/caster.py's own directory naming); ``zscale``
+    still appends a flat "_z" suffix to the size segment itself. ``ilr``
+    implies closure, so it nests in place of (not stacked with)
+    ``normalize``, even if ``normalize`` is also True -- mirrors
+    phlag/caster.py's own `_derive_output_path` precedence.
 
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
@@ -2529,15 +2469,19 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     short_sim = get_short_sim_name(leaf_dir.name)
 
     step_str = format_val(step_size)
-    site_suffix = "_site" if site else ""
     zscale_suffix = "_z" if zscale else ""
-    norm_suffix = "_n" if normalize else ""
     if pair or site:
         pair_chunk = chunk_size if chunk_size is not None else window_size
-        size_prefix = f"c{format_val(pair_chunk)}_s{step_str}{site_suffix}{zscale_suffix}{norm_suffix}"
+        size_prefix = f"c{format_val(pair_chunk)}_s{step_str}{zscale_suffix}"
     else:
-        size_prefix = f"w{format_val(window_size)}_s{step_str}{zscale_suffix}{norm_suffix}"
+        size_prefix = f"w{format_val(window_size)}_s{step_str}{zscale_suffix}"
     base = get_data_dir() / "caster" / size_prefix
+    if site:
+        base = base / "site"
+    if ilr:
+        base = base / "ilr"
+    elif normalize:
+        base = base / "normalize"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
@@ -2545,13 +2489,13 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                             pair=False, site=False, chunk_size=None, normalize=False, zscale=False):
+                             pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
-        pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale,
+        pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale, ilr=ilr,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2639,10 +2583,9 @@ def run_all(args, sim_root, out_dir):
     against the existing scores.tsv.
 
     args' mirrored-flag values (already fully resolved by the caller -- a
-    plain --create's parsed args, or --rerun/--copy/--sweep's args with the
-    relevant dests overridden onto a copy) are written to <out_dir>/args.json
-    immediately, before any processing, so a later --rerun/--copy can read
-    them back.
+    plain --create's parsed args, or --sweep's args with the swept dest
+    overridden onto a copy) are written to <out_dir>/args.json immediately,
+    before any processing, mainly as a record of exactly what this run used.
 
     Caster's scores.tsv stays canonical/shared in its own store/caster/
     w<W>_s<S> tree regardless (see get_expected_caster_sim_dir/caster.py),
@@ -2665,12 +2608,9 @@ def run_all(args, sim_root, out_dir):
 
     # Persist a cheap copy of the phlag/ source snapshot (just the .py files
     # this invocation actually ran, already assembled above) into the run
-    # dir, overwritten every call -- unlike args.json (frozen once at
-    # --create so --rerun replays it), this always reflects the code as of
-    # the MOST RECENT invocation, since --rerun replays old flags against
-    # whatever code is currently live, not old code. That's the only place
-    # to see what code produced a given run after the fact -- the temp
-    # snapshot_root itself is deleted at the end of this function.
+    # dir, overwritten every call -- that's the only place to see what code
+    # produced a given run after the fact -- the temp snapshot_root itself is
+    # deleted at the end of this function.
     source_snapshot_dir = out_dir / "source"
     if source_snapshot_dir.exists():
         shutil.rmtree(source_snapshot_dir)
@@ -2729,13 +2669,18 @@ def run_all(args, sim_root, out_dir):
     skipped_present = 0
     failures = []
 
+    def record_failure(msg):
+        progress.write(f"{RED}[fail] {msg}{RESET}")
+        failures.append(msg)
+
     progress = tqdm(work_items, desc="", unit="file")
     for leaf_dir, rel_path, fasta_path in progress:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
 
         scores_path = get_expected_scores_path(
             fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
-            pair=args.pair, site=args.site, chunk_size=args.chunk_size, normalize=args.normalize, zscale=args.zscale,
+            pair=args.pair, site=args.site, chunk_size=args.chunk_size,
+            normalize=args.normalize, zscale=args.zscale, ilr=args.ilr,
         )
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
@@ -2759,9 +2704,7 @@ def run_all(args, sim_root, out_dir):
                 cwd=str(snapshot_root), env=snapshot_env,
             )
             if not phlag_ok:
-                msg = f"{pattern_rel}: phlag failed\n{phlag_out}"
-                progress.write(f"{RED}[fail] {msg}{RESET}")
-                failures.append(msg)
+                record_failure(f"{pattern_rel}: phlag failed\n{phlag_out}")
                 continue
         else:
             progress.set_description(f"[caster] {pattern_rel} is being processed", refresh=False)
@@ -2774,19 +2717,17 @@ def run_all(args, sim_root, out_dir):
                 cwd=str(snapshot_root), env=snapshot_env,
             )
             if not phlagster_ok:
-                msg = f"{pattern_rel}: phlagster failed\n{phlagster_out}"
-                progress.write(f"{RED}[fail] {msg}{RESET}")
-                failures.append(msg)
+                record_failure(f"{pattern_rel}: phlagster failed\n{phlagster_out}")
                 continue
             if not scores_path.exists():
-                msg = f"{pattern_rel}: phlagster reported success but scores file not found at {scores_path}"
-                progress.write(f"{RED}[fail] {msg}{RESET}")
-                failures.append(msg)
+                record_failure(
+                    f"{pattern_rel}: phlagster reported success but scores file not found at {scores_path}"
+                )
                 continue
             if not report_path.exists():
-                msg = f"{pattern_rel}: phlagster reported success but report file not found at {report_path}"
-                progress.write(f"{RED}[fail] {msg}{RESET}")
-                failures.append(msg)
+                record_failure(
+                    f"{pattern_rel}: phlagster reported success but report file not found at {report_path}"
+                )
                 continue
 
         processed += 1
@@ -2918,10 +2859,10 @@ def _format_duration(seconds):
 
 
 def _validate_store_path(flag_label, run_path):
-    """Shared by resolve_run_dir (--create/--rerun) and resolve_copy_dirs
-    (--copy): run_path must be a path relative to the repo root starting
-    with 'store/' (the symlink to $CONNECTION_DIR) and must resolve under
-    the phlag output tree. Returns the resolved candidate Path, or
+    """Used by resolve_run_dir (--create): run_path must be a path relative
+    to the repo root starting with 'store/' (the symlink to $CONNECTION_DIR)
+    and must resolve under the phlag output tree. Returns the resolved
+    candidate Path, or
     sys.exit()s with a red error."""
     if not run_path.startswith("store/"):
         sys.exit(
@@ -2946,108 +2887,21 @@ def _validate_store_path(flag_label, run_path):
 def resolve_run_dir(args):
     """
     Resolves the full output directory this invocation targets, straight
-    from --create/--rerun's PATH value -- called from main() before
-    run_all()/summarize() run against it. Returns (out_dir, reuse).
+    from --create's PATH value -- called from main() before
+    run_all()/summarize() run against it.
 
-    Exactly one of args.create/args.rerun is set (enforced in
-    parse_arguments()), each a path relative to the repo root, always
-    starting with 'store/' (the symlink to $CONNECTION_DIR) -- e.g.
+    A path relative to the repo root, always starting with 'store/' (the
+    symlink to $CONNECTION_DIR) -- e.g.
     'store/phlag/gaussian/repulsion/w50k_s1k/benchmark/annealing/tau2x'.
     This fully determines out_dir (validated as falling under the phlag
     output tree, nothing more specific than that -- there's no separate
     --base to join it against, and so nothing left to accidentally double
-    up). --create errors out only if out_dir is already *finished*
-    (has analysis.tsv, written by a prior --create/--rerun's summarize());
-    a populated-but-unfinished reports/ archive (run_all() got partway
-    through phlag on a prior invocation that never reached summarize())
-    is resumable too, same as an out_dir with no reports/ at all yet --
-    both are reported back via resume_unfinished so main() can reload
-    that prior invocation's args.json before continuing. --rerun errors
-    out if out_dir has no analysis.tsv directly under it (a prior
-    --create/--rerun that got as far as summarize()). reuse is just
-    bool(args.rerun) -- --create guarantees out_dir/analysis.tsv didn't
-    exist yet, --rerun guarantees it did.
+    up). Always just runs against out_dir with this invocation's flags,
+    whether it's new, partially done, or already finished -- to force a
+    clean redo, delete out_dir's own report.txt/args.json/source/runs.tsv/
+    bins.tsv/analysis.tsv/reports/*.png first.
     """
-    flag, run_path = ("--create", args.create) if args.create else ("--rerun", args.rerun)
-    out_dir = _validate_store_path(flag, run_path)
-
-    resume_unfinished = False
-    if args.create:
-        if _is_finished_run(out_dir):
-            sys.exit(f"{RED}--create {run_path}: already finished (has analysis.tsv) at {out_dir} -- use --rerun instead.{RESET}")
-        resume_unfinished = _has_reports_archive(out_dir)
-    if args.rerun and not _is_finished_run(out_dir):
-        sys.exit(
-            f"{RED}--rerun {run_path}: no analysis.tsv found directly under {out_dir} "
-            f"-- use --create instead.{RESET}"
-        )
-
-    return out_dir, bool(args.rerun), resume_unfinished
-
-
-def resolve_copy_dirs(args):
-    """--copy's PATH resolution: POS1 must already exist (it's the source
-    template, like --rerun's PATH); POS2 need not as a whole tree -- its
-    per-leaf existence is checked leaf-by-leaf in handle_copy()."""
-    pos1_path, pos2_path = args.copy
-    pos1_dir = _validate_store_path("--copy POS1", pos1_path)
-    pos2_dir = _validate_store_path("--copy POS2", pos2_path)
-    if not pos1_dir.exists():
-        sys.exit(f"{RED}--copy {pos1_path}: no existing run/container at {pos1_dir}.{RESET}")
-    return pos1_dir, pos2_dir
-
-
-def _has_reports_archive(run_dir):
-    reports_dir = run_dir / "reports"
-    return reports_dir.exists() and any(reports_dir.rglob("*.tsv"))
-
-
-def _is_finished_run(run_dir):
-    """True only once summarize() has actually completed for run_dir (it
-    writes analysis.tsv last) -- unlike _has_reports_archive, this is False
-    for a reports/ archive that's merely non-empty but incomplete (e.g. an
-    interrupted prior invocation, or missing gaps within it), so callers
-    that shortcut straight to resummarizing-from-archive (skipping a fresh
-    run_all() pass) only take that shortcut when there's truly nothing left
-    for run_all() to fill in."""
-    return (run_dir / "analysis.tsv").exists()
-
-
-def _skips_all_stages(args):
-    """True when --skip names both caster and phlag -- nothing could
-    possibly get (re)computed this invocation, so run_all()'s full
-    simulations/ tree walk (checking shared-tree existence per leaf, purely
-    to decide what to print) is pure overhead when there's an existing
-    reports/ archive to resummarize from instead. --rerun-only caller."""
-    return "caster" in args.skip and "phlag" in args.skip
-
-
-def discover_archived_run_dirs(prefix_dir, direct_only=False):
-    """
-    Recursively finds every directory under prefix_dir that is itself a
-    completed run -- i.e. has its own populated reports/ tree (phlag writes
-    there directly, see get_run_reports_base_override) -- for
-    batch-resummarizing every run nested under a --run value that names a
-    container (e.g. 'annealing', holding 'annealing/base',
-    'annealing/boost=1', ...) rather than a single leaf run. Each match's own
-    reports/ subtree is flat ('<pattern>.tsv' files), never itself containing
-    a nested run, so matches don't overlap.
-
-    direct_only (--batch) restricts this to prefix_dir's immediate
-    subdirectories instead of recursing to arbitrary depth -- for a
-    container whose own children are themselves containers not meant to be
-    expanded further this invocation.
-    """
-    if direct_only:
-        return sorted(
-            child for child in prefix_dir.iterdir()
-            if child.is_dir() and _has_reports_archive(child)
-        )
-    return sorted(
-        reports_dir.parent
-        for reports_dir in prefix_dir.rglob("reports")
-        if reports_dir.is_dir() and any(reports_dir.rglob("*.tsv"))
-    )
+    return _validate_store_path("--create", args.create)
 
 
 def _read_args_json(args_json_path):
@@ -3060,68 +2914,11 @@ def _read_args_json(args_json_path):
         return {}
 
 
-def handle_copy(args, sim_root, stats, start_time):
-    """--copy POS1 POS2: for every leaf found under POS1 (every nested run
-    with its own reports/ archive, including POS1 itself if it has one --
-    exactly like --rerun's container handling -- or just POS1 itself if
-    it's a single run with no archive of its own yet), starts from that
-    leaf's own recorded args.json, overrides any mirrored dest passed
-    directly on THIS invocation (args.explicit_dests, from parse_arguments()),
-    and runs into the same relative leaf under POS2 -- unless that POS2 leaf
-    is already a *finished* run (has analysis.tsv), in which case it just
-    resummarizes from the existing archive instead. Same resume behavior as
-    --create/--rerun: an unfinished POS2 leaf (no analysis.tsv yet, whether
-    it has no reports/ at all or a partial one from an interrupted prior
-    invocation) always goes through run_all(), which -- honoring --skip like
-    --rerun does -- reuses whatever per-item output already exists and only
-    computes what's missing, never blindly recomputing already-present
-    reports. If POS2 has no leaf yet at that relative path, one is created
-    with POS1's recorded values (plus this invocation's overrides)."""
-    pos1_dir, pos2_dir = resolve_copy_dirs(args)
-
-    overridden_dests = args.explicit_dests & set(MIRRORED_DESTS)
-
-    leaf_dirs = discover_archived_run_dirs(pos1_dir) if pos1_dir.is_dir() else []
-    if not leaf_dirs:
-        leaf_dirs = [pos1_dir]
-
-    for pos1_leaf in leaf_dirs:
-        rel = pos1_leaf.relative_to(pos1_dir)
-        pos2_leaf = pos2_dir / rel
-        print(f"\n=== {rel} ===")
-
-        pos1_args_json = pos1_leaf / "args.json"
-        if not pos1_args_json.exists():
-            print(f"{RED}[skip] {pos1_leaf}: no args.json of its own -- can't --copy it.{RESET}")
-            continue
-        pos1_recorded = _read_args_json(pos1_args_json)
-        if not pos1_recorded:
-            print(f"{RED}[skip] {pos1_leaf}: args.json unreadable/invalid JSON.{RESET}")
-            continue
-
-        pos2_leaf_existed = pos2_leaf.exists()
-
-        leaf_args = argparse.Namespace(**vars(args))
-        for dest, value in pos1_recorded.items():
-            setattr(leaf_args, dest, value)
-        for dest in overridden_dests:
-            setattr(leaf_args, dest, getattr(args, dest))
-
-        if _is_finished_run(pos2_leaf):
-            print(f"[skip caster,phlag] resummarizing directly from {pos2_leaf / 'reports'}")
-        else:
-            run_all(leaf_args, sim_root, pos2_leaf)
-            if "caster" not in args.skip:
-                args.skip = args.skip + ["caster"]
-                print("[copy] caster generated -- skipping caster for remaining leaves")
-        summarize(leaf_args, sim_root, stats, pos2_leaf, pos2_leaf_existed, start_time=start_time)
-
-
-def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
+def summarize(args, sim_root, stats, out_dir, start_time=None):
     """
     Aggregates every finished run into the Figure-3 panels and writes them out.
 
-    stats, out_dir, reuse: resolved by main() via resolve_run_dir() before
+    stats, out_dir: resolved by main() via resolve_run_dir() before
     run_all() executes.
 
     start_time: time.perf_counter() value from when the `benchmark` command
@@ -3157,7 +2954,7 @@ def summarize(args, sim_root, stats, out_dir, reuse, start_time=None):
     if report_lines:
         report_txt_path = out_dir / "report.txt"
         text = "\n".join(report_lines) + "\n"
-        if reuse and report_txt_path.exists():
+        if report_txt_path.exists():
             with open(report_txt_path, "a") as f:
                 f.write(text)
             print(f"Appended to report:  {report_txt_path}")
@@ -3209,29 +3006,7 @@ def main(argv=None):
         errorbar=args.errorbar,
     )
 
-    if args.copy:
-        handle_copy(args, sim_root, stats, start_time)
-        return
-
-    out_dir, reuse, resume_unfinished = resolve_run_dir(args)
-
-    if resume_unfinished:
-        args_json_path = out_dir / "args.json"
-        if not args_json_path.exists():
-            print(f"[create] {out_dir}: unfinished reports found but no args.json to resume from -- continuing with this invocation's own flags.")
-        else:
-            overridden = args.explicit_dests & set(MIRRORED_DESTS)
-            if overridden:
-                sys.exit(
-                    f"{RED}--create {args.create}: {out_dir} has unfinished reports from a "
-                    f"prior run -- can't also pass {', '.join(sorted(overridden))} directly. "
-                    f"Use --copy instead to override, or omit them to resume with the "
-                    f"recorded args.json.{RESET}"
-                )
-            for dest, value in _read_args_json(args_json_path).items():
-                setattr(args, dest, value)
-            print(f"[create] {out_dir}: resuming unfinished run using recorded args.json")
-            reuse = True
+    out_dir = resolve_run_dir(args)
 
     if args.sweep is not None:
         dest, value_pairs = args.sweep
@@ -3241,86 +3016,11 @@ def main(argv=None):
             leaf_args = argparse.Namespace(**vars(args))
             setattr(leaf_args, dest, value)
             run_all(leaf_args, sim_root, leaf_dir)
-            summarize(leaf_args, sim_root, stats, leaf_dir, False, start_time=start_time)
+            summarize(leaf_args, sim_root, stats, leaf_dir, start_time=start_time)
         return
 
-    # --rerun given a container path (e.g. 'annealing', holding
-    # 'annealing/base', 'annealing/boost=1', ...) rather than a single leaf
-    # run: it may or may not have a reports/ archive of its own in addition
-    # to the nested ones (a run can be both a leaf and a container of
-    # further sub-experiments). Batch processing like this is --rerun-only --
-    # --create always targets a single new run (guaranteed not to exist yet,
-    # so it can't have nested runs under it either; this check is gated on
-    # args.rerun directly, not just the already-equivalent `reuse`, so that
-    # stays true even if reuse's definition ever changes). Process every
-    # leaf run found nested underneath the container (including the
-    # container path itself, if it has its own archive), each with its OWN
-    # recorded args.json (not this invocation's own mirrored flags, and not
-    # each other's either).
-    if args.rerun and out_dir.is_dir():
-        leaf_dirs = discover_archived_run_dirs(out_dir, direct_only=args.batch)
-        if leaf_dirs and leaf_dirs != [out_dir]:
-            print(
-                f"--rerun {args.rerun!r} has {len(leaf_dirs)} "
-                f"run(s) nested underneath it -- processing each of those "
-                f"(including its own archive, if any) instead of just itself."
-            )
-            overridden = args.explicit_dests & set(MIRRORED_DESTS)
-            if overridden:
-                sys.exit(
-                    f"{RED}--rerun replays each run's original settings -- can't "
-                    f"also pass {', '.join(sorted(overridden))} directly. Use "
-                    f"--copy instead to override.{RESET}"
-                )
-            skip_run_all = _skips_all_stages(args)
-            for leaf_dir in leaf_dirs:
-                print(f"\n=== {leaf_dir.relative_to(out_dir)} ===")
-                # Every leaf_dir here was discovered specifically because it
-                # already has a reports/ archive (see discover_archived_run_dirs),
-                # so when both stages are skipped there is nothing run_all()
-                # could do except waste a full simulations/ tree walk --
-                # resummarize straight from that archive instead.
-                if skip_run_all:
-                    print(f"[skip caster,phlag] resummarizing directly from {leaf_dir / 'reports'}")
-                else:
-                    leaf_args_json = leaf_dir / "args.json"
-                    if not leaf_args_json.exists():
-                        print(f"{RED}[skip] {leaf_dir}: no args.json of its own -- can't --rerun it.{RESET}")
-                        continue
-                    leaf_args = argparse.Namespace(**vars(args))
-                    for dest, value in _read_args_json(leaf_args_json).items():
-                        setattr(leaf_args, dest, value)
-                    run_all(leaf_args, sim_root, leaf_dir)
-                summarize(args, sim_root, stats, leaf_dir, True, start_time=start_time)
-            return
-
-    if args.rerun:
-        args_json_path = out_dir / "args.json"
-        if not args_json_path.exists():
-            sys.exit(
-                f"{RED}--rerun {args.rerun}: no args.json found at {args_json_path} "
-                f"-- this run predates --rerun's args-recording, or was never "
-                f"created with --create. Nothing to replay.{RESET}"
-            )
-        overridden = args.explicit_dests & set(MIRRORED_DESTS)
-        if overridden:
-            sys.exit(
-                f"{RED}--rerun replays this run's original settings -- can't "
-                f"also pass {', '.join(sorted(overridden))} directly. Use "
-                f"--copy instead to override.{RESET}"
-            )
-        for dest, value in _read_args_json(args_json_path).items():
-            setattr(args, dest, value)
-
-    # Same shortcut as the batch-container path above: both stages skipped
-    # on an existing run that already has its own reports/ archive means
-    # there's nothing run_all() could contribute -- skip its tree walk and
-    # resummarize straight from the archive.
-    if args.rerun and _skips_all_stages(args) and _has_reports_archive(out_dir):
-        print(f"[skip caster,phlag] resummarizing directly from {out_dir / 'reports'}")
-    else:
-        run_all(args, sim_root, out_dir)
-    summarize(args, sim_root, stats, out_dir, reuse, start_time=start_time)
+    run_all(args, sim_root, out_dir)
+    summarize(args, sim_root, stats, out_dir, start_time=start_time)
 
 
 if __name__ == "__main__":

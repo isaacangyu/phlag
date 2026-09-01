@@ -147,8 +147,17 @@ def _x_bin_category_compatible(names, level_combo):
     return True
 
 _MIRRORED_SPECS = CASTER_ARG_SPECS + PHLAG_ARG_SPECS
-_FLAG_TO_DEST = {flag: dest for dest, flag, _ in _MIRRORED_SPECS}
 _PARSER = _build_parser()
+# Every option string (both short and long form, e.g. "-n" AND "--normalize")
+# that the real parser registers for a mirrored dest -- not just the one
+# canonical token CASTER_ARG_SPECS/PHLAG_ARG_SPECS happens to list, so a
+# config dict can use either alias interchangeably, same as the actual CLI.
+_MIRRORED_DESTS = {dest for dest, _, _ in _MIRRORED_SPECS}
+_FLAG_TO_DEST = {
+    option_string: action.dest
+    for option_string, action in _PARSER._option_string_actions.items()
+    if action.dest in _MIRRORED_DESTS
+}
 _PARAM_LABELS = {"emission_lambda": "lambda"}
 
 _CONFIG_PALETTE = list(matplotlib.colormaps["tab10"].colors)
@@ -720,9 +729,10 @@ class CrossRunAnalysis:
         same segment), agg[2] -> subplot columns, agg[3] -> subplot rows.
         Each point is the (mean FPR, mean TPR) of that (row, col, point,
         line) combo's already-row-filtered rows (in_panel_b only). The
-        legend's ROC-AUC per line value is pooled across every (point, col,
-        row) combo sharing that line value (agg[0]), not just one cell --
-        see _metric_by_axis_value."""
+        legend's ROC-AUC per line value is pooled across every *real*
+        (flag-based) point/col/row value sharing that line value (agg[0]),
+        not just one cell -- invariant to any row-filter agg axis, same as
+        _plot_grouped's legend -- see _metric_by_axis_value."""
         def axis_val(label, idx):
             vals = self._config_axes.get(label, [])
             return vals[idx] if idx < len(vals) else None
@@ -738,10 +748,28 @@ class CrossRunAnalysis:
             by_key[key] = (label, dirs)
 
         colors = {lv: _config_color(i) for i, lv in enumerate(line_vals)}
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         n_rows, n_cols = len(row_vals), len(col_vals)
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.3 * n_cols, 3.1 * n_rows + 0.8), squeeze=False)
+        # Reserve enough top margin for however many legend rows agg[0]/agg[1]
+        # actually produce -- a fixed-height reservation (the old behavior)
+        # only fit whatever entry count someone tested with; a longer -w/-s
+        # sweep or an extra (--ap, --annealing) combo pushed the legend past
+        # the axes into the suptitle. This is only a generous upper-bound
+        # estimate to size the canvas -- actual placement below re-measures
+        # each legend's real rendered extent instead of trusting this
+        # constant, so an under/over estimate here costs at most a
+        # slightly bigger-than-necessary canvas, never an overlap.
+        show_line_legend = len(line_vals) > 1 or line_vals != [None]
+        show_shade_legend = len(point_vals) > 1
+        legend_rows = (
+            (len(line_vals) if show_line_legend else 0)
+            + (len(point_vals) + 1 if show_shade_legend else 0)  # +1: shade legend's own title row
+        )
+        legend_extra_in = 0.32 * legend_rows
+
+        fig, axes = plt.subplots(
+            n_rows, n_cols, figsize=(3.3 * n_cols, 3.1 * n_rows + 0.8 + legend_extra_in), squeeze=False)
         for ri, rv in enumerate(row_vals):
             for ci, cv in enumerate(col_vals):
                 ax = axes[ri][ci]
@@ -782,32 +810,54 @@ class CrossRunAnalysis:
                     ax.scatter(xs, ys, color=shades, s=34, edgecolor="white", linewidth=0.7, zorder=3)
         fig.suptitle(title, fontsize=12, y=0.995)
 
-        if len(line_vals) > 1 or line_vals != [None]:
-            line_auc_values = self._metric_by_axis_value(configs, dfs, 0, "roc_auc")
+        # The two legends used to sit in opposite top corners (upper-left/
+        # upper-right) sharing one row of vertical space -- fine for a wide
+        # multi-column grid, but a single-panel figure (the common case here,
+        # e.g. agg's col/row axes both empty) is only ~3.3in wide, too narrow
+        # for two corner legends with any real text in them to avoid
+        # colliding in the middle. Stack them instead (same corner, one atop
+        # the other): that only costs vertical space, which is cheap since
+        # it's already being reserved via legend_extra_in, and it works
+        # regardless of figure width. Each legend's actual bottom is measured
+        # (get_window_extent) rather than estimated, so the next legend --
+        # and the axes area below both -- is placed exactly, not guessed.
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        fig_h_px = fig.bbox.height
+        cursor_y = (fig._suptitle.get_window_extent(renderer).y0 - 4) / fig_h_px
+
+        if show_line_legend:
+            line_auc_values = self._metric_by_axis_value(configs, 0, "roc_auc")
             handles = [
                 plt.Line2D([0], [0], marker="o", linestyle="none", markersize=6,
                            markerfacecolor=colors[lv], markeredgecolor="white",
                            label=f"{lv} (ROC-AUC={line_auc_values[lv][0]:.4f}±{line_auc_values[lv][1]:.4f})")
                 for lv in line_vals
             ]
-            fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.995, 0.97), fontsize=8, framealpha=0.9)
+            line_legend = fig.legend(
+                handles=handles, loc="upper right", bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
+            fig.canvas.draw()
+            cursor_y = (line_legend.get_window_extent(renderer).y0 - 4) / fig_h_px
 
         # Shared shading legend showing agg[1]'s values (point axis), light->dark,
         # matching the shading drawn on every line's points -- same role as
         # _plot_tpr_fpr_grid's fixed x_bin shading legend, generalized to whatever
         # axis agg[1] actually is.
-        if len(point_vals) > 1:
+        if show_shade_legend:
             shade_handles = [
                 plt.Line2D([0], [0], marker="o", linestyle="none", markersize=5,
                            markerfacecolor=_shade_color("#808080", i / max(len(point_vals) - 1, 1)),
                            markeredgecolor="white", markeredgewidth=0.6, label=str(pv))
                 for i, pv in enumerate(point_vals)
             ]
-            fig.legend(
-                handles=shade_handles, loc="upper left", bbox_to_anchor=(0.005, 0.97), fontsize=7,
+            shade_legend = fig.legend(
+                handles=shade_handles, loc="upper right", bbox_to_anchor=(0.995, cursor_y), fontsize=7,
                 framealpha=0.85, title="shade = agg[1] (light→dark)", title_fontsize=7,
             )
-        fig.tight_layout(rect=[0, 0.04, 1, 0.93])
+            fig.canvas.draw()
+            cursor_y = (shade_legend.get_window_extent(renderer).y0 - 4) / fig_h_px
+
+        fig.tight_layout(rect=[0, 0.04, 1, cursor_y])
         return fig
 
     def plot(self, axes, metrics, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
@@ -966,7 +1016,7 @@ class CrossRunAnalysis:
             return figs
 
         colors = {label: _config_color(i) for i, (label, _) in enumerate(configs)}
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         legend_handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[label]) for label, _ in configs]
         legend_labels = [label for label, _ in configs]
 
@@ -1114,58 +1164,92 @@ class CrossRunAnalysis:
         return [(v, groups[v]) for v in order]
 
     def _metric_by_label(self, configs, metric):
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         return {
             label: dfs[label][metric].dropna().mean() if not dfs[label].empty else float("nan")
             for label, _ in configs
         }
 
-    def _metric_by_axis_value(self, configs, dfs, axis_idx, metric, panel_col=None):
+    def _metric_by_axis_value(self, configs, axis_idx, metric, panel_col=None):
         """Mean+std `metric` for hue/line axis value `axis_idx` (e.g.
         axis_idx=0 pools by the hue/line axis a grouped plot's legend colors
         by -- resolve_configs_cartesian's agg[0], see its docstring),
-        averaged in two stages: each (row, col, bar, hue) config's own mean
-        first (dfs[label][metric], pooled over just that config's rows),
-        then an unweighted mean of those per-config means across every
-        config sharing the target hue value -- NOT one flat mean over every
-        row concatenated together. A flat pool implicitly weights each
-        config by however many rows it happens to have; when a hue value's
-        configs span several window/step sizes (window size pooled into one
-        legend number rather than broken out as its own column/row -- see
-        the screenshot case) those configs' row counts and n_windows can
-        differ a lot after panel/NaN filtering, so whichever one has the
-        most surviving rows would silently dominate the legend number.
-        Averaging per-config first gives every config equal say regardless
-        of its row count. Used to attach an aggregate score to each legend
-        entry in _plot_grouped/_plot_tpr_fpr_grouped. Std (not IQR, 0.0 for
-        a single config) of the per-config means, to match _draw_stat's own
-        bar errorbar convention -- note this is std across configs' means,
-        not across raw rows, so it shrinks as more configs are pooled
-        rather than reflecting per-row spread. `dfs`: configs' already-
-        loaded runs.tsv frames (label-keyed, from _load_configs_runs) --
-        passed in rather than reloaded, since callers already have it.
-        Returns {axis_value: (mean, std)}."""
+        averaged in three stages -- NOT one flat mean over every row
+        concatenated together, nor a flat mean of per-config means:
+
+        1. Each (config, window_size) pair's own mean first (that config's
+           dirs' rows for that window_size, via the "_window_size" column
+           _load_raw_config_df attaches -- a config's dirs can span several
+           window sizes when -w is a pooled, non-agg axis, see
+           resolve_configs_cartesian).
+        2. An unweighted mean of those (config, window_size) means across
+           every config sharing the target hue value, *within* each window
+           size -- "all configs in a window size" pooled first.
+        3. An unweighted mean of the resulting per-window-size numbers
+           across window sizes.
+
+        A flat pool over rows or over configs would let whichever
+        window/config happens to have the most surviving rows (after
+        panel/NaN filtering) dominate the legend number; pooling by window
+        size first, then across window sizes, gives every window size equal
+        say regardless of how many configs or rows it has.
+
+        Loads each config's dirs itself via _load_raw_config_df, deliberately
+        ignoring self._row_filters (unlike every other caller of
+        _load_configs_runs) -- a row-filter only ever comes from a
+        _DATA_COLUMN_AXES/_DYNAMIC_ROW_AXES agg level (e.g. "x_bin",
+        "fraction_bin", "em_gt_hd_bin"), which never narrows which dirs
+        match (see resolve_configs_cartesian: such a level's contribution
+        goes to row_filter, not agg_flags), so every config sharing a given
+        hue value AND real (flag-based) bar/col/row value already has
+        *identical* dirs regardless of its data-column-axis value(s) --
+        row-filtering them apart before pooling would otherwise multiply the
+        legend's granularity (and shift its number) every time a purely
+        display-oriented row-filter axis gets added to agg, e.g. adding
+        "em_gt_hd_bin"/"fraction_bin" as extra subplot col/row axes. Loading
+        raw instead means those configs just contribute identical, harmless
+        duplicate means (averaging duplicates doesn't change a mean), so the
+        legend score stays invariant to how many display axes agg carries --
+        only genuine flag-based differences (including which window sizes
+        are actually present) affect it. Used to attach an aggregate score
+        to each legend entry in _plot_grouped/_plot_tpr_fpr_grouped. Std (not
+        IQR, 0.0 for a single window size) of the per-window-size means, to
+        match _draw_stat's own bar errorbar convention -- this is std across
+        window sizes' pooled means, not across raw rows or configs. Returns
+        {axis_value: (mean, std)}."""
         def axis_val(label):
             vals = self._config_axes.get(label, [])
             return vals[axis_idx] if axis_idx < len(vals) else None
 
+        raw_cache = {}
+        def raw_df(dirs):
+            key = tuple(sorted(str(d) for d in dirs))
+            if key not in raw_cache:
+                raw_cache[key] = _load_raw_config_df(dirs, self._get_args, self._bin_specs)
+            return raw_cache[key]
+
         values = {}
         for target in _ordered_unique(axis_val(label) for label, _ in configs):
-            config_means = []
-            for label, _ in configs:
-                if axis_val(label) != target or dfs[label].empty:
+            by_window = {}
+            for label, dirs in configs:
+                if axis_val(label) != target:
                     continue
-                d = dfs[label]
+                d = raw_df(dirs)
+                if d.empty:
+                    continue
                 if panel_col is not None:
                     d = d[_is_true(d[panel_col])]
-                m = d[metric].dropna().mean()
-                if not pd.isna(m):
-                    config_means.append(m)
-            means = pd.Series(config_means, dtype=float)
-            if means.empty:
+                for window_size, sub in d.groupby("_window_size", dropna=False):
+                    m = sub[metric].dropna().mean()
+                    if not pd.isna(m):
+                        by_window.setdefault(window_size, []).append(m)
+            window_means = pd.Series(
+                [pd.Series(ms, dtype=float).mean() for ms in by_window.values()], dtype=float,
+            )
+            if window_means.empty:
                 values[target] = (float("nan"), float("nan"))
             else:
-                values[target] = (means.mean(), means.std() if len(means) > 1 else 0.0)
+                values[target] = (window_means.mean(), window_means.std() if len(window_means) > 1 else 0.0)
         return values
 
     def _plot_grouped(self, configs, metrics, plot_type, title_suffix=""):
@@ -1191,8 +1275,12 @@ class CrossRunAnalysis:
         e.g. a "low"/"high" x_bin bar only appears in an admixture column,
         not a recombination one, instead of showing as an empty tick there
         too. The legend's score per hue value is otherwise pooled across
-        every (bar, col, row) combo sharing that hue value (agg[0]), not
-        just one cell -- see _metric_by_axis_value."""
+        every *real* (flag-based) bar/col/row value sharing that hue value
+        (agg[0]), not just one cell -- but is invariant to any row-filter
+        (_DATA_COLUMN_AXES/_DYNAMIC_ROW_AXES, e.g. "x_bin", "fraction_bin",
+        "em_gt_hd_bin") axis in agg, since those only ever split the same
+        underlying dirs into more display cells without changing what's
+        actually being averaged -- see _metric_by_axis_value."""
         def axis_val(label, idx):
             vals = self._config_axes.get(label, [])
             return vals[idx] if idx < len(vals) else None
@@ -1210,7 +1298,7 @@ class CrossRunAnalysis:
             key = (axis_val(label, 3), axis_val(label, 2), axis_val(label, bar_idx), axis_val(label, hue_idx))
             by_key[key] = (label, dirs)
 
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         # Bar categories with no data at all get dropped everywhere below,
         # but which ones are non-empty can differ per (row, col) subplot
         # (e.g. a "low"/"high" x_bin only has rows for an admixture column,
@@ -1269,7 +1357,7 @@ class CrossRunAnalysis:
                         _clip_axis_to_whiskers(ax, cell_bounds)
             fig.suptitle(f"Cross-run {metric} comparison{title_suffix}", fontsize=12, y=0.99)
             if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
-                hue_metric_values = self._metric_by_axis_value(configs, dfs, hue_idx, metric, panel_col)
+                hue_metric_values = self._metric_by_axis_value(configs, hue_idx, metric, panel_col)
                 handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in hue_vals]
                 if pooled_legend:
                     hue_legend_labels = [
@@ -1360,7 +1448,7 @@ class CrossRunAnalysis:
             key = (axis_val(label, 3), axis_val(label, 2), axis_val(label, 1), axis_val(label, 0))
             by_key[key] = (label, dirs)
 
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
 
         numeric = True
         try:
@@ -1484,7 +1572,14 @@ class CrossRunAnalysis:
                     ax.set_xticks(tick_x)
                     ax.set_xticklabels(x_vals, rotation=30, ha="right", fontsize=7.5)
                     ax.set_yticks(tick_y)
-                    ax.set_yticklabels(y_vals, fontsize=7.5)
+                    # Only the leftmost column in each row needs y-tick text --
+                    # every subplot got its own labels before, which rendered
+                    # on top of the previous (left-neighbor) subplot's data
+                    # cells once panels were packed close together.
+                    if ci == 0:
+                        ax.set_yticklabels(y_vals, fontsize=7.5)
+                    else:
+                        ax.set_yticklabels([])
                     for yi, yn in enumerate(tick_y):
                         for xi, xn in enumerate(tick_x):
                             v = grid[yi][xi]
@@ -1549,7 +1644,7 @@ class CrossRunAnalysis:
         _compute_hd_bin_edges). All of a figure's subplots share one color
         scale (min/max across every config's grid) so e.g. a dvi-on vs
         dvi-off pair of subplots is visually comparable."""
-        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs)
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         all_gt_hd = [v for d in dfs.values() if not d.empty for v in d["em_gt_hd"].dropna().tolist()]
         edges = _compute_hd_bin_edges(all_gt_hd)
         hd_bins = [label for label, _, _ in edges]
@@ -1641,11 +1736,15 @@ def _matches_flags(recorded, flags):
     to equal that value (typed through the flag's own argparse type); requirement=None
     requires the recorded value be missing/null -- e.g. an older args.json written
     before that flag was added to CASTER_ARG_SPECS/PHLAG_ARG_SPECS, so the dest is
-    simply absent (recorded.get(dest) is None either way -- there's no way to tell
-    "missing key" from "explicit null" apart, and there's no need to); a _Not(value)
-    requires the recorded value NOT equal that value (NOT be missing/null, if
-    value is None) -- see _cartesian_axis_states, which builds these
-    automatically. recorded: one leaf's args.json, dest-keyed."""
+    simply absent; a _Not(value) requires the recorded value NOT equal that value --
+    see _cartesian_axis_states, which builds these automatically. A missing dest
+    (recorded.get(dest) is None) also satisfies an explicit requirement=False (and,
+    for _Not, counts as the negated value when negated is False): a store_true flag
+    that was never recorded (e.g. an older args.json written before that flag existed
+    in CASTER_ARG_SPECS/PHLAG_ARG_SPECS -- see --site, added in b0c28fa) defaulted off
+    exactly like an explicit False, so treating them as distinct would wrongly exclude
+    those older runs from a pool/agg axis pinned to that flag's off state. recorded:
+    one leaf's args.json, dest-keyed."""
     for flag, requirement in flags.items():
         dest = _FLAG_TO_DEST.get(flag)
         if dest is None:
@@ -1653,14 +1752,20 @@ def _matches_flags(recorded, flags):
         value = recorded.get(dest)
         if isinstance(requirement, _Not):
             negated = requirement.value
-            is_negated = value is None if negated is None else value == _typed_value(flag, negated)
+            if negated is None:
+                is_negated = value is None
+            else:
+                typed_negated = _typed_value(flag, negated)
+                is_negated = value == typed_negated or (value is None and typed_negated is False)
             if is_negated:
                 return False
         elif requirement is None:
             if value is not None:
                 return False
-        elif value != _typed_value(flag, requirement):
-            return False
+        else:
+            typed_requirement = _typed_value(flag, requirement)
+            if value != typed_requirement and not (value is None and typed_requirement is False):
+                return False
     return True
 
 
@@ -1976,7 +2081,39 @@ def _is_true(series):
     return series.astype(str).str.strip() == "True"
 
 
-def _load_configs_runs(configs, row_filters=None, bin_specs=None):
+def _load_raw_config_df(dirs, get_args, bin_specs=None):
+    """Concats `dirs`' runs.tsv into one frame, tagging every row with its
+    source dir's window_size as "_window_size" (a config's dirs, see
+    resolve_configs_cartesian, can span several window sizes when -w is a
+    pooled, non-agg axis) and adding the same merged_category/bin_specs
+    derived columns _load_configs_runs does -- but with NO row_filter
+    applied. get_args: run_dir -> args.json dict (pass a CrossRunAnalysis
+    instance's self._get_args to reuse its cache). Used directly by
+    _metric_by_axis_value, which needs a config's full underlying data
+    regardless of any row-filter (x_bin, fraction_bin, em_gt_hd_bin, ...)
+    agg axis -- otherwise the legend score it computes would shift just
+    because a display-only row-filter axis was added to agg, splitting the
+    same underlying dirs into more, smaller row-filtered buckets that then
+    get pooled as if they were separate configs."""
+    frames = []
+    for d in dirs:
+        p = Path(d) / "runs.tsv"
+        if not p.exists():
+            continue
+        frame = pd.read_csv(p, sep="\t")
+        frame["_window_size"] = get_args(d).get("window_size")
+        frames.append(frame)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not df.empty and "category" in df.columns and "subcategory" in df.columns:
+        df["merged_category"] = _merged_category(df["category"], df["subcategory"])
+    if not df.empty and bin_specs:
+        for bin_col, (source_col, edges) in bin_specs.items():
+            if source_col in df.columns:
+                df[bin_col] = df[source_col].apply(lambda v: assign_bin(v, edges))
+    return df
+
+
+def _load_configs_runs(configs, row_filters=None, bin_specs=None, get_args=None):
     """row_filters: {label: {col: value, ...}}, from resolve_configs_cartesian
     agg'ing by a _DATA_COLUMN_AXES name (e.g. "x_bin") -- restricts that
     config's rows to matching values after loading, since (unlike a flag) a
@@ -1986,20 +2123,14 @@ def _load_configs_runs(configs, row_filters=None, bin_specs=None):
     "em_hd_bin") via assign_bin(source_col value, edges), same derived-column
     treatment as merged_category, before row_filters get applied (so a
     row_filter naming a bin_col, e.g. from agg=["em_hd_bin"], has something
-    to filter on)."""
+    to filter on). get_args: run_dir -> args.json dict, defaults to an
+    uncached _read_args_json call; pass a CrossRunAnalysis instance's
+    self._get_args to reuse its args.json cache. See _load_raw_config_df for
+    the (row_filter-less) per-dir loading this wraps."""
+    get_args = get_args or (lambda d: _read_args_json(Path(d) / "args.json"))
     result = {}
     for label, dirs in configs:
-        frames = [
-            pd.read_csv(p, sep="\t")
-            for d in dirs if (p := Path(d) / "runs.tsv").exists()
-        ]
-        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        if not df.empty and "category" in df.columns and "subcategory" in df.columns:
-            df["merged_category"] = _merged_category(df["category"], df["subcategory"])
-        if not df.empty and bin_specs:
-            for bin_col, (source_col, edges) in bin_specs.items():
-                if source_col in df.columns:
-                    df[bin_col] = df[source_col].apply(lambda v: assign_bin(v, edges))
+        df = _load_raw_config_df(dirs, get_args, bin_specs)
         row_filter = (row_filters or {}).get(label)
         if row_filter and not df.empty:
             for col, value in row_filter.items():

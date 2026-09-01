@@ -58,6 +58,26 @@ def parse_arguments(argv=None):
         help="Forwarded to caster's --pair (caster-pair/quartet-scoring mode instead of dstar).",
     )
     parser.add_argument(
+        "--site",
+        dest="site",
+        action="store_true",
+        help="Forwarded to caster's --site (caster-site quartet-scoring mode instead of dstar).",
+    )
+    parser.add_argument(
+        "-z",
+        "--zscale",
+        dest="zscale",
+        action="store_true",
+        help="Forwarded to caster's -z/--zscale.",
+    )
+    parser.add_argument(
+        "-i",
+        "--ilr",
+        dest="ilr",
+        action="store_true",
+        help="Forwarded to caster's -i/--ilr.",
+    )
+    parser.add_argument(
         "--chunk",
         dest="chunk_size",
         type=int_or_abbrev,
@@ -178,6 +198,20 @@ def parse_arguments(argv=None):
         default=None,
         help="Forwarded to phlag's --correct-transition.",
     )
+    parser.add_argument(
+        "--rho",
+        dest="rho",
+        type=float,
+        default=None,
+        help="Forwarded to phlag's --rho (default: whatever phlag's own default is).",
+    )
+    parser.add_argument(
+        "--beta",
+        dest="beta",
+        type=float,
+        default=None,
+        help="Forwarded to phlag's --beta (default: whatever phlag's own default is).",
+    )
     return parser.parse_args(argv)
 
 
@@ -201,6 +235,12 @@ def main(argv=None):
         caster_extra_args += ["--shift-caster"]
     if args.pair:
         caster_extra_args += ["--pair"]
+    if args.site:
+        caster_extra_args += ["--site"]
+    if args.zscale:
+        caster_extra_args += ["-z"]
+    if args.ilr:
+        caster_extra_args += ["-i"]
     if args.chunk_size is not None:
         caster_extra_args += ["--chunk", str(args.chunk_size)]
     if args.chunk_scores is not None:
@@ -243,6 +283,10 @@ def main(argv=None):
         phlag_extra_args += ["-p", str(args.best_paths)]
     if args.correct_transition is not None:
         phlag_extra_args += ["--correct-transition", args.correct_transition]
+    if args.rho is not None:
+        phlag_extra_args += ["--rho", str(args.rho)]
+    if args.beta is not None:
+        phlag_extra_args += ["--beta", str(args.beta)]
     # phlag has no -d/--dist-type flag -- model_design is inferred from the
     # scores.tsv/report.tsv filename, which already carries the dist_type
     # (see phlag.Phlag.extract_distribution_type_from_filename).

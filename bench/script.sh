@@ -1,13 +1,14 @@
-# rm -r logs/*;
-# grep '^benchmark' bench/script.sh | sed 's/;$//' | \
-#   xargs -P 35 -I CMD env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 bash -c '
-#     cmd="CMD"
-#     name=$(echo "$cmd" | grep -oE "gaussian/[^ ]+" | tail -1 | sed "s#gaussian/##" | tr "/" "_")
-#     eval "$cmd" > "logs/${name}.log" 2>&1
-#     echo "done: $name (exit $?)"
-#   '
-
-benchmark --create store/phlag/gaussian/c25k_s25k/normalize/rho0.9_beta4.0/repulsion/annealing/lam1.5 --pair --normalize -c 25k -s 25k --ap repulsion --lam 1.5 --annealing --rho 0.9 --beta 4.0;
-benchmark --create store/phlag/gaussian/c25k_s25k/zscale/rho0.9_beta4.0/repulsion/annealing/lam1.5 --pair --zscale -c 25k -s 25k --ap repulsion --lam 1.5 --annealing --rho 0.9 --beta 4.0;
-benchmark --create store/phlag/gaussian/c25k_s25k/site/normalize/rho0.9_beta4.0/repulsion/annealing/lam1.5 --site --normalize -c 25k -s 25k --ap repulsion --lam 1.5 --annealing --rho 0.9 --beta 4.0;
-benchmark --create store/phlag/gaussian/c25k_s25k/site/zscale/rho0.9_beta4.0/repulsion/annealing/lam1.5 --site --zscale -c 25k -s 25k --ap repulsion --lam 1.5 --annealing --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w25k_s25k/ilr/rho0.9_beta4.0/repulsion/lam1.5 -w 25k -s 25k --ilr --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w25k_s25k/ilr/rho0.9_beta4.0 -w 25k -s 25k --ilr --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w50k_s50k/ilr/rho0.9_beta4.0/repulsion/lam1.5 -w 50k -s 50k --ilr --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w50k_s50k/ilr/rho0.9_beta4.0 -w 50k -s 50k --ilr --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w10_s10/ilr/rho0.9_beta4.0/ -w 10 -s 10 --ilr --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w10_s10/ilr/rho0.9_beta4.0/repulsion/lam1.5 -w 10 -s 10 --ilr --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w10_s10/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 10 -s 10 --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w100_s100/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 100 -s 100 --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w1k_s1k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 1k -s 1k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w2k_s2k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 2k -s 2k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w5k_s5k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 5k -s 5k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w10k_s10k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 10k -s 10k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w25k_s25k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 25k -s 25k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w50k_s50k/ilr/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 50k -s 50k --ilr --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
