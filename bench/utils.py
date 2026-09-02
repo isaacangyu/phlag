@@ -21,6 +21,7 @@ from bench.benchmark import (
     _read_args_json,
     assign_bin,
 )
+from phlag.caster import int_or_abbrev
 from phlag.utils import ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
 
 STORE_ROOT = "store/phlag"
@@ -158,31 +159,35 @@ _FLAG_TO_DEST = {
     for option_string, action in _PARSER._option_string_actions.items()
     if action.dest in _MIRRORED_DESTS
 }
+# dest -> its long ("--...") option string, so a short-form token (e.g. "-w")
+# and its long form (e.g. "--window-size") both resolve to the same canonical
+# name -- used to always display/store a flag's long form (see
+# _canonical_flag_name) regardless of which alias a caller's axes/agg used.
+_DEST_TO_LONG_FLAG = {}
+for _option_string, _action in _PARSER._option_string_actions.items():
+    if _action.dest in _MIRRORED_DESTS and _action.dest not in _DEST_TO_LONG_FLAG:
+        _long_opts = [opt for opt in _action.option_strings if opt.startswith("--")]
+        if _long_opts:
+            _DEST_TO_LONG_FLAG[_action.dest] = _long_opts[0]
+del _option_string, _action, _long_opts
+
+
+def _canonical_flag_name(flag):
+    """flag's long-form option string (e.g. "-w" -> "--window-size"), or flag
+    itself unchanged if it's not a recognized mirrored CLI flag (e.g. a
+    _DATA_COLUMN_AXES/_DYNAMIC_ROW_AXES name like "x_bin") or already has no
+    short alias."""
+    dest = _FLAG_TO_DEST.get(flag)
+    return _DEST_TO_LONG_FLAG.get(dest, flag) if dest is not None else flag
 _PARAM_LABELS = {"emission_lambda": "lambda"}
 
 _CONFIG_PALETTE = list(matplotlib.colormaps["tab10"].colors)
 
 
-class _Not:
-    """Marks a flags-dict value as "not this" -- used internally to auto-derive an
-    axis's off-state from its on-state; never constructed directly by callers."""
-    __slots__ = ("value",)
-    def __init__(self, value):
-        self.value = value
-    def __repr__(self):
-        return f"_Not({self.value!r})"
-
-
 def _match_cache_key(flags):
     """Canonical, order-independent, hashable key for a find_matching_leaf_dirs
-    `flags` dict -- used to memoize its result (see find_matching_leaf_dirs).
-    _Not has no __eq__/__hash__ of its own (two separately-constructed
-    _Not(False) instances are otherwise distinct by identity), so it's
-    unwrapped to a ("NOT", value) tuple here instead of hashed directly."""
-    return tuple(sorted(
-        (flag, ("NOT", req.value) if isinstance(req, _Not) else req)
-        for flag, req in flags.items()
-    ))
+    `flags` dict -- used to memoize its result (see find_matching_leaf_dirs)."""
+    return tuple(sorted(flags.items()))
 
 
 class CrossRunAnalysis:
@@ -417,14 +422,11 @@ class CrossRunAnalysis:
     def resolve_configs_cartesian(self, axes, exclude_keywords=(), agg=()):
         """axes: {flag: value_spec} dict, one entry per flag -- e.g.
         {"-d": "gaussian", "-s": "1k", "--double-variance-init": True, "--lam": [1.0, 1.5]}.
-        A list value_spec is an explicit multi-value axis, iterated as-is (no
-        other state). Any other value_spec is a binary on/off toggle
-        (on=value_spec, off=its negation) -- there's no separate "just pin this"
-        mode, so a flag meant to stay fixed for every resulting config (e.g.
-        -d/-s above) is still written as an on/off entry; if its negation
-        genuinely has no matching runs on disk, that side is silently skipped
-        (see resolve_configs), which is how a "fixed" flag ends up behaving
-        like one in practice. exclude_keywords: see resolve_configs.
+        A list value_spec is an explicit multi-value axis, iterated as-is. A
+        bare (non-list) value_spec pins that flag to exactly that one value --
+        equivalent to wrapping it in a single-element list -- e.g. -d/-s above
+        each match only their given value, no other state. exclude_keywords:
+        see resolve_configs.
 
         agg: the subset of axes' keys to categorize by -- their cartesian
         combinations each become their own config/bar, and their values are all
@@ -467,7 +469,9 @@ class CrossRunAnalysis:
         get loaded, e.g. by plot/print_configs -- see
         _load_configs_runs) restricting it to just that x_bin/fraction_bin/
         column value. Its `axes` entry, if given, must be an explicit list
-        (no auto on/off toggle). Left out of `axes` entirely, a
+        (a bare value_spec doesn't apply to these -- there's no single-flag
+        state to pin, only a set of values to filter rows by). Left out of
+        `axes` entirely, a
         _DATA_COLUMN_AXES name uses its fixed default enumeration (already
         known from benchmark.py); a _DYNAMIC_ROW_AXES name instead
         auto-discovers its default list from runs.tsv on disk (like a CLI
@@ -597,7 +601,7 @@ class CrossRunAnalysis:
             else:
                 continue  # not a flag, not a data column -- silently skipped, as before
             levels.append((name, states))
-        level_names = [_strip_flag(name) if name in _FLAG_TO_DEST else name for name, _ in levels]
+        level_names = [_strip_flag(_canonical_flag_name(name)) if name in _FLAG_TO_DEST else name for name, _ in levels]
         level_key_names = [name for name, _ in levels]
 
         configs = []
@@ -665,7 +669,7 @@ class CrossRunAnalysis:
 
     # ---- cross-run PNG-metric grids ----
 
-    def _plot_tpr_fpr_grid(self, configs, title="Cross-run TPR/FPR comparison"):
+    def _plot_tpr_fpr_grid(self, configs, title="TPR/FPR"):
         colors = {label: _config_color(i) for i, (label, _) in enumerate(configs)}
         auc_by_label = self._metric_by_label(configs, "roc_auc")
 
@@ -739,8 +743,16 @@ class CrossRunAnalysis:
 
         line_vals = _ordered_unique(axis_val(label, 0) for label, _ in configs)
         point_vals = _ordered_unique(axis_val(label, 1) for label, _ in configs)
-        col_vals = _ordered_unique(axis_val(label, 2) for label, _ in configs)
-        row_vals = _ordered_unique(axis_val(label, 3) for label, _ in configs)
+        # col/row (agg[2]/[3], the subplot grid) are sorted numerically-aware
+        # rather than left in _ordered_unique's first-seen order -- unlike
+        # line/point (agg[0]/[1], color/shading), a grid axis has no other
+        # ordering signal, and first-seen order is fragile to a value being
+        # skipped for the first several (line, point) combos it's tried
+        # against (e.g. a window size missing data at one --annealing state
+        # but not another) and only "discovered" later, landing it out of
+        # order (e.g. w10 sorting after w50k) -- see _token_sort_key.
+        col_vals = sorted(_ordered_unique(axis_val(label, 2) for label, _ in configs), key=_token_sort_key)
+        row_vals = sorted(_ordered_unique(axis_val(label, 3) for label, _ in configs), key=_token_sort_key)
 
         by_key = {}
         for label, dirs in configs:
@@ -861,7 +873,7 @@ class CrossRunAnalysis:
         return fig
 
     def plot(self, axes, metrics, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
-             title="Cross-run comparison"):
+             title=""):
         """Resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
         (see its docstring, including its "" placeholder and tuple-axis
         handling) and renders the result -- one call replaces the old
@@ -988,10 +1000,11 @@ class CrossRunAnalysis:
         figs = []
         if "tpr_fpr" in metrics:
             levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
+            tpr_fpr_title = _compose_title(suffix, title, "TPR/FPR")
             if levels >= 2:
-                figs.append(self._plot_tpr_fpr_grouped(configs, title=f"{title} (TPR/FPR){suffix}"))
+                figs.append(self._plot_tpr_fpr_grouped(configs, title=tpr_fpr_title))
             else:
-                figs.append(self._plot_tpr_fpr_grid(configs, title=f"{title} (TPR/FPR){suffix}"))
+                figs.append(self._plot_tpr_fpr_grid(configs, title=tpr_fpr_title))
         metrics = [m for m in metrics if m != "tpr_fpr"]
         self.metrics = [m for panel in metrics for m in (panel if isinstance(panel, tuple) else (panel,))]
         if not metrics:
@@ -1056,7 +1069,8 @@ class CrossRunAnalysis:
                             cell_bounds.append(_draw_stat(ax, cfg_idx, dd[metric], colors[label], 1.0, plot_type))
                         if plot_type == "violin" and not bounded:
                             _clip_axis_to_whiskers(ax, cell_bounds)
-                fig.suptitle(f"Cross-run {metric} by HD bin{suffix}", fontsize=12, y=0.995)
+                metric_part = metric if len(metrics) > 1 else ""
+                fig.suptitle(_compose_title(suffix, metric_part, "by HD bin"), fontsize=12, y=0.995)
                 metric_values = self._metric_by_label(configs, metric)
                 agg_legend_labels = [f"{label} ({metric}={metric_values[label]:.4f})" for label in legend_labels]
                 fig.legend(legend_handles, agg_legend_labels, loc="upper right",
@@ -1107,7 +1121,7 @@ class CrossRunAnalysis:
                     cell_bounds.append(_draw_stat(ax, cfg_idx, d[metric], colors[label], 1.0, plot_type))
                 if plot_type == "violin" and not bounded:
                     _clip_axis_to_whiskers(ax, cell_bounds)
-        fig.suptitle(f"{title}{suffix}", fontsize=12, y=0.99)
+        fig.suptitle(_compose_title(suffix, title), fontsize=12, y=0.99)
         flat_metrics = [m for panel in metrics for m in (panel if isinstance(panel, tuple) else (panel,))]
         metric_values = {metric: self._metric_by_label(configs, metric) for metric in flat_metrics}
         agg_legend_labels = [
@@ -1150,7 +1164,7 @@ class CrossRunAnalysis:
         used by plot's heatmap grid_by generalization to render one
         heatmap figure per group instead of cramming every config into one
         shared figure."""
-        norm = _strip_flag(axis_name) if axis_name in _FLAG_TO_DEST else axis_name
+        norm = _strip_flag(_canonical_flag_name(axis_name)) if axis_name in _FLAG_TO_DEST else axis_name
         order = []
         groups = {}
         for label, dirs in configs:
@@ -1287,8 +1301,12 @@ class CrossRunAnalysis:
 
         hue_vals = _ordered_unique(axis_val(label, 0) for label, _ in configs)
         bar_vals = _ordered_unique(axis_val(label, 1) for label, _ in configs)
-        col_vals = _ordered_unique(axis_val(label, 2) for label, _ in configs)
-        row_vals = _ordered_unique(axis_val(label, 3) for label, _ in configs)
+        # col/row (agg[2]/[3], the subplot grid) sorted numerically-aware --
+        # see the identical comment in _plot_tpr_fpr_grouped.
+        col_vals = sorted(_ordered_unique(axis_val(label, 2) for label, _ in configs), key=_token_sort_key)
+        row_vals = sorted(_ordered_unique(axis_val(label, 3) for label, _ in configs), key=_token_sort_key)
+        agg_names = self._agg_axis_names.get(configs[0][0], []) if configs else []
+        bar_axis_label = _axis_flag_label(agg_names[1]) if len(agg_names) > 1 else ""
 
         hue_idx, bar_idx = 0, 1
         pooled_legend = hue_vals == ["(none)"] and len(bar_vals) > 1
@@ -1355,7 +1373,10 @@ class CrossRunAnalysis:
                             cell_bounds.append(_draw_stat(ax, bi + offset, d[metric], colors[hv], bar_width, plot_type))
                     if plot_type == "violin" and not bounded:
                         _clip_axis_to_whiskers(ax, cell_bounds)
-            fig.suptitle(f"Cross-run {metric} comparison{title_suffix}", fontsize=12, y=0.99)
+            fig.suptitle(_compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
+            if bar_axis_label:
+                fig.supxlabel(bar_axis_label, fontsize=9)
+            fig.supylabel(metric, fontsize=9)
             if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
                 hue_metric_values = self._metric_by_axis_value(configs, hue_idx, metric, panel_col)
                 handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in hue_vals]
@@ -1435,6 +1456,9 @@ class CrossRunAnalysis:
         y_vals = _ordered_unique(axis_val(label, 1) for label, _ in configs)
         col_vals = _ordered_unique(axis_val(label, 2) for label, _ in configs)
         row_vals = _ordered_unique(axis_val(label, 3) for label, _ in configs)
+        agg_names = self._agg_axis_names.get(configs[0][0], []) if configs else []
+        x_axis_label = _axis_flag_label(agg_names[0]) if len(agg_names) > 0 else ""
+        y_axis_label = _axis_flag_label(agg_names[1]) if len(agg_names) > 1 else ""
 
         n_agg_levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
         metric_role = n_agg_levels if len(metrics) > 1 and n_agg_levels in (2, 3) else None
@@ -1592,7 +1616,12 @@ class CrossRunAnalysis:
                         ax.set_ylabel(str(rv), fontsize=9, labelpad=28)
             title_metric = "/".join(metrics) if metric_role else outer_metric
             base_label = "value" if metric_role else outer_metric
-            fig.suptitle(f"Cross-run {title_metric} heatmap{title_suffix}", fontsize=12)
+            multi_metric = metric_role is None and len(metrics) > 1
+            fig.suptitle(_compose_title(title_suffix, title_metric if multi_metric else "", "heatmap"), fontsize=12)
+            if x_axis_label:
+                fig.supxlabel(x_axis_label, fontsize=9)
+            if y_axis_label:
+                fig.supylabel(y_axis_label, fontsize=9)
             all_axes = list(axes.flat)
             if diff_mesh is None:
                 # Ordinary (unsigned) heatmap, or a signed one whose baseline
@@ -1692,7 +1721,8 @@ class CrossRunAnalysis:
                             color = "white" if (v - vmin) / (vmax - vmin or 1) > 0.6 else "black"
                             ax.text(ci + 0.5, ri + 0.5, f"{v:.3f}", ha="center", va="center",
                                      color=color, fontsize=6.5)
-            fig.suptitle(f"Cross-run {metric} by HD bin x alt proportion{title_suffix}", fontsize=11, y=1.0)
+            metric_part = metric if len(metrics) > 1 else ""
+            fig.suptitle(_compose_title(title_suffix, metric_part, "by HD bin x alt proportion"), fontsize=11, y=1.0)
             fig.text(0.5, 0.01, "HD bin (em_gt_hd)", ha="center", fontsize=8.5)
             fig.text(0.005, 0.5, "alt proportion", va="center", rotation="vertical", fontsize=8.5)
             fig.colorbar(mesh, ax=axes[0].tolist(), label=metric, fraction=0.05, pad=0.02)
@@ -1736,31 +1766,27 @@ def _matches_flags(recorded, flags):
     to equal that value (typed through the flag's own argparse type); requirement=None
     requires the recorded value be missing/null -- e.g. an older args.json written
     before that flag was added to CASTER_ARG_SPECS/PHLAG_ARG_SPECS, so the dest is
-    simply absent; a _Not(value) requires the recorded value NOT equal that value --
-    see _cartesian_axis_states, which builds these automatically. A missing dest
-    (recorded.get(dest) is None) also satisfies an explicit requirement=False (and,
-    for _Not, counts as the negated value when negated is False): a store_true flag
-    that was never recorded (e.g. an older args.json written before that flag existed
-    in CASTER_ARG_SPECS/PHLAG_ARG_SPECS -- see --site, added in b0c28fa) defaulted off
-    exactly like an explicit False, so treating them as distinct would wrongly exclude
-    those older runs from a pool/agg axis pinned to that flag's off state. recorded:
-    one leaf's args.json, dest-keyed."""
+    simply absent. A missing dest (recorded.get(dest) is None) also satisfies an
+    explicit requirement=False, AND a recorded explicit False also satisfies
+    requirement=None -- both directions of the same "missing == off" equivalence for
+    a store_true flag that some args.json predate and others record explicitly (e.g.
+    --site, added in b0c28fa: some leaf dirs' args.json were written before it existed
+    at all, recording nothing, while sibling dirs re-run since then record `"site":
+    false` explicitly for the exact same off state) -- treating those as distinct
+    would wrongly exclude one sibling or the other from a pool/agg axis pinned to
+    that flag's off state (requirement=False) or its "never recorded" state
+    (requirement=None), even though on disk they mean the same thing. Safe for any
+    flag type, not just booleans: an `is False` identity check only ever matches a
+    literal recorded False, never a falsy non-bool value (0, ""), which a numeric/
+    string flag could otherwise (rarely, and likely a data bug if so) have recorded.
+    recorded: one leaf's args.json, dest-keyed."""
     for flag, requirement in flags.items():
         dest = _FLAG_TO_DEST.get(flag)
         if dest is None:
             raise KeyError(f"{flag!r} is not one of benchmark.py's mirrored caster/phlag flags")
         value = recorded.get(dest)
-        if isinstance(requirement, _Not):
-            negated = requirement.value
-            if negated is None:
-                is_negated = value is None
-            else:
-                typed_negated = _typed_value(flag, negated)
-                is_negated = value == typed_negated or (value is None and typed_negated is False)
-            if is_negated:
-                return False
-        elif requirement is None:
-            if value is not None:
+        if requirement is None:
+            if value is not None and value is not False:
                 return False
         else:
             typed_requirement = _typed_value(flag, requirement)
@@ -1771,6 +1797,37 @@ def _matches_flags(recorded, flags):
 
 def _strip_flag(flag):
     return flag.lstrip("-")
+
+
+def _compose_title(suffix, *parts):
+    """Joins optional leading title parts (e.g. a metric name, gated on
+    whether this figure is one of several -- see plot()'s docstring) with
+    _title_suffix's " — <restriction>" text (bare, no leading " — ") using a
+    single " — " separator, dropping any empty piece -- so a figure's title
+    never carries boilerplate like "Cross-run"/"comparison", just whatever
+    identifies its content (metric, if given) and the configs it covers
+    (the restriction)."""
+    bare_suffix = suffix[len(" — "):] if suffix.startswith(" — ") else suffix.strip()
+    pieces = [p for p in parts if p] + ([bare_suffix] if bare_suffix else [])
+    return " — ".join(pieces)
+
+
+def _axis_flag_label(name):
+    """Display text for an agg axis's own name (self._agg_axis_names, already
+    canonicalized to a CLI flag's long form and _strip_flag-ed by
+    resolve_configs_cartesian -- see _canonical_flag_name) as an x/y axis
+    label -- dashes/underscores become spaces (e.g. "window-size" -> "window
+    size", "x_bin" -> "x bin"), a tuple axis's raw member tokens (e.g.
+    ("--ap", "--annealing"), NOT yet canonicalized/stripped -- unlike a plain
+    flag axis's name, resolve_configs_cartesian stores a tuple axis's name
+    as-is) are each canonicalized and joined with " / ", and the ""
+    placeholder axis (see resolve_configs_cartesian's agg docstring) has no
+    label at all."""
+    if isinstance(name, tuple):
+        return " / ".join(_axis_flag_label(_canonical_flag_name(n)) for n in name)
+    if not name:
+        return ""
+    return _strip_flag(name).replace("-", " ").replace("_", " ")
 
 
 def _pool_axes_label(pool_axes):
@@ -1787,11 +1844,12 @@ def _pool_axes_label(pool_axes):
 
 
 def _combo_label_part(flag, requirement):
-    """Display text for one axis's state in a suffix combo label: an on-state renders as
+    """Display text for one axis's state in a suffix combo label: a True value renders as
     its bare value (value flags, e.g. "repulsion" for {"--ap": "repulsion"}) or bare flag
     name stripped of leading dashes (bool flags, e.g. "annealing"); requirement=None (the
-    flag is missing from args.json) renders as "no-<flag>"; an off/negated state
-    is dropped entirely (returns None) rather than shown with a "!" prefix. -w/-s
+    flag is missing from args.json) renders as "no-<flag>"; a False value
+    is dropped entirely (returns None) rather than shown with a "!" prefix, since it's
+    the default/off state for a store_true flag. -w/-s
     specifically render as "w"/"s" glued directly onto their value, shortened to a
     k/m suffix like the rest of the codebase (e.g. {"-w": "50000"} -> "w50k"). A
     fractional -s value (e.g. 0.8, meaning 80% of whatever window it ends up
@@ -1800,7 +1858,7 @@ def _combo_label_part(flag, requirement):
     until matched against a specific window."""
     if requirement is True:
         return _strip_flag(flag)
-    if requirement is False or isinstance(requirement, _Not):
+    if requirement is False:
         return None
     if requirement is None:
         return f"no-{_strip_flag(flag)}"
@@ -1817,15 +1875,16 @@ def _combo_label(flags, empty_label):
 
 
 def _cartesian_axis_states(flag, value_spec):
-    """A scalar value_spec is a binary on/off axis (on=value_spec, off=its
-    negation) -- e.g. {"--annealing": True}. A list value_spec is an explicit
-    multi-value axis, used as-is with no automatic off/negation state -- e.g.
-    {"-w": ["50k", "100k", "250k"]}. None is a valid list element (or scalar):
-    it means the flag is missing from args.json entirely -- e.g. {"--lam": [None,
-    1.0, 1.5]} includes runs with no recorded lambda alongside 1.0 and 1.5."""
+    """A list value_spec is an explicit multi-value axis, used as-is -- e.g.
+    {"-w": ["50k", "100k", "250k"]}. A bare (non-list) value_spec pins the axis to
+    exactly that one value, equivalent to a single-element list -- e.g.
+    {"--annealing": True} matches only annealing=True, never pooling in
+    annealing=False too. None is a valid list element (or bare value): it means
+    the flag is missing from args.json entirely -- e.g. {"--lam": [None, 1.0,
+    1.5]} includes runs with no recorded lambda alongside 1.0 and 1.5."""
     if isinstance(value_spec, list):
         return [{flag: v} for v in value_spec]
-    return [{flag: value_spec}, {flag: _Not(value_spec)}]
+    return [{flag: value_spec}]
 
 
 def _as_step_fraction(value):
@@ -1854,16 +1913,13 @@ def _resolve_step_fraction(flags):
     floored at 1) -- matching args.json's always-absolute recorded
     step_size, since a fraction is never itself a real recorded value.
     Returns `flags` unchanged otherwise (including when -s isn't a
-    fraction, -w is missing, or -w is itself negated/unresolved)."""
+    fraction or -w is missing)."""
     if "-s" not in flags or "-w" not in flags:
         return flags
     frac = _as_step_fraction(flags["-s"])
     if frac is None:
         return flags
-    w_val = flags["-w"]
-    if isinstance(w_val, _Not):
-        return flags
-    w_int = _typed_value("-w", w_val)
+    w_int = _typed_value("-w", flags["-w"])
     flags = dict(flags)
     flags["-s"] = max(1, round(frac * w_int))
     return flags
@@ -1991,17 +2047,29 @@ def _ordered_unique(values):
 
 
 _LEADING_NUM_RE = re.compile(r"[-+]?\d+\.?\d*")
+_ABBREV_TOKEN_RE = re.compile(r"^[A-Za-z]*(-?\d+\.?\d*[km]?)$", re.IGNORECASE)
 
 
 def _token_sort_key(token):
-    """Sorts a heatmap axis's raw label tokens numerically when possible
-    instead of lexicographically -- "80000" must sort after "40000", not
-    before it. token is usually a string, but can be the Python None
-    self._config_axes falls back to for an axis slot that doesn't exist for
-    a given config (e.g. y when a heatmap's agg only has 1 real level) --
+    """Sorts a heatmap/subplot-grid axis's raw label tokens numerically when
+    possible instead of lexicographically -- "80000" must sort after
+    "40000", not before it. token is usually a string, but can be the Python
+    None self._config_axes falls back to for an axis slot that doesn't exist
+    for a given config (e.g. y when a heatmap's agg only has 1 real level) --
     float(None) raises TypeError, not ValueError, so that's caught too
     rather than propagating out of what looks like a harmless sort call;
     None sorts last (after both numeric and non-numeric strings).
+
+    A -w/-s display token (_combo_label_part, e.g. "w50k", "w100") glues a
+    bare flag letter onto a k/m-abbreviated value, which a whole-token
+    float() parse can't see through -- and treating "w50k"/"w10k" as
+    literal-string-order or via the bin-range fallback below (which reads
+    only the leading digits, "50"/"10", ignoring the k/m multiplier)
+    resorts to a lexicographic-ish order that would land e.g. "w10" after
+    "w50k" instead of near "w100". So a token matching
+    <letters><number><k/m?> (anchored, nothing else in the string) is
+    parsed with int_or_abbrev (same parser CLI flags like -w/-s/-L use) once
+    the leading letters are stripped, ahead of the bin-range fallback.
 
     A whole-token float() parse fails for a bin-range label like
     "[0.000,0.067]"/"(0.067,0.133]" (_compute_hd_bin_edges), so this falls
@@ -2010,15 +2078,28 @@ def _token_sort_key(token):
     first bin's "[..." after every other bin's "(..." (since '(' < '['
     lexicographically), landing the lowest bin last instead of first. Only
     a token with no number at all (e.g. a plain category name) falls back
-    to the raw string."""
+    to the raw string -- except a merged_category value (e.g. "recombination
+    up", "admixture"), which sorts by _MERGED_CATEGORY_ORDER instead: several
+    of these (e.g. "10X up"/"10X down") contain a leading number that would
+    otherwise misroute them into the numeric branch below by their category
+    name's incidental digits rather than their actual (non-numeric) meaning,
+    so this is checked first, before any numeric parse is attempted."""
     if token is None:
         return (2, "")
+    if isinstance(token, str) and token in _MERGED_CATEGORY_ORDER:
+        return (-1, _MERGED_CATEGORY_ORDER.index(token))
     try:
         return (0, float(token))
     except (TypeError, ValueError):
         pass
-    if isinstance(token, str) and (m := _LEADING_NUM_RE.search(token)):
-        return (0, float(m.group()))
+    if isinstance(token, str):
+        if m := _ABBREV_TOKEN_RE.match(token):
+            try:
+                return (0, float(int_or_abbrev(m.group(1))))
+            except ValueError:
+                pass
+        if m := _LEADING_NUM_RE.search(token):
+            return (0, float(m.group()))
     return (1, token)
 
 
