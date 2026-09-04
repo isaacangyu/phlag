@@ -1,5 +1,19 @@
-benchmark --create store/phlag/gaussian/w25k_s25k/rho0.9_beta4.0/repulsion/lam1.5 -w 25k -s 25k --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
-benchmark --create store/phlag/gaussian/w50k_s50k/rho0.9_beta4.0/repulsion/lam1.5 -w 50k -s 50k --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
-benchmark --create store/phlag/gaussian/w10_s10/rho0.9_beta4.0/ -w 10 -s 10 --ilr --rho 0.9 --beta 4.0 --skip caster;
-benchmark --create store/phlag/gaussian/w10_s10/rho0.9_beta4.0/repulsion/lam1.5 -w 10 -s 10 --ap repulsion --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
-benchmark --create store/phlag/gaussian/w10_s10/rho0.9_beta4.0/repulsion/annealing/lam1.5 -w 10 -s 10 --ap repulsion --annealing --lam 1.5 --rho 0.9 --beta 4.0 --skip caster;
+benchmark --create store/phlag/gaussian/w1_s1/normalize -w 1 -s 1 -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w10_s10/normalize -w 10 -s 10 -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w100_s100/normalize -w 100 -s 100 -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w1k_s1k/normalize -w 1k -s 1k -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w2k_s2k/normalize -w 2k -s 2k -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w5k_s5k/normalize -w 5k -s 5k -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w10k_s10k/normalize -w 10k -s 10k -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w25k_s25k/normalize -w 25k -s 25k -n --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w50k_s50k/normalize -w 50k -s 50k -n --rho 0.9 --beta 4.0;
+
+benchmark --create store/phlag/gaussian/w1_s1/site -w 1 -s 1 --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w10_s10/site -w 10 -s 10 --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w100_s100/site -w 100 -s 100 --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w1k_s1k/site -w 1k -s 1k --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w2k_s2k/site -w 2k -s 2k --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w5k_s5k/site -w 5k -s 5k --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w10k_s10k/site -w 10k -s 10k --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w25k_s25k/site -w 25k -s 25k --site --rho 0.9 --beta 4.0;
+benchmark --create store/phlag/gaussian/w50k_s50k/site -w 50k -s 50k --site --rho 0.9 --beta 4.0;

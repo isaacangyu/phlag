@@ -322,6 +322,26 @@ def apply_ilr_to_scores_file(src_path, dst_path, has_q123):
         raise
 
 
+def copy_quartet_counts_if_missing(src_dir, dst_dir):
+    """
+    Propagates a sibling quartet_counts.tsv (dstar.cpp/caster-site.cpp's
+    diagnostic per-window quartet-count companion, see plot_quartet_counts) from
+    src_dir to dst_dir when dst_dir doesn't already have one -- used by the
+    --ilr/--normalize/exact-cache short-circuits below, which reuse an
+    already-computed scores.tsv instead of re-running the binary, so
+    quartet_counts.tsv (unaffected by ILR/normalize -- it's about raw per-site
+    score sign, not the scaled score columns) would otherwise never appear
+    next to the transformed/cached output. No-op if src has none, or dst
+    already has one (never overwrites).
+    """
+    src_path = src_dir / "quartet_counts.tsv"
+    dst_path = dst_dir / "quartet_counts.tsv"
+    if dst_path.exists() or not src_path.exists():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src_path, dst_path)
+
+
 def get_fasta_length(fasta_path):
     length = 0
     with open(fasta_path, "r") as f:
@@ -336,7 +356,7 @@ def get_fasta_length(fasta_path):
 
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, locus_pattern=None):
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, locus_pattern=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
@@ -385,6 +405,14 @@ class CasterPlotter:
 
             if plot_scores:
                 self.plot_topology_scatter()
+            if plot_dist:
+                self.plot_distribution()
+            if plot_topology_pairs:
+                self.plot_topology_pairs()
+            if plot_correlation:
+                self.plot_correlation()
+            if plot_quartet_counts:
+                self.plot_quartet_counts()
 
     def load_data(self):
         """Parses the tab-separated value file into a Pandas DataFrame."""
@@ -415,6 +443,54 @@ class CasterPlotter:
         full_path_str = str(self.scores_file)
         m = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', full_path_str)
         return m.group(1) if m else None
+
+    def _shade_locus_pattern(self, ax):
+        """
+        Draws ground-truth Alt-region shading, null/alt divider lines, and
+        block labels on ax -- factored out of plot_topology_scatter so every
+        window-position plot in this file (including plot_quartet_counts)
+        marks the same regions the same way. No-op if no ground-truth
+        pattern is resolvable.
+        """
+        pattern_str = self._ground_truth_pattern()
+        if not pattern_str:
+            return
+        from .utils import parse_pattern_string
+        total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
+        blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+
+        if anomaly_intervals and not any(b[0] == 'n' for b in blocks):
+            # Pure interval format (e.g. 45-55)
+            alt_shaded = False
+            for start_pos, end_pos in anomaly_intervals:
+                lbl = 'Alt' if not alt_shaded else None
+                ax.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                alt_shaded = True
+                ax.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+                ax.axvline(x=end_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+        elif blocks:
+            curr_pos_bp = 0
+            alt_shaded = False
+            for idx, (b_type, b_id, length_bp) in enumerate(blocks):
+                start_pos = curr_pos_bp
+                end_pos = curr_pos_bp + length_bp
+                mid_pos = (start_pos + end_pos) / 2.0
+                label_text = "null" if b_type == 'n' else "alt"
+
+                if b_type == 'a':
+                    lbl = 'Alt' if not alt_shaded else None
+                    ax.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
+                    alt_shaded = True
+
+                if start_pos > 0:
+                    ax.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+
+                ax.text(mid_pos, 0.02, label_text, transform=ax.get_xaxis_transform(),
+                         ha='center', va='bottom', fontsize=10, fontweight='bold',
+                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='none'))
+
+                curr_pos_bp = end_pos
+            ax.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
 
     def calculate_summary_statistics(self, series):
         """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
@@ -502,45 +578,7 @@ class CasterPlotter:
         sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=palette, alpha=0.6, s=12)
 
         # Draw vertical split lines and shade alt regions if a ground truth pattern is known
-        pattern_str = self._ground_truth_pattern()
-        if pattern_str:
-            from .utils import parse_pattern_string
-            total_span = self.df['pos'].max() if ('pos' in self.df.columns and len(self.df) > 0) else None
-            blocks, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
-
-            if anomaly_intervals and not any(b[0] == 'n' for b in blocks):
-                # Pure interval format (e.g. 45-55)
-                alt_shaded = False
-                for start_pos, end_pos in anomaly_intervals:
-                    mid_pos = (start_pos + end_pos) / 2.0
-                    lbl = 'Alt' if not alt_shaded else None
-                    plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
-                    alt_shaded = True
-                    plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
-                    plt.axvline(x=end_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
-            elif blocks:
-                curr_pos_bp = 0
-                alt_shaded = False
-                for idx, (b_type, b_id, length_bp) in enumerate(blocks):
-                    start_pos = curr_pos_bp
-                    end_pos = curr_pos_bp + length_bp
-                    mid_pos = (start_pos + end_pos) / 2.0
-                    label_text = "null" if b_type == 'n' else "alt"
-
-                    if b_type == 'a':
-                        lbl = 'Alt' if not alt_shaded else None
-                        plt.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
-                        alt_shaded = True
-
-                    if start_pos > 0:
-                        plt.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
-
-                    plt.text(mid_pos, 0.02, label_text, transform=plt.gca().get_xaxis_transform(),
-                             ha='center', va='bottom', fontsize=10, fontweight='bold',
-                             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8, edgecolor='none'))
-
-                    curr_pos_bp = end_pos
-                plt.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+        self._shade_locus_pattern(plt.gca())
 
         # Format names for cleaner legend and title
         title = f'Genomic Topology Profile: {self.gene_name}'
@@ -557,6 +595,311 @@ class CasterPlotter:
         save_path_scatter = os.path.join(output_dir, 'scatter.png')
         plt.savefig(save_path_scatter, dpi=300)
         print(f"Saved empirical topology scatter plot to: {save_path_scatter}")
+        plt.close()
+
+    def plot_distribution(self):
+        """
+        Pre-refactor 'dist' plot, restored: one subplot per resolved topology
+        column, each an empirical Null/Alt histogram (the same ground-truth
+        split _compute_null_alt_labels resolves for the 3D/pairs/correlation
+        plots) with Gaussian fit overlays and annotated mean/std. Unlike
+        plot_topology_scatter, which just skips the shading when no
+        ground-truth pattern is resolvable, there's no meaningful Null/Alt
+        histogram without one, so this skips entirely (CLAUDE.md's "needs a
+        locus pattern... else eval skips, not errors") rather than the old
+        code's sys.exit.
+        """
+        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
+        if not avg_cols:
+            print("No matching topology columns found to plot distributions for.")
+            return
+
+        labels = self._compute_null_alt_labels()
+        if labels is None:
+            print("No resolvable ground-truth locus pattern; skipping distribution plot.")
+            return
+
+        norm_label = 'Normalized (Min-Max)' if pathlib.Path(self.scores_file).stem.endswith('_n') else 'Raw'
+
+        import matplotlib.transforms as transforms
+
+        num_plots = len(avg_cols)
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5), squeeze=False)
+        axes = axes[0]
+
+        # Fixed Null/Alt colors (not per-topology self.topo_colors) so Null
+        # stays visually distinct from Alt's red on every panel -- matches
+        # the Null/Alt convention plot_topology_pairs/correlation use.
+        null_color = self.topo_colors['ABBA']
+        for ax, col in zip(axes, avg_cols):
+            topo_name = rename_map.get(col, col)
+            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+            vals = self.df[col].to_numpy(dtype=float)
+            xmin, xmax = vals.min(), vals.max()
+            margin = (xmax - xmin) * 0.15 if xmax > xmin else 1.0
+            x_grid = np.linspace(xmin - margin, xmax + margin, 200)
+
+            null_vals = self.df.loc[labels == 'Null', col]
+            alt_vals = self.df.loc[labels == 'Alt', col]
+
+            if len(null_vals) > 0:
+                sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=null_color, label='Null Histogram', bins=30)
+            if len(alt_vals) > 0:
+                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=30)
+
+            if len(null_vals) > 1:
+                mu_null, std_null = norm.fit(null_vals)
+                ax.plot(x_grid, norm.pdf(x_grid, mu_null, std_null), color=null_color, linewidth=2.2, label='Null Fit')
+                ax.axvline(mu_null, color=null_color, linestyle='--', linewidth=1.5)
+                ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color=null_color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color=null_color, fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            if len(alt_vals) > 1:
+                mu_alt, std_alt = norm.fit(alt_vals)
+                ax.plot(x_grid, norm.pdf(x_grid, mu_alt, std_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+
+            title = f'Topology: {topo_name}'
+            if len(null_vals) > 1 and len(alt_vals) > 1:
+                from .utils import gaussian_hellinger2_nd
+                h2 = gaussian_hellinger2_nd([mu_null], [[std_null ** 2]], [mu_alt], [[std_alt ** 2]])
+                title += f'  ($H^2$={h2:.3f})'
+            ax.set_title(title, fontsize=12, fontweight='bold')
+            ax.set_xlabel(f'{norm_label} Score')
+            ax.set_ylabel('Density')
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+            ax.grid(True, linestyle=':', alpha=0.5)
+
+        title = f'Topology Histograms & {self.distribution} Fits: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.tight_layout()
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_dist = os.path.join(output_dir, 'dist.png')
+        plt.savefig(save_path_dist, dpi=300, bbox_inches='tight')
+        print(f"Saved topology histogram chart to: {save_path_dist}")
+        plt.close()
+
+    def _resolve_topo_columns_strict(self):
+        """
+        Like resolve_topology_columns, but additionally dedupes to one column
+        per ABBA/BABA/AABB name (first match wins, mirroring
+        write_ground_truth_stats' col_for_topo) and returns None unless all
+        three are present -- both the 3D plot and the correlation heatmap
+        need exactly the three raw topology axes (not the 2D c*ILR1/c*ILR2
+        columns an --ilr file carries instead).
+        """
+        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
+        topo_order = ['ABBA', 'BABA', 'AABB']
+        col_for_topo = {}
+        for col in avg_cols:
+            mapped = rename_map.get(col, col)
+            if mapped in topo_order and mapped not in col_for_topo:
+                col_for_topo[mapped] = col
+        if not all(t in col_for_topo for t in topo_order):
+            return None
+        return col_for_topo
+
+    def _compute_null_alt_labels(self):
+        """
+        Shared ground-truth Null/Alt per-window labeling, factored out so
+        plot_topology_pairs and plot_correlation's null/alt split can reuse
+        the exact same parse_pattern_string logic
+        instead of re-deriving it. Returns a numpy object array of
+        'Null'/'Alt' (one per row of self.df, positional) or None if no
+        ground-truth locus pattern is resolvable.
+        """
+        pattern_str = self._ground_truth_pattern()
+        if not (pattern_str and 'pos' in self.df.columns and len(self.df) > 0):
+            return None
+        from .utils import parse_pattern_string
+        positions = self.df['pos'].to_numpy()
+        total_span = positions.max()
+        _, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
+        if not anomaly_intervals:
+            return None
+        labels = np.full(len(positions), 'Null', dtype=object)
+        for idx, pos in enumerate(positions):
+            for start_bp, end_bp in anomaly_intervals:
+                if start_bp <= pos <= end_bp:
+                    labels[idx] = 'Alt'
+                    break
+        return labels
+
+    def plot_topology_pairs(self):
+        """
+        Per-window ABBA/BABA/AABB points with the same Null/Alt ground-truth
+        coloring plot_topology_scatter shades as an axvspan, projected onto
+        each of the three 2D axis pairs (ABBA-vs-BABA, ABBA-vs-AABB,
+        BABA-vs-AABB) -- laid out as a single 1x3 subplot grid saved to one
+        PNG (replaces the old single 3D ABBA/BABA/AABB scatter, which needed
+        rotation to read and isn't legible in a static PNG).
+        """
+        col_for_topo = self._resolve_topo_columns_strict()
+        if col_for_topo is None:
+            print("Need all three ABBA/BABA/AABB topology columns for a pairwise topology plot; skipping.")
+            return
+
+        vals = {t: self.df[col_for_topo[t]].to_numpy(dtype=float) for t in ('ABBA', 'BABA', 'AABB')}
+        labels = self._compute_null_alt_labels()
+        label_colors = {'Null': self.topo_colors['ABBA'], 'Alt': '#E05638'}
+
+        pairs = [('ABBA', 'BABA'), ('ABBA', 'AABB'), ('BABA', 'AABB')]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        for ax, (xt, yt) in zip(axes, pairs):
+            x, y = vals[xt], vals[yt]
+            if labels is not None:
+                for lbl in ('Null', 'Alt'):
+                    mask = labels == lbl
+                    if mask.any():
+                        ax.scatter(x[mask], y[mask], c=label_colors[lbl], label=lbl, alpha=0.6, s=14, edgecolors='none')
+                ax.legend(loc='upper right', framealpha=0.9)
+            else:
+                ax.scatter(x, y, c=self.topo_colors['ABBA'], alpha=0.6, s=14, edgecolors='none')
+            ax.set_xlabel(xt, fontsize=10, labelpad=6)
+            ax.set_ylabel(yt, fontsize=10, labelpad=6)
+            ax.set_title(f'{xt} vs {yt}', fontsize=11)
+
+        title = f'Pairwise Topology Space: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_pairs = os.path.join(output_dir, 'topology_pairs.png')
+        plt.savefig(save_path_pairs, dpi=300)
+        print(f"Saved pairwise topology plot to: {save_path_pairs}")
+        plt.close()
+
+    def plot_correlation(self):
+        """
+        Heatmap(s) of the pairwise Pearson correlation between the three raw
+        topology score columns (ABBA/BABA/AABB) across windows. When a
+        ground-truth locus pattern is resolvable (same per-window Null/Alt
+        split plot_topology_pairs uses), shows two heatmaps side by side --
+        one computed over Null-only windows, one over Alt-only windows -- on
+        a single figure, since the two classes can have meaningfully
+        different topology correlation structure. Falls back to one
+        aggregate heatmap (the original behavior) when no ground-truth
+        pattern is resolvable, the same fallback convention plot_topology_pairs
+        uses for its own coloring.
+        """
+        col_for_topo = self._resolve_topo_columns_strict()
+        if col_for_topo is None:
+            print("Need all three ABBA/BABA/AABB topology columns for a correlation plot; skipping.")
+            return
+
+        topo_order = ['ABBA', 'BABA', 'AABB']
+        corr_df = self.df[[col_for_topo[t] for t in topo_order]].rename(
+            columns={col_for_topo[t]: t for t in topo_order}
+        )
+
+        title = f'Topology Score Correlation: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+
+        labels = self._compute_null_alt_labels()
+
+        if labels is None:
+            corr = corr_df.corr(method='pearson')
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm', vmin=-1, vmax=1,
+                        square=True, cbar_kws={'label': 'Pearson r'})
+            plt.title(title, fontsize=13, fontweight='bold', pad=10)
+            plt.tight_layout()
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            for ax, lbl in zip(axes, ('Null', 'Alt')):
+                mask = labels == lbl
+                n = int(mask.sum())
+                sub_corr = corr_df.loc[mask].corr(method='pearson') if n >= 2 else None
+                if sub_corr is not None:
+                    sns.heatmap(sub_corr, annot=True, fmt='.2f', cmap='coolwarm', vmin=-1, vmax=1,
+                                square=True, cbar_kws={'label': 'Pearson r'}, ax=ax)
+                else:
+                    ax.text(0.5, 0.5, 'Not enough windows', ha='center', va='center', transform=ax.transAxes)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                ax.set_title(f'{lbl} (n={n})', fontsize=11, fontweight='bold')
+            fig.suptitle(title, fontsize=13, fontweight='bold')
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path_corr = os.path.join(output_dir, 'correlation.png')
+        plt.savefig(save_path_corr, dpi=300, bbox_inches='tight')
+        print(f"Saved topology correlation heatmap to: {save_path_corr}")
+        plt.close()
+
+    def plot_quartet_counts(self):
+        """
+        Diagnostic plot for dstar.cpp/caster-site.cpp's optional quartet_counts.tsv
+        companion file (per-window, per-topology counts of raw per-site
+        scores classified zero/negative/positive -- see caster/dstar.cpp's
+        scoreIntervalWithCounts and sequence.hpp's
+        Quadripartition::Gene::signCounts). Purely diagnostic: this file is
+        never read by phlag's HMM and has no bearing on scores.tsv/
+        chunk_scores.tsv. Skips gracefully (prints a warning, doesn't raise)
+        when quartet_counts.tsv is missing, matching the convention the other
+        optional plots in this class already follow.
+        """
+        quartet_counts_path = pathlib.Path(self.scores_file).parent / "quartet_counts.tsv"
+        if not quartet_counts_path.exists():
+            print(f"No quartet_counts.tsv found at '{quartet_counts_path}'; skipping quartet counts plot.")
+            return
+
+        try:
+            quartet_counts_df = pd.read_csv(quartet_counts_path, sep='\t')
+        except Exception as e:
+            print(f"Error reading quartet counts file {quartet_counts_path}: {e}; skipping quartet counts plot.")
+            return
+
+        if 'pos' not in quartet_counts_df.columns:
+            print(f"Quartet counts file '{quartet_counts_path}' has no 'pos' column; skipping quartet counts plot.")
+            return
+
+        topo_order = ['ABBA', 'BABA', 'AABB']
+        kind_colors = {'zero': '#7F7F7F', 'negative': self.topo_colors['BABA'], 'positive': self.topo_colors['ABBA']}
+        kind_cols = {'zero': '_zero', 'negative': '_neg', 'positive': '_pos'}
+
+        missing = [f"{t}{suffix}" for t in topo_order for suffix in kind_cols.values()
+                   if f"{t}{suffix}" not in quartet_counts_df.columns]
+        if missing:
+            print(f"Quartet counts file '{quartet_counts_path}' is missing expected column(s) {missing}; skipping quartet counts plot.")
+            return
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+
+        for ax, topo in zip(axes, topo_order):
+            for kind, suffix in kind_cols.items():
+                ax.plot(quartet_counts_df['pos'], quartet_counts_df[f"{topo}{suffix}"], color=kind_colors[kind], label=kind, linewidth=1.2)
+            self._shade_locus_pattern(ax)
+            ax.set_title(f'Topology: {topo}', fontsize=11, fontweight='bold')
+            ax.set_ylabel('Site count')
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+            ax.grid(True, linestyle=':', alpha=0.5)
+
+        axes[-1].set_xlabel('Genomic Position (pos)', fontsize=11, labelpad=8)
+
+        title = f'Per-Site Quartet Counts: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'quartet_counts.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved quartet counts plot to: {save_path}")
         plt.close()
 
 
@@ -577,7 +920,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     gracefully (skips that section, or writes nothing at all) rather than
     raising, same convention as phlag.py's own ground-truth handling.
     """
-    from .utils import parse_pattern_string, write_gt_stats_file, GT_STATS_FILENAME
+    from .utils import parse_pattern_string, write_gt_stats_file, gaussian_hellinger2_nd, GT_STATS_FILENAME
 
     try:
         df = pd.read_csv(scores_file, sep='\t')
@@ -622,6 +965,10 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
                 stats["Null"] = (null_vals.mean(axis=0), np.cov(null_vals, rowvar=False).reshape(3, 3))
             if len(alt_vals) > 1:
                 stats["Alt"] = (alt_vals.mean(axis=0), np.cov(alt_vals, rowvar=False).reshape(3, 3))
+            if "Null" in stats and "Alt" in stats:
+                stats["Hellinger2"] = gaussian_hellinger2_nd(
+                    stats["Null"][0], stats["Null"][1], stats["Alt"][0], stats["Alt"][1],
+                )
 
     output_path = pathlib.Path(output_dir) / GT_STATS_FILENAME
     write_gt_stats_file(output_path, stats)
@@ -707,10 +1054,21 @@ def build_parser():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["scores", "scatter"],
+        choices=["scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts"],
         default=["scores"],
         help="List of plots to generate (choices: scores/scatter, aliases for "
-             "the same topology scatter plot. Default: scores)",
+             "the same topology scatter plot; dist, per-topology Null/Alt "
+             "histograms with Gaussian fit overlays (requires a resolvable "
+             "ground-truth locus pattern, else skipped); topology_pairs, "
+             "per-window ABBA/BABA/AABB points projected onto each of the "
+             "three 2D axis pairs (1x3 subplot grid, one PNG); correlation, "
+             "a pairwise Pearson correlation heatmap of the same three "
+             "columns (split into Null/Alt side-by-side heatmaps when a "
+             "ground-truth pattern is resolvable); quartet_counts, per-topology "
+             "raw per-site score quartet counts (zero/negative/positive) from "
+             "the optional quartet_counts.tsv companion file, one PNG with 3 "
+             "stacked subplots (requires quartet_counts.tsv, else skipped). "
+             "Default: scores)",
     )
     parser.add_argument(
         "-t",
@@ -965,7 +1323,7 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
         topologies=args.topologies,
     )
 
-    if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+    if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-pair.cpp to mirror dstar's scores.tsv exactly, so the same
         # CasterPlotter -- same palette, same ground-truth shading -- renders
@@ -975,7 +1333,11 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
             distribution=args.dist_type,
             data_dir=str(plot_data_dir.resolve()),
             topologies=args.topologies,
-            plot_scores=True,
+            plot_scores=("scores" in args.plot or "scatter" in args.plot),
+            plot_dist=("dist" in args.plot),
+            plot_correlation=("correlation" in args.plot),
+            plot_topology_pairs=("topology_pairs" in args.plot),
+            plot_quartet_counts=("quartet_counts" in args.plot),
             locus_pattern=locus_pattern,
         )
 
@@ -1033,6 +1395,10 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
 
     chunk_scores_path = args.chunk_scores if args.chunk_scores else final_output_path
     chunk_scores_path.parent.mkdir(parents=True, exist_ok=True)
+    # Diagnostic-only companion file (per-window, per-topology raw per-site
+    # quartet counts) -- see caster-site.cpp's --quartet-counts. Never read by
+    # phlag; written purely for CasterPlotter.plot_quartet_counts.
+    quartet_counts_path = chunk_scores_path.parent / "quartet_counts.tsv"
     window_size = args.chunk_size if args.chunk_size is not None else args.window_size
     site_step = min(args.step_size, window_size)
 
@@ -1041,6 +1407,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         str(binary_path),
         "--branch-mapping", str(args.mapping.resolve()),
         "--chunk-scores", str(chunk_scores_path.resolve()),
+        "--quartet-counts", str(quartet_counts_path.resolve()),
         "--chunk", str(site_step),
         "--window", str(window_size),
         str(args.fasta_file.resolve()),
@@ -1060,6 +1427,12 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         raw_df = pd.read_csv(chunk_scores_path, sep="\t")
         raw_df["pos"] = raw_df["pos"] + window_size // 2
         raw_df.to_csv(chunk_scores_path, sep="\t", index=False)
+        # Keep quartet_counts.tsv's pos column in sync so it stays joinable
+        # against chunk_scores_path by pos after the shift above.
+        if quartet_counts_path.exists():
+            quartet_counts_df = pd.read_csv(quartet_counts_path, sep="\t")
+            quartet_counts_df["pos"] = quartet_counts_df["pos"] + window_size // 2
+            quartet_counts_df.to_csv(quartet_counts_path, sep="\t", index=False)
 
     if args.ilr:
         apply_ilr_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
@@ -1078,7 +1451,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         topologies=args.topologies,
     )
 
-    if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+    if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-site.cpp to mirror dstar's scores.tsv exactly, so the same
         # CasterPlotter -- same palette, same ground-truth shading -- renders
@@ -1088,7 +1461,11 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
             distribution=args.dist_type,
             data_dir=str(plot_data_dir.resolve()),
             topologies=args.topologies,
-            plot_scores=True,
+            plot_scores=("scores" in args.plot or "scatter" in args.plot),
+            plot_dist=("dist" in args.plot),
+            plot_correlation=("correlation" in args.plot),
+            plot_topology_pairs=("topology_pairs" in args.plot),
+            plot_quartet_counts=("quartet_counts" in args.plot),
             locus_pattern=locus_pattern,
         )
 
@@ -1312,19 +1689,24 @@ def main(argv=None):
     # so this check covers both without branching on args.bench itself.
     if (args.ilr or args.normalize) and final_output_path.exists():
         print(f"Found existing scores at '{final_output_path}' -- skipping regeneration.")
+        copy_quartet_counts_if_missing(_derive_output_path(False, False).parent, plot_data_dir)
         write_ground_truth_stats(
             scores_file=str(final_output_path.resolve()),
             output_dir=str(plot_data_dir.resolve()),
             locus_pattern=locus_pattern,
             topologies=args.topologies,
         )
-        if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+        if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
             CasterPlotter(
                 scores_file=str(final_output_path.resolve()),
                 distribution=args.dist_type,
                 data_dir=str(plot_data_dir.resolve()),
                 topologies=args.topologies,
-                plot_scores=True,
+                plot_scores=("scores" in args.plot or "scatter" in args.plot),
+                plot_dist=("dist" in args.plot),
+                    plot_correlation=("correlation" in args.plot),
+                plot_topology_pairs=("topology_pairs" in args.plot),
+                plot_quartet_counts=("quartet_counts" in args.plot),
                 locus_pattern=locus_pattern,
             )
         return final_output_path
@@ -1341,19 +1723,24 @@ def main(argv=None):
             print(f"Found raw scores at '{raw_path}' -- computing ILR without recomputing caster...")
             apply_ilr_to_scores_file(raw_path, final_output_path, has_q123=args.pair)
             print(f"Success: TSV output file generated at: {final_output_path}")
+            copy_quartet_counts_if_missing(raw_path.parent, plot_data_dir)
             write_ground_truth_stats(
                 scores_file=str(final_output_path.resolve()),
                 output_dir=str(plot_data_dir.resolve()),
                 locus_pattern=locus_pattern,
                 topologies=args.topologies,
             )
-            if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+            if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
                 CasterPlotter(
                     scores_file=str(final_output_path.resolve()),
                     distribution=args.dist_type,
                     data_dir=str(plot_data_dir.resolve()),
                     topologies=args.topologies,
-                    plot_scores=True,
+                    plot_scores=("scores" in args.plot or "scatter" in args.plot),
+                    plot_dist=("dist" in args.plot),
+                            plot_correlation=("correlation" in args.plot),
+                    plot_topology_pairs=("topology_pairs" in args.plot),
+                    plot_quartet_counts=("quartet_counts" in args.plot),
                     locus_pattern=locus_pattern,
                 )
             return final_output_path
@@ -1369,19 +1756,24 @@ def main(argv=None):
             print(f"Found un-normalized scores at '{unnormalized_path}' -- normalizing without recomputing caster...")
             apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair)
             print(f"Success: TSV output file generated at: {final_output_path}")
+            copy_quartet_counts_if_missing(unnormalized_path.parent, plot_data_dir)
             write_ground_truth_stats(
                 scores_file=str(final_output_path.resolve()),
                 output_dir=str(plot_data_dir.resolve()),
                 locus_pattern=locus_pattern,
                 topologies=args.topologies,
             )
-            if args.plot and ("scores" in args.plot or "scatter" in args.plot):
+            if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
                 CasterPlotter(
                     scores_file=str(final_output_path.resolve()),
                     distribution=args.dist_type,
                     data_dir=str(plot_data_dir.resolve()),
                     topologies=args.topologies,
-                    plot_scores=True,
+                    plot_scores=("scores" in args.plot or "scatter" in args.plot),
+                    plot_dist=("dist" in args.plot),
+                            plot_correlation=("correlation" in args.plot),
+                    plot_topology_pairs=("topology_pairs" in args.plot),
+                    plot_quartet_counts=("quartet_counts" in args.plot),
                     locus_pattern=locus_pattern,
                 )
             return final_output_path
@@ -1474,6 +1866,19 @@ def main(argv=None):
     cmd.append(str(args.step_size))
 
     temp_dir = tempfile.mkdtemp()
+    # dstar's own positional WINDOW_SIZE (4th arg) only controls its internal
+    # pi-estimation blocking within each step_size-sized interval row -- it's
+    # unrelated to args.window_size (the Python-side rolling window below)
+    # and was never passed before this diagnostic was added, so it's kept at
+    # dstar's own prior default (10000) here to leave the main scores.tsv
+    # table byte-for-byte unchanged. The 5th positional arg is new: a
+    # diagnostic companion TSV of per-window, per-topology raw per-site
+    # quartet counts, sign-classified (zero/negative/positive), written into
+    # the same temp_dir as the main stdout table and rolled up below exactly
+    # like c*ABBA/BABA/AABB.
+    dstar_quartet_counts_bin_path = os.path.join(temp_dir, "quartet_counts.tsv")
+    cmd.append("10000")
+    cmd.append(dstar_quartet_counts_bin_path)
     try:
         try:
             result = subprocess.run(cmd, cwd=temp_dir, capture_output=True, text=True, check=True)
@@ -1501,6 +1906,20 @@ def main(argv=None):
         if not raw_rows:
             mapping_name = args.mapping.name if args.mapping else "-"
             sys.exit(f"Error: No window scores calculated for '{args.fasta_file.name}' using mapping '{mapping_name}'. Please check that sequence headers in the FASTA match species in the mapping file.")
+
+        # Diagnostic-only quartet-counts companion table, read the same way as
+        # the main stdout table above; rows line up 1:1 with raw_rows since
+        # both are written by the same per-interval loop in dstar.cpp.
+        quartet_counts_raw_rows = []
+        if os.path.exists(dstar_quartet_counts_bin_path):
+            with open(dstar_quartet_counts_bin_path) as f:
+                quartet_counts_lines = f.read().splitlines()
+            for line in quartet_counts_lines[1:]:
+                if not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) >= 11:
+                    quartet_counts_raw_rows.append(parts)
 
         # Perform rolling window average with O(1) sliding window
         K = max(1, args.window_size // args.step_size)
@@ -1557,6 +1976,59 @@ def main(argv=None):
                         'dstar': dstar_val,
                         'qcnt': avg_qcnt
                     })
+
+        # Diagnostic-only: same O(1) sliding-window logic as above, but
+        # SUMMING (not averaging) each of the 9 quartet-count columns -- these
+        # are literal per-site counts, not per-informative-site averages.
+        # Iterated separately (rather than folded into the loop above) to
+        # keep this purely-diagnostic addition from touching the already-
+        # tested scores.tsv rolling logic. Skips gracefully (warns, doesn't
+        # raise) if the quartet-counts file is missing or its row count doesn't
+        # line up with the main table's.
+        quartet_counts_results = []
+        if not quartet_counts_raw_rows:
+            print("Warning: quartet counts output missing or empty; skipping quartet_counts.tsv.")
+        elif len(quartet_counts_raw_rows) != len(parsed_rows):
+            print(f"Warning: quartet counts row count ({len(quartet_counts_raw_rows)}) does not match main table row count "
+                  f"({len(parsed_rows)}); skipping quartet_counts.tsv.")
+        elif len(parsed_rows) >= K:
+            quartet_counts_parsed_rows = [tuple(int(x) for x in row[2:11]) for row in quartet_counts_raw_rows]
+            run_quartet_counts = [sum(r[c] for r in quartet_counts_parsed_rows[:K]) for c in range(9)]
+            for i in range(len(parsed_rows) - K + 1):
+                if i > 0:
+                    outgoing = quartet_counts_parsed_rows[i - 1]
+                    incoming = quartet_counts_parsed_rows[i + K - 1]
+                    for c in range(9):
+                        run_quartet_counts[c] += incoming[c] - outgoing[c]
+
+                pos_val = parsed_rows[i][1]
+                if args.shift_caster:
+                    pos_val += args.window_size // 2
+
+                if args.left <= pos_val < args.right:
+                    quartet_counts_results.append((parsed_rows[i][0], pos_val, tuple(run_quartet_counts)))
+
+        if quartet_counts_results:
+            quartet_counts_output_lines = ["file\tpos\tABBA_zero\tABBA_neg\tABBA_pos\tBABA_zero\tBABA_neg\tBABA_pos\tAABB_zero\tAABB_neg\tAABB_pos\n"]
+            for file_val, pos_val, counts in quartet_counts_results:
+                quartet_counts_output_lines.append(f"{file_val}\t{pos_val}\t" + "\t".join(str(c) for c in counts) + "\n")
+
+            quartet_counts_out_path = final_output_path.parent / "quartet_counts.tsv"
+            quartet_counts_out_path.parent.mkdir(parents=True, exist_ok=True)
+            quartet_counts_tmp_fd, quartet_counts_tmp_path = tempfile.mkstemp(
+                dir=str(quartet_counts_out_path.parent), prefix=".quartet_counts_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(quartet_counts_tmp_fd, "w") as f:
+                    f.writelines(quartet_counts_output_lines)
+                os.replace(quartet_counts_tmp_path, quartet_counts_out_path)
+            except BaseException:
+                try:
+                    os.remove(quartet_counts_tmp_path)
+                except OSError:
+                    pass
+                raise
+            print(f"Success: quartet counts TSV output file generated at: {quartet_counts_out_path}")
 
         if args.ilr:
             # D* itself is invariant to closure (same denominator cancels),
@@ -1626,14 +2098,22 @@ def main(argv=None):
 
     if args.plot:
         plot_scores = "scores" in args.plot or "scatter" in args.plot
+        plot_dist = "dist" in args.plot
+        plot_correlation = "correlation" in args.plot
+        plot_topology_pairs = "topology_pairs" in args.plot
+        plot_quartet_counts = "quartet_counts" in args.plot
 
-        if plot_scores:
+        if plot_scores or plot_dist or plot_correlation or plot_topology_pairs or plot_quartet_counts:
             CasterPlotter(
                 scores_file=str(final_output_path.resolve()),
                 distribution=args.dist_type,
                 data_dir=str(plot_data_dir.resolve()),
                 topologies=args.topologies,
                 plot_scores=plot_scores,
+                plot_dist=plot_dist,
+                plot_correlation=plot_correlation,
+                plot_topology_pairs=plot_topology_pairs,
+                plot_quartet_counts=plot_quartet_counts,
                 locus_pattern=locus_pattern,
             )
 

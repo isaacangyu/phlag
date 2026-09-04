@@ -96,7 +96,7 @@ def _cluster_mean_cov(pts, D, eps=1e-4):
     return mu, cov
 
 
-def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir):
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, n_clusters=2):
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,240 +125,167 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
             topo_name = topology_names[d]
             y_plot = y_d.ravel()
 
-        k_values = list(range(2, 11))
-        scores = {}
-        k_opt = 2
-        max_score = -2.0
-
-        for k in k_values:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
-            labels = kmeans.fit_predict(y_d)
-            score = silhouette_score(y_d, labels)
-            scores[k] = score
-            if score > max_score:
-                max_score = score
-                k_opt = k
-
-        s_2 = scores[2]
+        kmeans_s2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
+        s_2 = silhouette_score(y_d, kmeans_s2.fit_predict(y_d))
+        k_opt = n_clusters
 
         print(f"\nTopology / Dimension: {topo_name}")
-        print(f"{'k':<5} | {'Global Silhouette Score':<25}")
-        print("-" * 35)
-        for k in k_values:
-            marker = " *" if k == k_opt else ""
-            print(f"{k:<5} | {scores[k]:<25.6f}{marker}")
-        print(f"Global Optimal k* = {k_opt} (Score: {max_score:.6f})")
+        print(f"-k {n_clusters} given -- using k* = {n_clusters} directly (skipping k=2..10 search)")
         print(f"Global k=2 Score = {s_2:.6f}")
+        print(f"Partitioning into Null and Alternative clusters (k* = {k_opt}):")
 
-        if s_2 > silhouette_threshold:
-            print(f"s_2 ({s_2:.4f}) > threshold ({silhouette_threshold:.4f}) -> Partitioning into Null and Alternative clusters:")
+        kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
+        labels_2 = kmeans_2.fit_predict(y_d)
 
-            kmeans_2 = KMeans(n_clusters=2, random_state=42, n_init="auto")
-            labels_2 = kmeans_2.fit_predict(y_d)
+        # Assign cluster labels to Null vs Alternative based on distance from global mean
+        global_mean = np.mean(y_d, axis=0)
+        mean_c0 = np.mean(y_d[labels_2 == 0], axis=0)
+        mean_c1 = np.mean(y_d[labels_2 == 1], axis=0)
 
-            # Assign cluster labels to Null vs Alternative based on distance from global mean
-            global_mean = np.mean(y_d, axis=0)
-            mean_c0 = np.mean(y_d[labels_2 == 0], axis=0)
-            mean_c1 = np.mean(y_d[labels_2 == 1], axis=0)
+        dist_c0 = np.linalg.norm(mean_c0 - global_mean)
+        dist_c1 = np.linalg.norm(mean_c1 - global_mean)
 
-            dist_c0 = np.linalg.norm(mean_c0 - global_mean)
-            dist_c1 = np.linalg.norm(mean_c1 - global_mean)
-
-            if dist_c0 < dist_c1:
-                null_lbl, alt_lbl = 0, 1
-            else:
-                null_lbl, alt_lbl = 1, 0
-
-            y_sub_N = y_d[labels_2 == null_lbl]
-            pos_sub_N = positions_kb[labels_2 == null_lbl]
-            y_sub_A = y_d[labels_2 == alt_lbl]
-            pos_sub_A = positions_kb[labels_2 == alt_lbl]
-
-            n_N = len(y_sub_N)
-            n_A = len(y_sub_A)
-
-
-            # Search for best split kn + ka = k_opt minimizing total within-cluster sum of squares (inertia)
-            best_kn = 1
-            best_ka = k_opt - 1
-            min_inertia = float('inf')
-
-            print(f"\nEvaluating partitions (kn + ka = k* = {k_opt}):")
-            print(f"{'Split':<12} | {'Null Inertia':<15} | {'Alt Inertia':<15} | {'Total Inertia':<15}")
-            print("-" * 65)
-
-            for kn in range(1, k_opt):
-                ka = k_opt - kn
-                if kn > n_N or ka > n_A:
-                    continue
-
-                if kn == 1:
-                    w_n = float(np.sum((y_sub_N - np.mean(y_sub_N, axis=0)) ** 2))
-                else:
-                    km_n = KMeans(n_clusters=kn, random_state=42, n_init="auto")
-                    km_n.fit(y_sub_N)
-                    w_n = float(km_n.inertia_)
-
-                if ka == 1:
-                    w_a = float(np.sum((y_sub_A - np.mean(y_sub_A, axis=0)) ** 2))
-                else:
-                    km_a = KMeans(n_clusters=ka, random_state=42, n_init="auto")
-                    km_a.fit(y_sub_A)
-                    w_a = float(km_a.inertia_)
-
-                total_w = w_n + w_a
-                marker = ""
-                if total_w < min_inertia:
-                    min_inertia = total_w
-                    best_kn = kn
-                    best_ka = ka
-                    marker = " *"
-
-                print(f"{kn:<2} + {ka:<2} = {k_opt:<2}  | {w_n:<15.6f} | {w_a:<15.6f} | {total_w:<15.6f}{marker}")
-
-            print(f"Optimal split: Null count = {best_kn}, Alternative count = {best_ka} (Inertia: {min_inertia:.6f})")
-
-            if d is None:
-                num_mixtures_matrix[0, :] = best_kn
-                num_mixtures_matrix[1, :] = best_ka
-            else:
-                num_mixtures_matrix[0, d] = best_kn
-                num_mixtures_matrix[1, d] = best_ka
-
-            if best_kn > 1:
-                sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
-                sub_labels = sub_kmeans.fit_predict(y_sub_N)
-
-                plt.figure(figsize=(10, 5))
-                sns.set_theme(style="whitegrid")
-                sns.scatterplot(x=pos_sub_N, y=y_plot[labels_2 == null_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
-                plt.title(f"{topo_name} | Null Sub-cluster {best_kn}-means Clustering", fontsize=12, fontweight='bold')
-                plt.xlabel("Position (kb)", fontsize=10)
-                plt.ylabel("Normalized score", fontsize=10)
-                plt.tight_layout()
-                plot_path_sub_N = output_dir / f"kmeans_kstar_{topo_name}_null.png"
-                plt.savefig(plot_path_sub_N, dpi=150)
-                plt.close()
-                print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
-
-            if best_ka > 1:
-                sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
-                sub_labels = sub_kmeans.fit_predict(y_sub_A)
-
-                plt.figure(figsize=(10, 5))
-                sns.set_theme(style="whitegrid")
-                sns.scatterplot(x=pos_sub_A, y=y_plot[labels_2 == alt_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
-                plt.title(f"{topo_name} | Alternative Sub-cluster {best_ka}-means Clustering", fontsize=12, fontweight='bold')
-                plt.xlabel("Position (kb)", fontsize=10)
-                plt.ylabel("Normalized score", fontsize=10)
-                plt.tight_layout()
-                plot_path_sub_A = output_dir / f"kmeans_kstar_{topo_name}_alternative.png"
-                plt.savefig(plot_path_sub_A, dpi=150)
-                plt.close()
-                print(f"Saved Alternative sub-cluster optimal plot to: {plot_path_sub_A}")
-
-            plt.figure(figsize=(10, 5))
-            sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
-            plt.title(f"{topo_name} | Optimal GMM Mixture Partitions (Null count={best_kn}, Alt count={best_ka})", fontsize=11, fontweight='bold')
-            plt.xlabel("Position (kb)", fontsize=10)
-            plt.ylabel("Normalized score", fontsize=10)
-            plt.tight_layout()
-            plot_path_opt = output_dir / f"kmeans_kstar_{topo_name}.png"
-            plt.savefig(plot_path_opt, dpi=150)
-            plt.close()
-            print(f"Saved combined optimal plot to: {plot_path_opt}")
-
-            null_params = []
-            if best_kn == 1:
-                mu_n, cov_n = _cluster_mean_cov(y_sub_N, D)
-                null_params.append((1.0, mu_n, cov_n))
-            else:
-                km_n = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
-                sub_labels_n = km_n.fit_predict(y_sub_N)
-                for m in range(best_kn):
-                    pts = y_sub_N[sub_labels_n == m]
-                    if len(pts) > 0:
-                        w = len(pts) / len(y_sub_N)
-                        mu, cov = _cluster_mean_cov(pts, D)
-                    else:
-                        w = 1.0 / best_kn
-                        mu = km_n.cluster_centers_[m]
-                        cov = np.eye(D) * 1e-4
-                    null_params.append((w, mu, cov))
-
-            alt_params = []
-            if best_ka == 1:
-                mu_a, cov_a = _cluster_mean_cov(y_sub_A, D)
-                alt_params.append((1.0, mu_a, cov_a))
-            else:
-                km_a = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
-                sub_labels_a = km_a.fit_predict(y_sub_A)
-                for m in range(best_ka):
-                    pts = y_sub_A[sub_labels_a == m]
-                    if len(pts) > 0:
-                        w = len(pts) / len(y_sub_A)
-                        mu, cov = _cluster_mean_cov(pts, D)
-                    else:
-                        w = 1.0 / best_ka
-                        mu = km_a.cluster_centers_[m]
-                        cov = np.eye(D) * 1e-4
-                    alt_params.append((w, mu, cov))
-
-            dim_cluster_info[d] = (null_params, alt_params)
-
+        if dist_c0 < dist_c1:
+            null_lbl, alt_lbl = 0, 1
         else:
-            m_val = max(1, int(round(k_opt / 2.0)))
-            print(f"s_2 ({s_2:.4f}) <= threshold ({silhouette_threshold:.4f}) -> Use k*/2 = {m_val} mixtures for both states.")
-            if d is None:
-                num_mixtures_matrix[0, :] = m_val
-                num_mixtures_matrix[1, :] = m_val
-            else:
-                num_mixtures_matrix[0, d] = m_val
-                num_mixtures_matrix[1, d] = m_val
+            null_lbl, alt_lbl = 1, 0
 
-            # Save ONLY 2-means plot, NOT kmeans_kstar plot!
-            kmeans_plot = KMeans(n_clusters=2, random_state=42, n_init="auto")
-            labels_plot = kmeans_plot.fit_predict(y_d)
+        y_sub_N = y_d[labels_2 == null_lbl]
+        pos_sub_N = positions_kb[labels_2 == null_lbl]
+        y_sub_A = y_d[labels_2 == alt_lbl]
+        pos_sub_A = positions_kb[labels_2 == alt_lbl]
+
+        n_N = len(y_sub_N)
+        n_A = len(y_sub_A)
+
+        # Search for best split kn + ka = k_opt minimizing total within-cluster sum of squares (inertia)
+        best_kn = 1
+        best_ka = k_opt - 1
+        min_inertia = float('inf')
+
+        print(f"\nEvaluating partitions (kn + ka = k* = {k_opt}):")
+        print(f"{'Split':<12} | {'Null Inertia':<15} | {'Alt Inertia':<15} | {'Total Inertia':<15}")
+        print("-" * 65)
+
+        for kn in range(1, k_opt):
+            ka = k_opt - kn
+            if kn > n_N or ka > n_A:
+                continue
+
+            if kn == 1:
+                w_n = float(np.sum((y_sub_N - np.mean(y_sub_N, axis=0)) ** 2))
+            else:
+                km_n = KMeans(n_clusters=kn, random_state=42, n_init="auto")
+                km_n.fit(y_sub_N)
+                w_n = float(km_n.inertia_)
+
+            if ka == 1:
+                w_a = float(np.sum((y_sub_A - np.mean(y_sub_A, axis=0)) ** 2))
+            else:
+                km_a = KMeans(n_clusters=ka, random_state=42, n_init="auto")
+                km_a.fit(y_sub_A)
+                w_a = float(km_a.inertia_)
+
+            total_w = w_n + w_a
+            marker = ""
+            if total_w < min_inertia:
+                min_inertia = total_w
+                best_kn = kn
+                best_ka = ka
+                marker = " *"
+
+            print(f"{kn:<2} + {ka:<2} = {k_opt:<2}  | {w_n:<15.6f} | {w_a:<15.6f} | {total_w:<15.6f}{marker}")
+
+        print(f"Optimal split: Null count = {best_kn}, Alternative count = {best_ka} (Inertia: {min_inertia:.6f})")
+
+        if d is None:
+            num_mixtures_matrix[0, :] = best_kn
+            num_mixtures_matrix[1, :] = best_ka
+        else:
+            num_mixtures_matrix[0, d] = best_kn
+            num_mixtures_matrix[1, d] = best_ka
+
+        if best_kn > 1:
+            sub_kmeans = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+            sub_labels = sub_kmeans.fit_predict(y_sub_N)
 
             plt.figure(figsize=(10, 5))
             sns.set_theme(style="whitegrid")
-            sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_plot, palette="tab10", alpha=0.8, legend="full")
-            plt.title(f"{topo_name} | 2-means Clustering", fontsize=12, fontweight='bold')
+            sns.scatterplot(x=pos_sub_N, y=y_plot[labels_2 == null_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | Null Sub-cluster {best_kn}-means Clustering", fontsize=12, fontweight='bold')
             plt.xlabel("Position (kb)", fontsize=10)
             plt.ylabel("Normalized score", fontsize=10)
-            plt.legend(title="Cluster")
             plt.tight_layout()
-
-            plot_path = output_dir / f"kmeans_2_{topo_name}.png"
-            plt.savefig(plot_path, dpi=150)
+            plot_path_sub_N = output_dir / f"kmeans_kstar_{topo_name}_null.png"
+            plt.savefig(plot_path_sub_N, dpi=150)
             plt.close()
-            print(f"Saved diagnostic clustering plot to: {plot_path}")
+            print(f"Saved Null sub-cluster optimal plot to: {plot_path_sub_N}")
 
-            null_params = []
-            alt_params = []
-            if m_val == 1:
-                mu_base, cov_base = _cluster_mean_cov(y_d, D)
-                std_base = np.sqrt(np.clip(np.diag(cov_base), a_min=1e-4, a_max=None))
-                null_params.append((1.0, mu_base, cov_base))
-                alt_params.append((1.0, mu_base + std_base, cov_base))
-            else:
-                km = KMeans(n_clusters=m_val, random_state=42, n_init="auto")
-                labels_m = km.fit_predict(y_d)
-                for m in range(m_val):
-                    pts = y_d[labels_m == m]
-                    if len(pts) > 0:
-                        w = len(pts) / len(y_d)
-                        mu, cov = _cluster_mean_cov(pts, D)
-                    else:
-                        w = 1.0 / m_val
-                        mu = km.cluster_centers_[m]
-                        cov = np.eye(D) * 1e-4
-                    std = np.sqrt(np.clip(np.diag(cov), a_min=1e-4, a_max=None))
-                    null_params.append((w, mu, cov))
-                    alt_params.append((w, mu + std, cov))
+        if best_ka > 1:
+            sub_kmeans = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+            sub_labels = sub_kmeans.fit_predict(y_sub_A)
 
-            dim_cluster_info[d] = (null_params, alt_params)
+            plt.figure(figsize=(10, 5))
+            sns.set_theme(style="whitegrid")
+            sns.scatterplot(x=pos_sub_A, y=y_plot[labels_2 == alt_lbl], hue=sub_labels, palette="tab10", alpha=0.8, legend="full")
+            plt.title(f"{topo_name} | Alternative Sub-cluster {best_ka}-means Clustering", fontsize=12, fontweight='bold')
+            plt.xlabel("Position (kb)", fontsize=10)
+            plt.ylabel("Normalized score", fontsize=10)
+            plt.tight_layout()
+            plot_path_sub_A = output_dir / f"kmeans_kstar_{topo_name}_alternative.png"
+            plt.savefig(plot_path_sub_A, dpi=150)
+            plt.close()
+            print(f"Saved Alternative sub-cluster optimal plot to: {plot_path_sub_A}")
+
+        plt.figure(figsize=(10, 5))
+        sns.set_theme(style="whitegrid")
+        sns.scatterplot(x=positions_kb, y=y_plot, hue=labels_2, palette="tab10", alpha=0.8, legend="full")
+        plt.title(f"{topo_name} | Optimal GMM Mixture Partitions (Null count={best_kn}, Alt count={best_ka})", fontsize=11, fontweight='bold')
+        plt.xlabel("Position (kb)", fontsize=10)
+        plt.ylabel("Normalized score", fontsize=10)
+        plt.tight_layout()
+        plot_path_opt = output_dir / f"kmeans_kstar_{topo_name}.png"
+        plt.savefig(plot_path_opt, dpi=150)
+        plt.close()
+        print(f"Saved combined optimal plot to: {plot_path_opt}")
+
+        null_params = []
+        if best_kn == 1:
+            mu_n, cov_n = _cluster_mean_cov(y_sub_N, D)
+            null_params.append((1.0, mu_n, cov_n))
+        else:
+            km_n = KMeans(n_clusters=best_kn, random_state=42, n_init="auto")
+            sub_labels_n = km_n.fit_predict(y_sub_N)
+            for m in range(best_kn):
+                pts = y_sub_N[sub_labels_n == m]
+                if len(pts) > 0:
+                    w = len(pts) / len(y_sub_N)
+                    mu, cov = _cluster_mean_cov(pts, D)
+                else:
+                    w = 1.0 / best_kn
+                    mu = km_n.cluster_centers_[m]
+                    cov = np.eye(D) * 1e-4
+                null_params.append((w, mu, cov))
+
+        alt_params = []
+        if best_ka == 1:
+            mu_a, cov_a = _cluster_mean_cov(y_sub_A, D)
+            alt_params.append((1.0, mu_a, cov_a))
+        else:
+            km_a = KMeans(n_clusters=best_ka, random_state=42, n_init="auto")
+            sub_labels_a = km_a.fit_predict(y_sub_A)
+            for m in range(best_ka):
+                pts = y_sub_A[sub_labels_a == m]
+                if len(pts) > 0:
+                    w = len(pts) / len(y_sub_A)
+                    mu, cov = _cluster_mean_cov(pts, D)
+                else:
+                    w = 1.0 / best_ka
+                    mu = km_a.cluster_centers_[m]
+                    cov = np.eye(D) * 1e-4
+                alt_params.append((w, mu, cov))
+
+        dim_cluster_info[d] = (null_params, alt_params)
 
     max_m = int(np.max(num_mixtures_matrix))
     init_means = np.zeros((NUM_STATES, max_m, D), dtype=np.float32)
@@ -400,9 +327,12 @@ class Phlag:
         self.initialize_output()
 
     def extract_distribution_type_from_filename(self):
-        # model_design has no CLI flag -- inferred from the input/output
-        # filename, falling back to the "gaussian" default (see parse_arguments)
-        # if neither filename carries a hint.
+        # If -d/--dist-type was explicitly passed, it wins outright.
+        if getattr(self.args, "model_design", None) is not None:
+            return
+
+        # Otherwise infer from the input/output filename, falling back to
+        # the "gaussian" default if neither filename carries a hint.
         filenames_to_check = []
         if hasattr(self.args, "caster_scores") and self.args.caster_scores:
             filenames_to_check.append(str(self.args.caster_scores))
@@ -417,6 +347,8 @@ class Phlag:
             elif "gaussian" in fname_lower:
                 self.args.model_design = "gaussian"
                 break
+        else:
+            self.args.model_design = "gaussian"
 
     def validate_parameters(self):
         pass
@@ -649,6 +581,7 @@ class Phlag:
             self.pos_to_caster,
             self.args.silhouette_threshold,
             output_dir,
+            n_clusters=self.args.n_clusters,
         )
 
         self.num_mixtures = int(np.max(num_mixtures_matrix))
@@ -1104,27 +1037,31 @@ class Phlag:
             gt_stats_path = pathlib.Path(self.args.caster_scores).parent / "gt_stats.txt"
             gt_stats = read_gt_stats_file(gt_stats_path)
 
-            if "Null" in gt_stats and "Alt" in gt_stats:
-                mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
-                mu_alt_gt_joint, cov_alt_gt_joint = gt_stats["Alt"]
-                have_gt_joint = True
-            else:
-                null_vals = Y_np[y_true == 0]
-                alt_vals = Y_np[y_true == 1]
-                have_gt_joint = len(null_vals) > 1 and len(alt_vals) > 1
-                if have_gt_joint:
-                    emission_dim = Y_np.shape[-1]
-                    mu_null_gt_joint = null_vals.mean(axis=0)
-                    mu_alt_gt_joint = alt_vals.mean(axis=0)
-                    cov_null_gt_joint = np.cov(null_vals, rowvar=False).reshape(emission_dim, emission_dim)
-                    cov_alt_gt_joint = np.cov(alt_vals, rowvar=False).reshape(emission_dim, emission_dim)
-
-            if have_gt_joint:
-                gt_hellinger2_joint = hmm.gaussian_hellinger2(
-                    jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
-                    jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
-                )
+            if "Hellinger2" in gt_stats:
+                gt_hellinger2_joint = gt_stats["Hellinger2"]
                 headers.append(f"em_gt_hd: {format_number(float(gt_hellinger2_joint))}")
+            else:
+                if "Null" in gt_stats and "Alt" in gt_stats:
+                    mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
+                    mu_alt_gt_joint, cov_alt_gt_joint = gt_stats["Alt"]
+                    have_gt_joint = True
+                else:
+                    null_vals = Y_np[y_true == 0]
+                    alt_vals = Y_np[y_true == 1]
+                    have_gt_joint = len(null_vals) > 1 and len(alt_vals) > 1
+                    if have_gt_joint:
+                        emission_dim = Y_np.shape[-1]
+                        mu_null_gt_joint = null_vals.mean(axis=0)
+                        mu_alt_gt_joint = alt_vals.mean(axis=0)
+                        cov_null_gt_joint = np.cov(null_vals, rowvar=False).reshape(emission_dim, emission_dim)
+                        cov_alt_gt_joint = np.cov(alt_vals, rowvar=False).reshape(emission_dim, emission_dim)
+
+                if have_gt_joint:
+                    gt_hellinger2_joint = hmm.gaussian_hellinger2(
+                        jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
+                        jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
+                    )
+                    headers.append(f"em_gt_hd: {format_number(float(gt_hellinger2_joint))}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
@@ -1793,10 +1730,18 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER"
     )
-    # model_design has no CLI flag -- it's inferred from the input/output
-    # filename (see Phlag.extract_distribution_type_from_filename), falling
-    # back to this default if neither filename carries a "gaussian"/"gmm" hint.
-    parser.set_defaults(model_design="gaussian")
+    parser.add_argument(
+        "-d",
+        "--dist-type",
+        dest="model_design",
+        default=None,
+        choices=["gaussian", "gmm"],
+        help="HMM emission distribution type (default: inferred from the "
+             "caster_scores/-o filename via "
+             "Phlag.extract_distribution_type_from_filename, falling back to "
+             "gaussian if neither filename carries a hint). Passing this "
+             "flag explicitly overrides filename inference."
+    )
 
     parser.add_argument(
         "caster_scores",
@@ -1952,6 +1897,17 @@ def build_parser():
         type=float,
         default=0.5,
         help="Silhouette score threshold to determine optimal GMM mixture counts (default: 0.5)",
+    )
+    hmm_group.add_argument(
+        "-k",
+        "--n-clusters",
+        dest="n_clusters",
+        type=int,
+        default=2,
+        help="""Total number of mixture components (null + alt combined) to use
+                    for GMM initialization -- skips the automatic silhouette-based
+                    search over k=2..10 candidate values and uses this value
+                    directly as k* (default: 2, i.e. one component per state).""",
     )
     hmm_group.add_argument(
         "-p",

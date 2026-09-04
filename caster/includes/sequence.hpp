@@ -507,6 +507,47 @@ struct Quadripartition{
 			return scoreCache;
 		}
 
+		// Diagnostic only: per-topology counts of raw per-site scores
+		// (kernal[iKernal].score(pi), the same array<score_t,3> scoreCnt()
+		// sums) classified by sign -- result[topology][0]=zero,
+		// result[topology][1]=negative, result[topology][2]=positive.
+		// Independent of scoreCnt()/scoreCache (does not touch valid/
+		// scoreCache) and never changes the score used by the tree search or
+		// --branch-mapping's chunk_scores.tsv.
+		array<array<long long, 3>, 3> signCounts() {
+			array<array<long long, 3>, 3> counts = {};
+			for (int iKernal = 0; iKernal < nKernal; iKernal++){
+				array<score_t, 3> temp = kernal[iKernal].score(pi);
+				for (int i = 0; i < 3; i++){
+					if (temp[i] == 0) counts[i][0]++;
+					else if (temp[i] < 0) counts[i][1]++;
+					else counts[i][2]++;
+				}
+			}
+			return counts;
+		}
+
+		// dstar.cpp's quartetCnt() analog: per site, the product of each
+		// of the 4 groups' depth (total valid-base count across that
+		// group's individuals at this site, i.e. sum of kernal.cnt[g][0..3]
+		// -- the same per-group nucleotide counts scoreCnt()'s quadPos
+		// call reads), summed over all sites (kernals) in this gene/chunk.
+		// Topology-independent (doesn't touch pi) -- a single shared
+		// count, like dstar's QuartetCnt column, not one per topology.
+		long long quartetCount() {
+			long long total = 0;
+			for (int iKernal = 0; iKernal < nKernal; iKernal++){
+				long long prod = 1;
+				for (int g = 0; g < 4; g++){
+					long long depth = 0;
+					for (int k = 0; k < 4; k++) depth += kernal[iKernal].cnt[g][k];
+					prod *= depth;
+				}
+				total += prod;
+			}
+			return total;
+		}
+
 		void blCnt(array<score_t, 2> &res, int i, int j){
 			#if (defined(CUSTOMIZED_ANNOTATION_TERMINAL_LENGTH) && defined(CUSTOMIZED_ANNOTATION_TERMINAL_LENGTH_ROUGH)) || defined(CUSTOMIZED_ANNOTATION_LENGTH)
 			long long S0 = 0, S1 = 0;

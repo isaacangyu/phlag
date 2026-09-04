@@ -117,6 +117,19 @@ def parse_arguments(argv=None):
              "correlations.png) -- only scores.tsv and report.tsv are produced.",
     )
     parser.add_argument(
+        "--caster-plot",
+        dest="caster_plot",
+        nargs="*",
+        choices=["scores", "scatter", "dist", "correlation", "topology_pairs"],
+        default=None,
+        help="Explicit list of caster --plot names to generate, independent of "
+             "--no-plots (default: None, meaning use the existing --no-plots-derived "
+             "behavior unchanged -- 'scores' unless --no-plots is set, nothing if it "
+             "is). When given, used verbatim as caster's --plot argument, bypassing "
+             "the --no-plots-derived default entirely; does not affect phlag's own "
+             "plots or --no-plots' effect on them.",
+    )
+    parser.add_argument(
         "--np",
         dest="null_emission_parameterization",
         type=str.lower,
@@ -183,6 +196,14 @@ def parse_arguments(argv=None):
         help="Forwarded to phlag's -t/--silhouette-threshold (default: whatever phlag's own default is).",
     )
     parser.add_argument(
+        "-k",
+        "--n-clusters",
+        dest="n_clusters",
+        type=int,
+        default=None,
+        help="Forwarded to phlag's -k/--n-clusters (default: whatever phlag's own default is).",
+    )
+    parser.add_argument(
         "-p",
         "--best-paths",
         dest="best_paths",
@@ -246,7 +267,10 @@ def main(argv=None):
     if args.chunk_scores is not None:
         caster_extra_args += ["--chunk-scores", str(args.chunk_scores)]
 
-    caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
+    if args.caster_plot is not None:
+        caster_plot_args = ["--plot"] + list(args.caster_plot)
+    else:
+        caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
     print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
     scores_path = caster.main(
         [str(args.input_file), "-d", args.dist_type]
@@ -279,6 +303,8 @@ def main(argv=None):
         phlag_extra_args += ["--mu", str(args.lm_damping)]
     if args.silhouette_threshold is not None:
         phlag_extra_args += ["-t", str(args.silhouette_threshold)]
+    if args.n_clusters is not None:
+        phlag_extra_args += ["-k", str(args.n_clusters)]
     if args.best_paths is not None:
         phlag_extra_args += ["-p", str(args.best_paths)]
     if args.correct_transition is not None:
@@ -287,9 +313,7 @@ def main(argv=None):
         phlag_extra_args += ["--rho", str(args.rho)]
     if args.beta is not None:
         phlag_extra_args += ["--beta", str(args.beta)]
-    # phlag has no -d/--dist-type flag -- model_design is inferred from the
-    # scores.tsv/report.tsv filename, which already carries the dist_type
-    # (see phlag.Phlag.extract_distribution_type_from_filename).
+    phlag_extra_args += ["-d", args.dist_type]
     print(f"[phlagster] Running phlag on '{scores_path}'...")
     phlag_main.main(
         [str(scores_path)] + output_base_args + bench_args

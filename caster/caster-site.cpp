@@ -190,7 +190,7 @@ struct Workflow {
     // windows with more informative sites look stronger for no biological
     // reason, so each window's quartet sums are divided by that window's
     // total informative-site count to get a per-site average instead.
-    void scoreChunksForBranch(const string &mappingFile, const string &outFile, int windowChunks){
+    void scoreChunksForBranch(const string &mappingFile, const string &outFile, const string &quartetCountsFile, int windowChunks){
         ifstream fmap(mappingFile);
         if (!fmap){
             cerr << "Error: could not open branch mapping file '" << mappingFile << "'\n";
@@ -231,14 +231,37 @@ struct Workflow {
         }
 
         map<pair<int, int>, array<score_t, 3> > chunkScores;
+        // Diagnostic-only companion to chunkScores: per-chunk, per-topology
+        // counts of raw per-site scores (Quadripartition::Gene::signCounts(),
+        // same kernal-level values scoreCnt() sums) classified by sign --
+        // [topology][0]=zero, [1]=negative, [2]=positive. Never read back
+        // into chunkScores/chunk_scores.tsv.
+        map<pair<int, int>, array<array<long long, 3>, 3> > chunkSignCounts;
         map<pair<int, int>, long long> chunkSiteCount;
+        // dstar.cpp's QuartetCnt analog (Gene::quartetCount(), see
+        // sequence.hpp) -- a single topology-independent per-chunk count,
+        // averaged (like the score columns) by the window's informative-site
+        // count below and written as chunk_scores.tsv's own QuartetCnt
+        // column, not a separate diagnostic file (mirrors dstar's
+        // convention of QuartetCnt being a real column, unlike the
+        // quartet_counts.tsv sign-classification file below -- an
+        // unfortunate naming coincidence between two distinct diagnostics;
+        // chunkQuartetCnt/chunkSignCounts stay separately named internally
+        // on purpose, to not confuse this file's own two features.
+        map<pair<int, int>, long long> chunkQuartetCnt;
         map<int, vector<int> > locusChunks;
         for (size_t a = 0; a < quad.genes.size(); a++){
             array<score_t, 3> s = quad.genes[a].scoreCnt();
+            array<array<long long, 3>, 3> sc = quad.genes[a].signCounts();
             pair<int, int> key = make_pair(geneLocus[a], geneChunk[a]);
             array<score_t, 3> &acc = chunkScores[key];
             acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2];
+            array<array<long long, 3>, 3> &accSc = chunkSignCounts[key];
+            for (int t = 0; t < 3; t++)
+                for (int c = 0; c < 3; c++)
+                    accSc[t][c] += sc[t][c];
             chunkSiteCount[key] += quad.genes[a].nSite;
+            chunkQuartetCnt[key] += quad.genes[a].quartetCount();
             locusChunks[geneLocus[a]].push_back(geneChunk[a]);
         }
 
@@ -263,8 +286,19 @@ struct Workflow {
             cerr << "Error: could not open '" << outFile << "' for writing.\n";
             exit(1);
         }
+        ofstream fQuartetCounts(quartetCountsFile);
+        if (!fQuartetCounts){
+            cerr << "Error: could not open '" << quartetCountsFile << "' for writing.\n";
+            exit(1);
+        }
         const string &inputFile = ARG.getStringArg("input");
-        fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\n";
+        fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tQuartetCnt\n";
+        // Diagnostic-only quartet-counts companion file (sign-classified per-
+        // site scores, see Gene::signCounts()): same row/pos values as
+        // chunk-scores above so the two can be joined by 'pos'. These are
+        // literal per-site counts, so windows are SUMMED across windowChunks
+        // (unlike chunk-scores' per-informative-site average).
+        fQuartetCounts << "file\tpos\tABBA_zero\tABBA_neg\tABBA_pos\tBABA_zero\tBABA_neg\tBABA_pos\tAABB_zero\tAABB_neg\tAABB_pos\n";
         long long nWindows = 0;
         for (auto &kv: locusChunks){
             int locusId = kv.first;
@@ -272,21 +306,34 @@ struct Workflow {
             sort(chunks.begin(), chunks.end());
             for (size_t i = 0; i + windowChunks <= chunks.size(); i++){
                 array<score_t, 3> sum = {0, 0, 0};
+                array<array<long long, 3>, 3> signSum = {};
                 long long siteSum = 0;
+                long long quartetCntSum = 0;
                 for (int j = 0; j < windowChunks; j++){
                     pair<int, int> key = make_pair(locusId, chunks[i + j]);
                     array<score_t, 3> &s = chunkScores[key];
                     sum[0] += s[0]; sum[1] += s[1]; sum[2] += s[2];
+                    array<array<long long, 3>, 3> &sc = chunkSignCounts[key];
+                    for (int t = 0; t < 3; t++)
+                        for (int c = 0; c < 3; c++)
+                            signSum[t][c] += sc[t][c];
                     siteSum += chunkSiteCount[key];
+                    quartetCntSum += chunkQuartetCnt[key];
                 }
                 long long pos = (long long) chunks[i] * chunkSizeArg;
                 double denom = (siteSum > 0) ? (double) siteSum : 1.0;
                 fout << inputFile << "\t" << pos << "\t"
-                     << (double) sum[0] / denom << "\t" << (double) sum[1] / denom << "\t" << (double) sum[2] / denom << "\n";
+                     << (double) sum[0] / denom << "\t" << (double) sum[1] / denom << "\t" << (double) sum[2] / denom
+                     << "\t" << (double) quartetCntSum / denom << "\n";
+                fQuartetCounts << inputFile << "\t" << pos << "\t"
+                      << signSum[0][0] << "\t" << signSum[0][1] << "\t" << signSum[0][2] << "\t"
+                      << signSum[1][0] << "\t" << signSum[1][1] << "\t" << signSum[1][2] << "\t"
+                      << signSum[2][0] << "\t" << signSum[2][1] << "\t" << signSum[2][2] << "\n";
                 nWindows++;
             }
         }
         cerr << "Wrote per-window (window=" << windowChunks << " chunk(s)) branch scores (" << nWindows << " windows) to: " << outFile << "\n";
+        cerr << "Wrote per-window quartet counts (diagnostic) to: " << quartetCountsFile << "\n";
     }
 
     Workflow(int argc, char** argv){
@@ -321,6 +368,9 @@ int main(int argc, char** argv){
         "pipeline's population mapping files, e.g. P1/P2/P3/Po). When given, skips the tree search entirely and "
         "instead scores that one branch's quartet topology per genomic chunk -- see --chunk-scores.");
     ARG.addStringArg(0, "chunk-scores", "chunk_scores.tsv", "Output TSV path for --branch-mapping's per-chunk quartet scores.");
+    ARG.addStringArg(0, "quartet-counts", "quartet_counts.tsv", "Output TSV path for --branch-mapping's diagnostic per-window, "
+        "per-topology raw per-site score quartet counts, sign-classified (zero/negative/positive). Same 'pos' values "
+        "as --chunk-scores' output, for joining. Purely diagnostic -- never affects --chunk-scores or the tree search.");
     ARG.addIntArg(0, "window", 0, "--branch-mapping's sliding window size, in multiples of --chunk, rolling that "
         "many consecutive chunks (sliding by 1 chunk each row, so windows overlap when > 1 chunk) into each output "
         "row and dividing by that window's total informative-site count instead of --chunk's raw per-chunk sum. "
@@ -340,7 +390,7 @@ int main(int argc, char** argv){
             cerr << "Error: --window (" << windowArg << ") must be an exact multiple of --chunk (" << chunkArg << ").\n";
             exit(1);
         }
-        WF.scoreChunksForBranch(branchMapping, ARG.getStringArg("chunk-scores"), (int) (windowArg / chunkArg));
+        WF.scoreChunksForBranch(branchMapping, ARG.getStringArg("chunk-scores"), ARG.getStringArg("quartet-counts"), (int) (windowArg / chunkArg));
         return 0;
     }
 

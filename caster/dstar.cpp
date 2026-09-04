@@ -68,7 +68,25 @@ public:
         for (int i = start; i < end; i++) res += scoreSite(i, cnt0, cnt1, cnt2, cnt3, pi);
         return res;
     }
-	
+
+    // Diagnostic-only sibling of scoreInterval: same sum, but also
+    // classifies each site's raw scoreSite() value by sign (computed once
+    // per site, reused for both the sum and the classification) and
+    // accumulates zero/negative/positive counts into nzero/nneg/npos.
+    static ScoreType scoreIntervalWithCounts(int start, int end, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const array<EqFreqType, 4> &pi,
+            CounterType &nzero, CounterType &nneg, CounterType &npos){
+        ScoreType res = 0;
+        for (int i = start; i < end; i++){
+            ScoreType v = scoreSite(i, cnt0, cnt1, cnt2, cnt3, pi);
+            res += v;
+            if (v == 0) nzero++;
+            else if (v < 0) nneg++;
+            else npos++;
+        }
+        return res;
+    }
+
     static vector<ScoreType> dstar(int windowSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
             const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const vector<array<EqFreqType, 4> > &pi){
         vector<ScoreType> res;
@@ -78,7 +96,22 @@ public:
         }
         return res;
     }
-	
+
+    // Diagnostic-only sibling of dstar(): same windowSize blocking, but
+    // produces a (nzero, nneg, npos) sign-classified quartet-count triple
+    // per window instead of a score sum.
+    static vector<array<CounterType, 3> > dstarWithCounts(int windowSize, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
+            const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3, const vector<array<EqFreqType, 4> > &pi){
+        vector<array<CounterType, 3> > res;
+        for (int i = 0; i < cnt0[0].size(); i += windowSize){
+			int j = (i + windowSize < cnt0[0].size()) ? i + windowSize : cnt0[0].size();
+            CounterType nzero = 0, nneg = 0, npos = 0;
+            scoreIntervalWithCounts(i, j, cnt0, cnt1, cnt2, cnt3, pi[i / windowSize], nzero, nneg, npos);
+            res.push_back({nzero, nneg, npos});
+        }
+        return res;
+    }
+
 	static CounterType quartetCnt(int start, int end, const array<vector<FreqType>, 4> &cnt0, const array<vector<FreqType>, 4> &cnt1,
             const array<vector<FreqType>, 4> &cnt2, const array<vector<FreqType>, 4> &cnt3){
 		CounterType res = 0;
@@ -126,7 +159,7 @@ public:
         return res;
     }
 
-    static string multiind(string input, string mapping = "", int intervalSize = 1000000, int windowSize = 10000, bool header = true)
+    static string multiind(string input, string mapping = "", int intervalSize = 1000000, int windowSize = 10000, bool header = true, string quartetCountsPath = "")
     {
         string name[4];
         unordered_map<string, int> name2id;
@@ -205,7 +238,16 @@ public:
         }
         if (header) fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
         else cerr << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
-        
+
+        // Diagnostic-only companion output: per-window quartet counts (each
+        // site's raw per-site score classified zero/negative/positive by
+        // sign) for each of the 3 topologies. Only computed/written when a
+        // path was given, to avoid doubling the per-site work in the common
+        // case.
+        bool writeQuartetCounts = !quartetCountsPath.empty();
+        ostringstream quartetCountsOut;
+        if (writeQuartetCounts) quartetCountsOut << "file\tpos\tABBA_zero\tABBA_neg\tABBA_pos\tBABA_zero\tBABA_neg\tBABA_pos\tAABB_zero\tAABB_neg\tAABB_pos\n";
+
         double total1 = 0, total2 = 0, total3 = 0;
         size_t min_len = freq[0][0].size();
         for (int p = 1; p < 4; ++p) {
@@ -218,14 +260,33 @@ public:
             vector<ScoreType> topology2 = dstar(windowSize, data.cnt1, data.cnt3, data.cnt0, data.cnt2, data.pi);
             vector<ScoreType> topology3 = dstar(windowSize, data.cnt2, data.cnt3, data.cnt0, data.cnt1, data.pi);
             vector<CounterType> quartetCnt = dstarQuartetCnt(windowSize, data.cnt0, data.cnt1, data.cnt2, data.cnt3);
+
+            vector<array<CounterType, 3> > counts1, counts2, counts3;
+            if (writeQuartetCounts){
+                counts1 = dstarWithCounts(windowSize, data.cnt0, data.cnt3, data.cnt1, data.cnt2, data.pi);
+                counts2 = dstarWithCounts(windowSize, data.cnt1, data.cnt3, data.cnt0, data.cnt2, data.pi);
+                counts3 = dstarWithCounts(windowSize, data.cnt2, data.cnt3, data.cnt0, data.cnt1, data.pi);
+            }
+
             double sum1 = 0, sum2 = 0, sum3 = 0, qcnt = 0;
+            CounterType c1z = 0, c1n = 0, c1p = 0, c2z = 0, c2n = 0, c2p = 0, c3z = 0, c3n = 0, c3p = 0;
             for (size_t i = 0; i < topology1.size(); i++){
                 sum1 += topology1[i];
                 sum2 += topology2[i];
                 sum3 += topology3[i];
                 qcnt += quartetCnt[i];
+                if (writeQuartetCounts){
+                    c1z += counts1[i][0]; c1n += counts1[i][1]; c1p += counts1[i][2];
+                    c2z += counts2[i][0]; c2n += counts2[i][1]; c2p += counts2[i][2];
+                    c3z += counts3[i][0]; c3n += counts3[i][1]; c3p += counts3[i][2];
+                }
             }
             fout << input << "\t" << pos << "\t" << sum1 << "\t" << sum2 << "\t" << sum3 << "\t" << (sum1 - sum2) / (sum1 + sum2 + sum3) << "\t" << qcnt << endl;
+            if (writeQuartetCounts){
+                quartetCountsOut << input << "\t" << pos << "\t" << c1z << "\t" << c1n << "\t" << c1p
+                        << "\t" << c2z << "\t" << c2n << "\t" << c2p
+                        << "\t" << c3z << "\t" << c3n << "\t" << c3p << "\n";
+            }
             total1 += sum1;
             total2 += sum2;
             total3 += sum3;
@@ -236,18 +297,30 @@ public:
         cerr << "c*BABA = " << total2 << " (" << name[0] << " and " << name[2] << ")\n";
         cerr << "c*AABB = " << total3 << " (" << name[0] << " and " << name[1] << ")\n";
         cerr << "D* = (c*ABBA - c*BABA) / (c*ABBA + c*BABA + c*AABB) = " << (total1 - total2) / (total1 + total2 + total3) << "\n";
-        
+
+        if (writeQuartetCounts){
+            ofstream fqc(quartetCountsPath);
+            if (!fqc){
+                cerr << "Warning: could not open quartet counts output path '" << quartetCountsPath << "' for writing.\n";
+            } else {
+                fqc << quartetCountsOut.str();
+            }
+        }
+
         return fout.str();
     }
 };
 
 const string HELP = R"V0G0N(D* Statistic Sliding Window Tool
-dstar FASTA_FILE [ MAPPING_FILE STEP_SIZE [ WINDOW_SIZE ] ]
+dstar FASTA_FILE [ MAPPING_FILE STEP_SIZE [ WINDOW_SIZE [ QUARTET_COUNTS_OUTPUT_PATH ] ] ]
 
 FASTA_FILE: input file, currently only supporting FASTA format
 MAPPING_FILE: a file mapping input sequences into four clusters or - (see format below, default: -)
 STEP_SIZE: sliding step size (default: 1000000)
 WINDOW_SIZE: block window size (default: 10000)
+QUARTET_COUNTS_OUTPUT_PATH: optional path to write a diagnostic companion TSV
+    of per-window, per-topology raw per-site score quartet counts, sign-
+    classified (zero/negative/positive); omitted by default (not written)
 )V0G0N";
 
 int main(int argc, char *argv[])
@@ -256,13 +329,14 @@ int main(int argc, char *argv[])
 		cerr << HELP;
 		return 0;
 	}
-	
+
 	string fasta = argv[1];
 	string mapping = (argc > 2) ? argv[2] : "-";
 	if (mapping == "-") mapping = "";
 	int size = (argc > 3) ? stoi(argv[3]) : 1000000;
 	int win_size = (argc > 4) ? stoi(argv[4]) : 10000;
-	
-    cout << DStarQuadripartitionScorer<DataType16>::multiind(fasta, mapping, size, win_size);
+	string quartetCountsPath = (argc > 5) ? argv[5] : "";
+
+    cout << DStarQuadripartitionScorer<DataType16>::multiind(fasta, mapping, size, win_size, true, quartetCountsPath);
     return 0;
 }

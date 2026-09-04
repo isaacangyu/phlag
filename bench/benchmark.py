@@ -824,6 +824,7 @@ class BenchmarkStats:
 
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
+                 pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
                  errorbar="sd"):
         from phlag.utils import get_data_dir
 
@@ -834,6 +835,17 @@ class BenchmarkStats:
         self.dist_type = dist_type
         self.window_size = window_size
         self.step_size = step_size
+        # Forwarded to get_expected_caster_sim_dir (see _build_record's
+        # gt_stats.txt lookup) so a --pair/--site/-z/-i/-n run's caster
+        # ground-truth is read from ITS OWN c<chunk>_s<S>/variant tree,
+        # not the base w<W>_s<S> dstar tree every other constructor arg
+        # here already gets pinned to.
+        self.pair = pair
+        self.site = site
+        self.chunk_size = chunk_size
+        self.normalize = normalize
+        self.zscale = zscale
+        self.ilr = ilr
         self.errorbar = errorbar
 
         self.runs = []
@@ -984,6 +996,8 @@ class BenchmarkStats:
         leaf_dir = self.sim_root / rel_leaf
         caster_dir = get_expected_caster_sim_dir(
             leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
+            pair=self.pair, site=self.site, chunk_size=self.chunk_size,
+            normalize=self.normalize, zscale=self.zscale, ilr=self.ilr,
         )
         gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
         for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
@@ -2093,21 +2107,6 @@ class BenchmarkFigurePlotter:
 
 
 
-def _parse_skip_arg(value):
-    """--skip's argparse `type`: one comma-separated string (e.g. 'caster,phlag')
-    instead of nargs="+" -- a bare multi-token nargs="+" flag greedily swallows
-    whatever follows it, which collides with the positional `change` argument
-    whenever it comes after --skip on the command line."""
-    stages = [s.strip() for s in value.split(",") if s.strip()]
-    valid = {"caster", "phlag"}
-    invalid = [s for s in stages if s not in valid]
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            f"invalid choice(s) {invalid} (choose from 'caster', 'phlag')"
-        )
-    return stages
-
-
 # Caster/phlag flags mirrored onto benchmark.py's own parser -- recorded per
 # run into <out_dir>/args.json -- (dest, forwarded flag string, is_store_true_flag).
 # Each dest matches caster.py's/phlag.py's own build_parser() dest exactly, so
@@ -2129,6 +2128,7 @@ CASTER_ARG_SPECS = [
     ("ilr", "-i", True),
 ]
 PHLAG_ARG_SPECS = [
+    ("dist_type", "-d", False),
     ("null_emission_parameterization", "--np", False),
     ("alt_emission_parameterization", "--ap", False),
     ("n_iters", "-L", False),
@@ -2138,6 +2138,7 @@ PHLAG_ARG_SPECS = [
     ("annealing", "--annealing", True),
     ("lm_damping", "--mu", False),
     ("silhouette_threshold", "-t", False),
+    ("n_clusters", "-k", False),
     ("best_paths", "-p", False),
     ("correct_transition", "--correct-transition", False),
     ("rho", "--rho", False),
@@ -2178,19 +2179,9 @@ def _explicit_dests(argv, parser):
 def _build_parser():
     parser = argparse.ArgumentParser(
         description="Benchmark: run caster and phlag over every dataset in simulations/ "
-                    "(rerunning every stage by default), then summarize every "
+                    "(always a fresh caster+phlag pass, skipping only items whose "
+                    "report.tsv already exists), then summarize every "
                     "finished run into the Figure-3 panels."
-    )
-    parser.add_argument(
-        "--skip",
-        dest="skip",
-        type=_parse_skip_arg,
-        default=[],
-        help="Reuse existing output instead of rerunning, for the named stage(s), "
-             "comma-separated (e.g. 'caster,phlag') (default: rerun everything -- "
-             "the mirrored caster/phlag flags below can change what a stage does "
-             "without touching any source file, so existing output is never "
-             "assumed to still be current unless you say so here)",
     )
     parser.add_argument(
         "--create",
@@ -2324,6 +2315,10 @@ def _build_parser():
     phlag_group.add_argument(
         "-t", "--silhouette-threshold", dest="silhouette_threshold", type=float, default=0.5,
         help="Forwarded to phlag's -t/--silhouette-threshold (default: 0.5).",
+    )
+    phlag_group.add_argument(
+        "-k", "--n-clusters", dest="n_clusters", type=int, default=2,
+        help="Forwarded to phlag's -k/--n-clusters (default: 2).",
     )
     phlag_group.add_argument(
         "-p", "--best-paths", dest="best_paths", type=int, default=1,
@@ -2571,16 +2566,20 @@ def run_all(args, sim_root, out_dir):
     Anything else found there -- older one-off intervals, stray pattern-token files -- is
     left alone: it is neither run here nor counted by summarize().
 
-    Caster and phlag are rerun by default, since both draw their actual CLI flags
-    from args (the mirrored caster/phlag flags on benchmark.py's own parser, see
-    CASTER_ARG_SPECS/PHLAG_ARG_SPECS) rather than only from source code -- a flag
-    change there doesn't touch any .py file's mtime, so file-mtime-based staleness
-    detection can't be trusted to notice it. --skip caster and/or --skip phlag opt
-    back into reusing existing output for the named stage(s), if present. When both
-    stages are running, they run as a single `phlagster` invocation (in-process
-    caster-then-phlag, avoiding two separate interpreter/JAX startups); when
-    only phlag is running (caster skipped), `phlag` alone is invoked directly
-    against the existing scores.tsv.
+    Caster and phlag run as two separate passes over work_items, not one
+    combined `phlagster` invocation, so phlag never starts against a
+    partially-scored tree: phase 1 runs caster (alone) for every item still
+    missing its scores.tsv; phase 2 runs phlag (alone) for every item still
+    missing its report.tsv, using whatever scores.tsv now exists (from this
+    run's phase 1 or an earlier run). Each stage's own existing output is
+    what it checks -- an item whose scores.tsv is already present skips
+    caster (even with no report.tsv yet), and an item whose report.tsv is
+    already present skips phlag -- so a rerun of the same --create PATH
+    continues past whatever finished last time, at whichever stage. If phase
+    1 fails or leaves a scores.tsv missing, phase 2 records a failure for
+    that item instead of running phlag against a nonexistent input. To force
+    a clean redo of an item, delete its scores.tsv and/or report.tsv (or the
+    whole PATH, per --create's help).
 
     args' mirrored-flag values (already fully resolved by the caller -- a
     plain --create's parsed args, or --sweep's args with the swept dest
@@ -2650,8 +2649,9 @@ def run_all(args, sim_root, out_dir):
     phlag_forward_args = _build_forward_args(args, PHLAG_ARG_SPECS)
 
     config_lines = [
-        f"{len(work_items)} file(s) to process -- "
-        f"{'skipping ' + ', '.join(args.skip) if args.skip else 'rerunning all outputs'}",
+        f"{len(work_items)} file(s) to process -- caster and phlag run as separate "
+        "passes, each skipping items whose own output (scores.tsv / report.tsv) "
+        "already exists",
         f"phlag reports write directly to {out_dir / 'reports'} (--bench)",
         "[caster] Effective flags: " + " ".join(f"{d}={getattr(args, d)}" for d, _, _ in CASTER_ARG_SPECS),
         "[phlag] Effective flags: " + " ".join(f"{d}={getattr(args, d)}" for d, _, _ in PHLAG_ARG_SPECS),
@@ -2665,6 +2665,7 @@ def run_all(args, sim_root, out_dir):
     for line in config_lines:
         print(line)
 
+    caster_processed = 0
     processed = 0
     skipped_present = 0
     failures = []
@@ -2673,6 +2674,7 @@ def run_all(args, sim_root, out_dir):
         progress.write(f"{RED}[fail] {msg}{RESET}")
         failures.append(msg)
 
+    items = []
     progress = tqdm(work_items, desc="", unit="file")
     for leaf_dir, rel_path, fasta_path in progress:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
@@ -2685,50 +2687,62 @@ def run_all(args, sim_root, out_dir):
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
         )
+        items.append((leaf_dir, rel_path, fasta_path, scores_path, report_path))
 
-        caster_done = scores_path.exists() and "caster" in args.skip
-        phlag_done = report_path.exists() and "phlag" in args.skip
-
-        if caster_done and phlag_done:
-            skipped_present += 1
+        if scores_path.exists():
             continue
 
-        if caster_done:
-            progress.set_description(f"[phlag] {pattern_rel} is being processed", refresh=False)
-            phlag_ok, phlag_out = run_step(
-                [sys.executable, "-m", "phlag.phlag", str(scores_path)]
-                + ["--output-base", report_base_override, "--bench"]
-                + phlag_forward_args
-                + ["--plot", "-s", str(args.step_size)],
-                "phlag",
-                cwd=str(snapshot_root), env=snapshot_env,
+        progress.set_description(f"[caster] {pattern_rel} is being processed", refresh=False)
+        caster_ok, caster_out = run_step(
+            [sys.executable, "-m", "phlag.caster", str(fasta_path)]
+            + ["--bench"] + caster_forward_args
+            + ["--plot", "topology_pairs", "correlation"],
+            "caster",
+            cwd=str(snapshot_root), env=snapshot_env,
+        )
+        if not caster_ok:
+            record_failure(f"{pattern_rel}: caster failed\n{caster_out}")
+            continue
+        if not scores_path.exists():
+            record_failure(
+                f"{pattern_rel}: caster reported success but scores file not found at {scores_path}"
             )
-            if not phlag_ok:
-                record_failure(f"{pattern_rel}: phlag failed\n{phlag_out}")
-                continue
-        else:
-            progress.set_description(f"[caster] {pattern_rel} is being processed", refresh=False)
-            phlagster_ok, phlagster_out = run_step(
-                [sys.executable, "-m", "bench.phlagster", str(fasta_path)]
-                + ["--output-base", report_base_override, "--bench"]
-                + caster_forward_args + phlag_forward_args
-                + ["--no-plots"],
-                "phlagster",
-                cwd=str(snapshot_root), env=snapshot_env,
+            continue
+        caster_processed += 1
+    progress.set_description("")
+    progress.close()
+
+    # Phase 2 only starts once every item above has had its chance to get a
+    # scores.tsv -- phlag never runs against an item still missing one (a
+    # caster failure just above is recorded there, not re-raised here).
+    progress = tqdm(items, desc="", unit="file")
+    for leaf_dir, rel_path, fasta_path, scores_path, report_path in progress:
+        pattern_rel = f"{rel_path}/{fasta_path.stem}"
+
+        if report_path.exists():
+            skipped_present += 1
+            continue
+        if not scores_path.exists():
+            record_failure(f"{pattern_rel}: scores.tsv missing (caster failed above), skipping phlag")
+            continue
+
+        progress.set_description(f"[phlag] {pattern_rel} is being processed", refresh=False)
+        phlag_ok, phlag_out = run_step(
+            [sys.executable, "-m", "phlag.phlag", str(scores_path)]
+            + ["--output-base", report_base_override, "--bench"]
+            + phlag_forward_args
+            + ["--plot", "-s", str(args.step_size)],
+            "phlag",
+            cwd=str(snapshot_root), env=snapshot_env,
+        )
+        if not phlag_ok:
+            record_failure(f"{pattern_rel}: phlag failed\n{phlag_out}")
+            continue
+        if not report_path.exists():
+            record_failure(
+                f"{pattern_rel}: phlag reported success but report file not found at {report_path}"
             )
-            if not phlagster_ok:
-                record_failure(f"{pattern_rel}: phlagster failed\n{phlagster_out}")
-                continue
-            if not scores_path.exists():
-                record_failure(
-                    f"{pattern_rel}: phlagster reported success but scores file not found at {scores_path}"
-                )
-                continue
-            if not report_path.exists():
-                record_failure(
-                    f"{pattern_rel}: phlagster reported success but report file not found at {report_path}"
-                )
-                continue
+            continue
 
         processed += 1
     progress.set_description("")
@@ -2737,7 +2751,8 @@ def run_all(args, sim_root, out_dir):
     shutil.rmtree(snapshot_root, ignore_errors=True)
 
     print(
-        f"\nBenchmark complete: {processed} processed, "
+        f"\nBenchmark complete: {caster_processed} caster-processed, "
+        f"{processed} phlag-processed, "
         f"{skipped_incomplete} skipped (incomplete), "
         f"{skipped_present} skipped (already present), "
         f"{len(failures)} failed."
@@ -3001,10 +3016,24 @@ def main(argv=None):
     if not sim_root.exists():
         sys.exit(f"Error: simulations directory not found at '{sim_root}'")
 
-    stats = BenchmarkStats(
-        sim_root=sim_root,
-        errorbar=args.errorbar,
-    )
+    def make_stats(for_args):
+        # Built fresh from `for_args` every call, never shared/reused across a
+        # --sweep's leaves -- a leaf whose swept dest is one of these
+        # (e.g. --sweep=-w=...) needs summarize()'s gt_stats.txt lookup
+        # (_build_record) pinned to THAT leaf's own value, not whatever the
+        # top-level invocation happened to carry.
+        return BenchmarkStats(
+            sim_root=sim_root,
+            window_size=for_args.window_size,
+            step_size=for_args.step_size,
+            pair=for_args.pair,
+            site=for_args.site,
+            chunk_size=for_args.chunk_size,
+            normalize=for_args.normalize,
+            zscale=for_args.zscale,
+            ilr=for_args.ilr,
+            errorbar=for_args.errorbar,
+        )
 
     out_dir = resolve_run_dir(args)
 
@@ -3016,11 +3045,11 @@ def main(argv=None):
             leaf_args = argparse.Namespace(**vars(args))
             setattr(leaf_args, dest, value)
             run_all(leaf_args, sim_root, leaf_dir)
-            summarize(leaf_args, sim_root, stats, leaf_dir, start_time=start_time)
+            summarize(leaf_args, sim_root, make_stats(leaf_args), leaf_dir, start_time=start_time)
         return
 
     run_all(args, sim_root, out_dir)
-    summarize(args, sim_root, stats, out_dir, start_time=start_time)
+    summarize(args, sim_root, make_stats(args), out_dir, start_time=start_time)
 
 
 if __name__ == "__main__":

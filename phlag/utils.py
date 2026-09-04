@@ -137,13 +137,38 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
 
 GT_STATS_FILENAME = "gt_stats.txt"
 
+def gaussian_hellinger2_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
+    """
+    General-N Gaussian squared Hellinger distance (numpy), matching
+    hmm.gaussian_hellinger2 -- kept here (rather than importing jax into
+    caster.py/utils.py) so write_gt_stats_file's ground-truth Hellinger
+    distance can be computed once at write time instead of every phlag run
+    recomputing it from Null/Alt mean+covariance.
+    """
+    import numpy as np
+    mu1 = np.asarray(mu1, dtype=float)
+    mu2 = np.asarray(mu2, dtype=float)
+    Sigma1 = np.asarray(Sigma1, dtype=float)
+    Sigma2 = np.asarray(Sigma2, dtype=float)
+    d = mu1.shape[0]
+    Sigma_avg = 0.5 * (Sigma1 + Sigma2) + eps * np.eye(d)
+    diff = mu1 - mu2
+    _, logdet1 = np.linalg.slogdet(Sigma1 + eps * np.eye(d))
+    _, logdet2 = np.linalg.slogdet(Sigma2 + eps * np.eye(d))
+    _, logdet_avg = np.linalg.slogdet(Sigma_avg)
+    log_coef = 0.25 * logdet1 + 0.25 * logdet2 - 0.5 * logdet_avg
+    quad = diff @ np.linalg.solve(Sigma_avg, diff)
+    bc = np.exp(log_coef - 0.125 * quad)
+    return float(max(1.0 - bc, 0.0))
+
 def write_gt_stats_file(path, stats):
     """
     Writes stats (a dict with any subset of keys "Null", "Alt", "Overall",
     each an array-like (mean, covariance) pair over the 3 topology
-    dimensions) as a small ast.literal_eval-parseable text file, mirroring
-    phlag.py's old "Null/Alt fitted mean/covariance" bookkeeping convention
-    so read_gt_stats_file can recover it exactly. Writes nothing if stats
+    dimensions, plus an optional "Hellinger2" float) as a small
+    ast.literal_eval-parseable text file, mirroring phlag.py's old
+    "Null/Alt fitted mean/covariance" bookkeeping convention so
+    read_gt_stats_file can recover it exactly. Writes nothing if stats
     is empty.
     """
     import pathlib as _pathlib
@@ -154,15 +179,18 @@ def write_gt_stats_file(path, stats):
         mean, cov = stats[label]
         lines.append(f"{label} mean: {list(float(x) for x in mean)}")
         lines.append(f"{label} covariance: {[list(float(x) for x in row) for row in cov]}")
+    if "Hellinger2" in stats:
+        lines.append(f"Hellinger2: {float(stats['Hellinger2'])}")
     if lines:
         _pathlib.Path(path).write_text("\n".join(lines) + "\n")
 
 def read_gt_stats_file(path):
     """
     Reads back a gt_stats.txt written by write_gt_stats_file. Returns
-    {"Null": (mean, cov), "Alt": (mean, cov), "Overall": (mean, cov)} for
-    whichever sections are present (each mean/cov a plain nested list), or
-    {} if the file doesn't exist or has no parseable sections.
+    {"Null": (mean, cov), "Alt": (mean, cov), "Overall": (mean, cov),
+    "Hellinger2": float} for whichever sections are present (each mean/cov
+    a plain nested list), or {} if the file doesn't exist or has no
+    parseable sections.
     """
     import re
     import ast
@@ -171,6 +199,7 @@ def read_gt_stats_file(path):
     if not p.exists():
         return {}
     means, covs = {}, {}
+    hellinger2 = None
     for line in p.read_text().splitlines():
         m = re.match(r'^(Null|Alt|Overall) mean:\s*(\[.+\])\s*$', line)
         if m:
@@ -185,7 +214,17 @@ def read_gt_stats_file(path):
                 covs[m.group(1)] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
-    return {label: (means[label], covs[label]) for label in ("Null", "Alt", "Overall") if label in means and label in covs}
+            continue
+        m = re.match(r'^Hellinger2:\s*([-\d.eE+]+)\s*$', line)
+        if m:
+            try:
+                hellinger2 = float(m.group(1))
+            except ValueError:
+                pass
+    result = {label: (means[label], covs[label]) for label in ("Null", "Alt", "Overall") if label in means and label in covs}
+    if hellinger2 is not None:
+        result["Hellinger2"] = hellinger2
+    return result
 
 def clean_locus_name(locus_str):
     """

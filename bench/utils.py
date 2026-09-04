@@ -544,7 +544,20 @@ class CrossRunAnalysis:
         for flag in agg_seq:
             if flag not in axes and flag not in data_col_axes and flag in _FLAG_TO_DEST:
                 axes[flag] = self._discover_flag_values(flag, exclude_keywords)
-        pool_axes = {flag: spec for flag, spec in axes.items() if flag not in agg_set}
+        # A tuple agg element (e.g. ("--rho", "--beta")) is a single agg_set
+        # member, not its individual flags -- so excluding pool_axes by
+        # membership in agg_set alone would leave "--rho"/"--beta" (if also
+        # given their own entries in `axes`) as SEPARATE pool axes. Since a
+        # pool combo's values get merged in over the tuple axis's own
+        # realized (rho, beta) pair below (see the pool_combo loop), that
+        # would silently overwrite/erase the tuple axis's distinguishing
+        # combo for every bucket, unioning the same dirs into all of them.
+        # Flattening tuple members here keeps them out of pool_axes so only
+        # the tuple axis controls their value.
+        agg_members = set()
+        for name in agg_seq:
+            agg_members.update(name) if isinstance(name, tuple) else agg_members.add(name)
+        pool_axes = {flag: spec for flag, spec in axes.items() if flag not in agg_members}
         pool_axis_states = [_cartesian_axis_states(flag, spec) for flag, spec in pool_axes.items()]
         pool_combos = list(itertools.product(*pool_axis_states)) if pool_axis_states else [()]
         restriction = _pool_axes_label(pool_axes)
@@ -1249,7 +1262,7 @@ class CrossRunAnalysis:
                 if axis_val(label) != target:
                     continue
                 d = raw_df(dirs)
-                if d.empty:
+                if d.empty or metric not in d.columns:
                     continue
                 if panel_col is not None:
                     d = d[_is_true(d[panel_col])]
@@ -1365,7 +1378,10 @@ class CrossRunAnalysis:
                                 continue
                             label, _ = entry
                             d = dfs[label]
-                            if d.empty:
+                            # metric can be entirely absent from d's columns (not just
+                            # NaN-valued) when every one of this config's dirs' runs.tsv
+                            # predates it -- see _plot_heatmap's identical guard.
+                            if d.empty or metric not in d.columns:
                                 continue
                             if panel_col is not None:
                                 d = d[_is_true(d[panel_col])]
@@ -1374,7 +1390,14 @@ class CrossRunAnalysis:
                     if plot_type == "violin" and not bounded:
                         _clip_axis_to_whiskers(ax, cell_bounds)
             fig.suptitle(_compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
-            if bar_axis_label:
+            # A single subplot's bar categories aren't otherwise labeled
+            # anywhere, so the shared axis label carries real information
+            # there -- but a multi-subplot grid repeats the same bar
+            # categories (and now, since _combo_label_part canonicalizes bool
+            # flags to their long form, self-explanatory tick labels like
+            # "ilr"/"no-ilr") in every column, making one more copy centered
+            # under the whole figure redundant.
+            if bar_axis_label and n_rows * n_cols == 1:
                 fig.supxlabel(bar_axis_label, fontsize=9)
             fig.supylabel(metric, fontsize=9)
             if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
@@ -1527,7 +1550,16 @@ class CrossRunAnalysis:
                             d = dfs[label]
                             if panel_col is not None and not d.empty:
                                 d = d[_is_true(d[panel_col])]
-                            grid[yi][xi] = d[real_metric].dropna().mean() if not d.empty else float("nan")
+                            # real_metric can be entirely absent from d's columns, not just
+                            # NaN-valued -- pd.concat drops a column that's missing from
+                            # every one of a config's dirs' runs.tsv (e.g. legacy runs
+                            # predating null_mean_*/alt_mean_*, see CLAUDE.md's caster
+                            # scores note), so indexing d[real_metric] unconditionally
+                            # raises KeyError instead of just having no data to average.
+                            grid[yi][xi] = (
+                                d[real_metric].dropna().mean()
+                                if not d.empty and real_metric in d.columns else float("nan")
+                            )
                     grids[(rv, cv)] = grid
             any_signed = any(signed.values())
             is_diff = {}
@@ -1857,11 +1889,11 @@ def _combo_label_part(flag, requirement):
     ("s0.8") instead, since it has no single absolute step size to format
     until matched against a specific window."""
     if requirement is True:
-        return _strip_flag(flag)
+        return _strip_flag(_canonical_flag_name(flag))
     if requirement is False:
         return None
     if requirement is None:
-        return f"no-{_strip_flag(flag)}"
+        return f"no-{_strip_flag(_canonical_flag_name(flag))}"
     if flag == "-s" and (frac := _as_step_fraction(requirement)) is not None:
         return f"s{frac:g}"
     if flag in ("-w", "-s"):
