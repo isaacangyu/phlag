@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import norm
+from scipy.stats import norm, expon
 
 def format_val(val):
     """
@@ -61,17 +61,21 @@ def recover_source_fasta(scores_path):
 
 def parse_ws_from_path(path):
     """
-    Recovers (mode, window_or_chunk, step, is_site, is_zscale, is_ilr, is_normalize)
-    from a 'w<...>_s<...>' (dstar), 'c<...>_s<...>' (--pair), or
-    'c<...>_s<...>[_site][_z][_i][_n]' (--site/--zscale/--ilr/--normalize) path
-    segment, as written by caster.py's standalone out/ tree (flat suffixes)
-    and older canonical store/caster/ runs (same flat suffixes). The current
-    canonical store/caster/ tree instead nests 'site'/'ilr'/'normalize' as
-    their own path components right after the size segment (zscale stays a
-    flat '_z' suffix there) -- so after matching the size segment, also
-    consume any immediately-following 'site'/'ilr'/'normalize' components,
-    OR'd into whatever the flat suffixes already captured. Returns None if
-    no 'w'/'c'-prefixed size segment is found anywhere in path's parts.
+    Recovers (mode, window_or_chunk, step, is_site, is_zscale, is_ilr,
+    is_normalize, norm_eps) from a 'w<...>_s<...>' (dstar), 'c<...>_s<...>'
+    (--pair), or 'c<...>_s<...>[_site][_z][_i][_n]' (--site/--zscale/--ilr/
+    --normalize) path segment, as written by caster.py's standalone out/ tree
+    (flat suffixes) and older canonical store/caster/ runs (same flat
+    suffixes). The current canonical store/caster/ tree instead nests
+    'site'/'ilr'/'normalize' as their own path components right after the
+    size segment (zscale stays a flat '_z' suffix there), and 'normalize'
+    itself may further nest an 'eps<value>' component for a non-default
+    --norm-eps (see get_expected_caster_sim_dir/_derive_output_path) -- so
+    after matching the size segment, also consume any immediately-following
+    'site'/'ilr'/'normalize'/'eps<value>' components, OR'd into whatever the
+    flat suffixes already captured. norm_eps is None when no 'eps<value>'
+    component is found (caster's own default applies). Returns None if no
+    'w'/'c'-prefixed size segment is found anywhere in path's parts.
     """
     parts = path.parts
     for i, part in enumerate(parts):
@@ -81,6 +85,7 @@ def parse_ws_from_path(path):
             is_zscale = bool(m.group(5))
             is_ilr = bool(m.group(6))
             is_normalize = bool(m.group(7))
+            norm_eps = None
             for nested in parts[i + 1:]:
                 if nested == "site":
                     is_site = True
@@ -89,10 +94,13 @@ def parse_ws_from_path(path):
                 elif nested == "normalize":
                     is_normalize = True
                 else:
+                    eps_m = re.match(r'^eps([\d.eE+-]+)$', nested)
+                    if eps_m:
+                        norm_eps = float(eps_m.group(1))
                     break
             return (
                 m.group(1).lower(), int_or_abbrev(m.group(2)), int_or_abbrev(m.group(3)),
-                is_site, is_zscale, is_ilr, is_normalize,
+                is_site, is_zscale, is_ilr, is_normalize, norm_eps,
             )
     return None
 
@@ -143,7 +151,10 @@ def apply_zscale_to_scores_file(path, has_q123):
     pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
 
 
-def apply_normalize(rows, keys):
+DEFAULT_NORM_EPS = 1e-6
+
+
+def apply_normalize(rows, keys, eps=DEFAULT_NORM_EPS):
     """
     Normalizes each row's `keys` (dict keys into `rows`, a list of dicts) to
     proportions of that row's own sum (1/3 each if the sum is 0), in place.
@@ -152,20 +163,40 @@ def apply_normalize(rows, keys):
     unrelated to the sum of the three D* topology scores). D* itself is
     invariant to this rescaling (same denominator cancels), so it is left
     untouched by callers.
+
+    A window with no informative sites should have all three raw values at
+    exactly 0, but float accumulation leaves residual noise around 1e-14
+    instead -- an exact `denom == 0` check misses that, so dividing by a
+    ~1e-14 (or smaller) denom blows a noise-level numerator up to spurious
+    values in the thousands to billions. Treat the whole row as noise (fall
+    back to 1/3 each) whenever every value in it is already below a
+    noise floor, well under any real per-window topology count.
+
+    That NOISE_FLOOR check only catches an all-near-zero row -- it misses a
+    row whose 3 raw values are each individually real (not noise) but nearly
+    cancel (caster-pair/caster-site's c*ABBA/c*BABA/c*AABB are CASTER's
+    signed scoreCnt() evidence score, not a plain non-negative count, so
+    this cancellation is a real, not-rare case, not just float noise), which
+    still blows the ratio up to the thousands-to-billions range. `eps`
+    guards this second case by clamping `denom`'s magnitude (sign
+    preserved) to at least `eps` before dividing, independent of the
+    NOISE_FLOOR all-zero fallback above.
     """
+    NOISE_FLOOR = 1e-9
     for row in rows:
         vals = [row[k] for k in keys]
         denom = sum(vals)
-        if denom == 0:
+        if max(abs(v) for v in vals) < NOISE_FLOOR:
             for k in keys:
                 row[k] = 1.0 / len(keys)
         else:
+            denom_safe = max(denom, eps) if denom >= 0 else min(denom, -eps)
             for k, v in zip(keys, vals):
-                row[k] = v / denom
+                row[k] = v / denom_safe
     return rows
 
 
-def apply_normalize_to_scores_file(src_path, dst_path, has_q123):
+def apply_normalize_to_scores_file(src_path, dst_path, has_q123, eps=DEFAULT_NORM_EPS):
     """
     Reads an already-written scores TSV at `src_path` (un-normalized), applies
     apply_normalize to c*ABBA/c*BABA/c*AABB, and writes the result to
@@ -173,11 +204,12 @@ def apply_normalize_to_scores_file(src_path, dst_path, has_q123):
     recomputing dstar/caster-pair/caster-site when an un-normalized scores.tsv
     for the same window/step (or chunk/step) already exists. If q1/q2/q3 are
     also present (--pair), they collapse to exactly the normalized
-    c*ABBA/c*BABA/c*AABB values (a row's proportions summed to 1).
+    c*ABBA/c*BABA/c*AABB values (a row's proportions summed to 1). `eps`:
+    see apply_normalize.
     """
     df = pd.read_csv(src_path, sep="\t")
     rows = df.to_dict("records")
-    apply_normalize(rows, ["c*ABBA", "c*BABA", "c*AABB"])
+    apply_normalize(rows, ["c*ABBA", "c*BABA", "c*AABB"], eps=eps)
     if has_q123:
         for row in rows:
             row["q1"], row["q2"], row["q3"] = row["c*ABBA"], row["c*BABA"], row["c*AABB"]
@@ -381,7 +413,7 @@ class CasterPlotter:
         ws = parse_ws_from_path(pathlib.Path(scores_file))
         has_q123 = self.df is not None and all(c in self.df.columns for c in ('q1', 'q2', 'q3'))
         if ws:
-            mode, _, _, is_site, is_zscale, is_ilr, is_normalize = ws
+            mode, _, _, is_site, is_zscale, is_ilr, is_normalize, _ = ws
             source = "site" if (mode == "c" and is_site) else ("pair" if mode == "c" else "dstar")
             transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize)) if on]
             tag_parts = [source] + (transform_bits or ["raw"])
@@ -641,30 +673,53 @@ class CasterPlotter:
 
             null_vals = self.df.loc[labels == 'Null', col]
             alt_vals = self.df.loc[labels == 'Alt', col]
+            is_exponential = self.distribution == "exponential"
+            shift = vals.min() if is_exponential else None
 
             if len(null_vals) > 0:
                 sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=null_color, label='Null Histogram', bins=30)
             if len(alt_vals) > 0:
                 sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=30)
 
+            null_rate = alt_rate = None
             if len(null_vals) > 1:
-                mu_null, std_null = norm.fit(null_vals)
-                ax.plot(x_grid, norm.pdf(x_grid, mu_null, std_null), color=null_color, linewidth=2.2, label='Null Fit')
-                ax.axvline(mu_null, color=null_color, linestyle='--', linewidth=1.5)
-                ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color=null_color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-                ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color=null_color, fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                if is_exponential:
+                    scale_null = (null_vals.to_numpy(dtype=float) - shift).mean()
+                    null_rate = 1.0 / scale_null
+                    mean_null = shift + scale_null
+                    ax.plot(x_grid, expon.pdf(x_grid - shift, scale=scale_null), color=null_color, linewidth=2.2, label='Null Fit')
+                    ax.axvline(mean_null, color=null_color, linestyle='--', linewidth=1.5)
+                    ax.text(mean_null, 0.90, f"$\\lambda_{{null}}={null_rate:.3g}$", transform=trans, color=null_color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                else:
+                    mu_null, std_null = norm.fit(null_vals)
+                    ax.plot(x_grid, norm.pdf(x_grid, mu_null, std_null), color=null_color, linewidth=2.2, label='Null Fit')
+                    ax.axvline(mu_null, color=null_color, linestyle='--', linewidth=1.5)
+                    ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.2f}$", transform=trans, color=null_color, fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.2f}$", transform=trans, color=null_color, fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
             if len(alt_vals) > 1:
-                mu_alt, std_alt = norm.fit(alt_vals)
-                ax.plot(x_grid, norm.pdf(x_grid, mu_alt, std_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
-                ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
-                ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-                ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                if is_exponential:
+                    scale_alt = (alt_vals.to_numpy(dtype=float) - shift).mean()
+                    alt_rate = 1.0 / scale_alt
+                    mean_alt = shift + scale_alt
+                    ax.plot(x_grid, expon.pdf(x_grid - shift, scale=scale_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                    ax.axvline(mean_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                    ax.text(mean_alt, 0.75, f"$\\lambda_{{alt}}={alt_rate:.3g}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                else:
+                    mu_alt, std_alt = norm.fit(alt_vals)
+                    ax.plot(x_grid, norm.pdf(x_grid, mu_alt, std_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                    ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
+                    ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.2f}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+                    ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.2f}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
 
             title = f'Topology: {topo_name}'
             if len(null_vals) > 1 and len(alt_vals) > 1:
-                from .utils import gaussian_hellinger2_nd
-                h2 = gaussian_hellinger2_nd([mu_null], [[std_null ** 2]], [mu_alt], [[std_alt ** 2]])
+                if is_exponential:
+                    from .utils import exponential_hellinger2_nd
+                    h2 = exponential_hellinger2_nd([null_rate], [alt_rate])
+                else:
+                    from .utils import gaussian_hellinger2_nd
+                    h2 = gaussian_hellinger2_nd([mu_null], [[std_null ** 2]], [mu_alt], [[std_alt ** 2]])
                 title += f'  ($H^2$={h2:.3f})'
             ax.set_title(title, fontsize=12, fontweight='bold')
             ax.set_xlabel(f'{norm_label} Score')
@@ -903,7 +958,7 @@ class CasterPlotter:
         plt.close()
 
 
-def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None):
+def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None, dist_type="gaussian"):
     """
     Writes gt_stats.txt (Null/Alt/Overall mean+covariance across the 3
     topology dimensions, ABBA/BABA/AABB order) next to scores_file, so
@@ -919,8 +974,20 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     pattern and >=2 windows in each class. Any missing piece degrades
     gracefully (skips that section, or writes nothing at all) rather than
     raising, same convention as phlag.py's own ground-truth handling.
+
+    dist_type="gaussian" (default) computes Hellinger2 via
+    gaussian_hellinger2_nd on the joint 3D mean/covariance. dist_type=
+    "exponential" instead shifts each of the 3 topology columns by its own
+    global min (over the whole file, so Null and Alt stay shifted by the
+    same reference and remain comparable) so all values are >= 0, then
+    reads Exponential rates directly off the shifted Null/Alt means
+    (mean of shifted data == 1/rate) and computes Hellinger2 via
+    exponential_hellinger2_nd. Mean/covariance bookkeeping in gt_stats.txt
+    itself is otherwise unaffected -- the shift only changes what the means
+    represent (shifted-space means, whose reciprocal is the rate) and only
+    when dist_type="exponential".
     """
-    from .utils import parse_pattern_string, write_gt_stats_file, gaussian_hellinger2_nd, GT_STATS_FILENAME
+    from .utils import parse_pattern_string, write_gt_stats_file, gaussian_hellinger2_nd, exponential_hellinger2_nd, GT_STATS_FILENAME
 
     try:
         df = pd.read_csv(scores_file, sep='\t')
@@ -940,6 +1007,9 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     Y = df[[col_for_topo[t] for t in topo_order]].to_numpy(dtype=float)
     if len(Y) < 2:
         return
+
+    if dist_type == "exponential":
+        Y = Y - Y.min(axis=0)
 
     stats = {"Overall": (Y.mean(axis=0), np.cov(Y, rowvar=False).reshape(3, 3))}
 
@@ -966,9 +1036,14 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
             if len(alt_vals) > 1:
                 stats["Alt"] = (alt_vals.mean(axis=0), np.cov(alt_vals, rowvar=False).reshape(3, 3))
             if "Null" in stats and "Alt" in stats:
-                stats["Hellinger2"] = gaussian_hellinger2_nd(
-                    stats["Null"][0], stats["Null"][1], stats["Alt"][0], stats["Alt"][1],
-                )
+                if dist_type == "exponential":
+                    stats["Hellinger2"] = exponential_hellinger2_nd(
+                        1.0 / stats["Null"][0], 1.0 / stats["Alt"][0],
+                    )
+                else:
+                    stats["Hellinger2"] = gaussian_hellinger2_nd(
+                        stats["Null"][0], stats["Null"][1], stats["Alt"][0], stats["Alt"][1],
+                    )
 
     output_path = pathlib.Path(output_dir) / GT_STATS_FILENAME
     write_gt_stats_file(output_path, stats)
@@ -1027,6 +1102,16 @@ def build_parser():
         help="Normalize each site's c*ABBA/c*BABA/c*AABB by their sum into proportions (like caster-pair's q1/q2/q3), before window averaging"
     )
     parser.add_argument(
+        "--norm-eps",
+        dest="norm_eps",
+        type=float,
+        default=DEFAULT_NORM_EPS,
+        help=f"With -n/--normalize, clamp the per-row c*ABBA+c*BABA+c*AABB sum's "
+             f"magnitude to at least this before dividing, to stop a near-zero "
+             f"(sign-cancelling) sum blowing the ratio up to spurious huge values "
+             f"(default: {DEFAULT_NORM_EPS})"
+    )
+    parser.add_argument(
         "-s",
         dest="step_size",
         type=step_size_or_fraction,
@@ -1083,7 +1168,7 @@ def build_parser():
         "--dist-type",
         dest="dist_type",
         default="gaussian",
-        choices=["gaussian", "gmm"],
+        choices=["gaussian", "gmm", "exponential"],
         help="Distribution type used for CasterPlotter's statistical fits (default: "
              "gaussian). No longer affects scores.tsv's output location -- that's "
              "shared across dist_types, see --bench."
@@ -1309,7 +1394,7 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
     if args.ilr:
         apply_ilr_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True)
     elif args.normalize:
-        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True)
+        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=True, eps=args.norm_eps)
 
     if args.zscale:
         apply_zscale_to_scores_file(chunk_scores_path, has_q123=True)
@@ -1321,6 +1406,7 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
         output_dir=str(plot_data_dir.resolve()),
         locus_pattern=locus_pattern,
         topologies=args.topologies,
+        dist_type=args.dist_type,
     )
 
     if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
@@ -1437,7 +1523,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
     if args.ilr:
         apply_ilr_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
     elif args.normalize:
-        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False)
+        apply_normalize_to_scores_file(chunk_scores_path, chunk_scores_path, has_q123=False, eps=args.norm_eps)
 
     if args.zscale:
         apply_zscale_to_scores_file(chunk_scores_path, has_q123=False)
@@ -1449,6 +1535,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         output_dir=str(plot_data_dir.resolve()),
         locus_pattern=locus_pattern,
         topologies=args.topologies,
+        dist_type=args.dist_type,
     )
 
     if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
@@ -1529,11 +1616,13 @@ def main(argv=None):
 
         ws = parse_ws_from_path(regen_output_path)
         if ws:
-            mode, val, step, is_site, is_zscale, is_ilr, is_normalize = ws
+            mode, val, step, is_site, is_zscale, is_ilr, is_normalize, norm_eps = ws
             args.step_size = step
             args.zscale = is_zscale
             args.ilr = is_ilr
             args.normalize = is_normalize
+            if norm_eps is not None:
+                args.norm_eps = norm_eps
             if mode == "c" and is_site:
                 args.site = True
                 args.pair = False
@@ -1586,6 +1675,8 @@ def main(argv=None):
         --normalize was also explicitly passed.
         """
         local_norm_suffix = "_n" if (normalize_flag and not ilr_flag) else ""
+        if normalize_flag and not ilr_flag and args.norm_eps != DEFAULT_NORM_EPS:
+            local_norm_suffix += f"_eps{args.norm_eps:g}"
         local_ilr_suffix = "_i" if ilr_flag else ""
         if args.bench:
             # --bench (set only by benchmark's own subprocess invocations) keeps
@@ -1608,7 +1699,16 @@ def main(argv=None):
             # colliding with a --pair run sharing the same chunk/step, and
             # 'normalize' keeps normalized and raw scores from sharing a
             # cache entry. --zscale still appends a flat zscale_suffix ("_z")
-            # to the size segment itself, unchanged.
+            # to the size segment itself, unchanged. --norm-eps nests its own
+            # 'eps<value>' segment under 'normalize' (only when non-default --
+            # every prior normalize run used the default, so nothing existing
+            # needs to move), same reasoning: a non-default eps changes the
+            # cached scores.tsv's actual values, so it must not share a cache
+            # entry with the default-eps run. Any future new flag that
+            # changes what ends up in scores.tsv/report.tsv should get the
+            # same treatment -- its own named segment here (and mirrored in
+            # bench/benchmark.py's get_expected_caster_sim_dir) -- rather than
+            # folding into an existing directory's cache entry.
             if args.pair or args.site:
                 chunk = args.chunk_size if args.chunk_size is not None else args.window_size
                 caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
@@ -1620,6 +1720,8 @@ def main(argv=None):
                 caster_root = caster_root / "ilr"
             elif normalize_flag:
                 caster_root = caster_root / "normalize"
+                if args.norm_eps != DEFAULT_NORM_EPS:
+                    caster_root = caster_root / f"eps{args.norm_eps:g}"
             if parsed:
                 rel_dir = parsed["relative_dir_no_window"]
                 return caster_root / rel_dir / "scores.tsv"
@@ -1695,6 +1797,7 @@ def main(argv=None):
             output_dir=str(plot_data_dir.resolve()),
             locus_pattern=locus_pattern,
             topologies=args.topologies,
+            dist_type=args.dist_type,
         )
         if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
             CasterPlotter(
@@ -1729,6 +1832,7 @@ def main(argv=None):
                 output_dir=str(plot_data_dir.resolve()),
                 locus_pattern=locus_pattern,
                 topologies=args.topologies,
+                dist_type=args.dist_type,
             )
             if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
                 CasterPlotter(
@@ -1754,7 +1858,7 @@ def main(argv=None):
         unnormalized_path = _derive_output_path(False, False)
         if unnormalized_path != final_output_path and unnormalized_path.exists():
             print(f"Found un-normalized scores at '{unnormalized_path}' -- normalizing without recomputing caster...")
-            apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair)
+            apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair, eps=args.norm_eps)
             print(f"Success: TSV output file generated at: {final_output_path}")
             copy_quartet_counts_if_missing(unnormalized_path.parent, plot_data_dir)
             write_ground_truth_stats(
@@ -1762,6 +1866,7 @@ def main(argv=None):
                 output_dir=str(plot_data_dir.resolve()),
                 locus_pattern=locus_pattern,
                 topologies=args.topologies,
+                dist_type=args.dist_type,
             )
             if args.plot and any(p in args.plot for p in ("scores", "scatter", "dist", "correlation", "topology_pairs", "quartet_counts")):
                 CasterPlotter(
@@ -2045,7 +2150,7 @@ def main(argv=None):
             # rolling-average, like --zscale below) so the --normalize
             # short-circuit above can reproduce it exactly from an
             # already-window-averaged un-normalized scores.tsv.
-            apply_normalize(results, ['abba', 'baba', 'aabb'])
+            apply_normalize(results, ['abba', 'baba', 'aabb'], eps=args.norm_eps)
 
         if args.zscale:
             # D* itself is left as originally computed from the raw sums --
@@ -2094,6 +2199,7 @@ def main(argv=None):
         output_dir=str(plot_data_dir.resolve()),
         locus_pattern=locus_pattern,
         topologies=args.topologies,
+        dist_type=args.dist_type,
     )
 
     if args.plot:

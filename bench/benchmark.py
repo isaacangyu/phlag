@@ -47,7 +47,6 @@ DEFAULT_STEP_SIZE = 1000
 
 TOPOLOGY_NAMES = ["ABBA", "BABA", "AABB"]
 RELERR_STATES = ["Null", "Alt"]
-RELERR_STATISTICS = ["mean", "std"]
 
 DEFAULT_CONCAT_PATTERNS = ["37-62", "40-60", "42-57", "45-55", "47-52", "49-51"]
 
@@ -130,7 +129,7 @@ _RE_METRICS_WITH_PRECISION_AUC = re.compile(
     r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+),\s*(?:ROC-)?AUC:\s*([-\d.eE+]+)\s*$'
 )
 _RE_RELERR_ROW = re.compile(
-    r'^(\w+)\t(Null|Alt)\t(mean|std)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
+    r'^(\w+)\t(Null|Alt)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
     re.IGNORECASE,
 )
 _RE_EM_DIVERGENCE = re.compile(
@@ -349,19 +348,28 @@ def parse_report(report_path):
 
             m = _RE_RELERR_ROW.match(line)
             if m:
-                topology, state, statistic, _fitted_str, gt_str, relerr_str = m.groups()
+                # New KL-table row shape: one row per (topology, state), no
+                # separate mean/std rows any more -- KL is a property of the
+                # pair of full Gaussians, not a per-statistic quantity.
+                topology, state, _fitted_mean_str, _fitted_std_str, gt_mean_str, gt_std_str, kl_str = m.groups()
                 try:
-                    value = float(relerr_str)
+                    value = float(kl_str)
                 except ValueError:
                     value = None
                 if value is not None and not math.isnan(value):
-                    parsed["rel_err"][(topology, state.capitalize(), statistic.lower())] = value
+                    parsed["rel_err"][(topology, state.capitalize())] = value
                 try:
-                    gt_value = float(gt_str)
+                    gt_mean_value = float(gt_mean_str)
                 except ValueError:
-                    gt_value = None
-                if gt_value is not None and not math.isnan(gt_value):
-                    parsed["ground_truth_stats"][(topology, state.capitalize(), statistic.lower())] = gt_value
+                    gt_mean_value = None
+                if gt_mean_value is not None and not math.isnan(gt_mean_value):
+                    parsed["ground_truth_stats"][(topology, state.capitalize(), "mean")] = gt_mean_value
+                try:
+                    gt_std_value = float(gt_std_str)
+                except ValueError:
+                    gt_std_value = None
+                if gt_std_value is not None and not math.isnan(gt_std_value):
+                    parsed["ground_truth_stats"][(topology, state.capitalize(), "std")] = gt_std_value
                 continue
 
             m = (
@@ -585,9 +593,9 @@ class RunRecord:
     in_panel_hd_alt: bool = False
     hd_bin: Optional[str] = None
     exclusion: str = ""
-    rel_err: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
-    mean_relerr_agg: Optional[float] = None
-    covar_relerr_agg: Optional[float] = None
+    rel_err: Dict[Tuple[str, str], float] = field(default_factory=dict)
+    null_kl_agg: Optional[float] = None
+    alt_kl_agg: Optional[float] = None
     em_hd: Optional[float] = None
     em_gt_hd: Optional[float] = None
     null_mean_norm: Optional[float] = None
@@ -663,9 +671,10 @@ class PanelBCell:
 @dataclass
 class RelErrCell:
     """
-    One grouped-bar cell of the relerr figure: two bars, the mean |relative
-    error| (decimal, e.g. 0.05 = 5%) of the EM-fitted mean and of the EM-fitted covariance (std),
-    each vs. the ground-truth-split empirical fit, over the runs in this cell.
+    One grouped-bar cell of the relerr figure: two bars, the mean KL
+    divergence KL(Fitted || GroundTruth) between the EM-fitted 1D Gaussian
+    and the ground-truth-split empirical fit, averaged across topologies,
+    for the Null state and for the Alt state respectively.
 
     Same (column, fraction_bin, x_bin) grouping panel A uses, so relerr.png
     and f1.png are directly comparable bucket for bucket.
@@ -674,14 +683,14 @@ class RelErrCell:
     fraction_bin: str
     x_bin: str
     n_runs: int
-    mean_relerr: float
-    mean_relerr_sd: float
-    mean_relerr_err_minus: float
-    mean_relerr_err_plus: float
-    covar_relerr: float
-    covar_relerr_sd: float
-    covar_relerr_err_minus: float
-    covar_relerr_err_plus: float
+    null_kl: float
+    null_kl_sd: float
+    null_kl_err_minus: float
+    null_kl_err_plus: float
+    alt_kl: float
+    alt_kl_sd: float
+    alt_kl_err_minus: float
+    alt_kl_err_plus: float
     run_ids: List[str] = field(default_factory=list)
 
 
@@ -825,7 +834,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                 errorbar="sd"):
+                 norm_eps=None, errorbar="sd"):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -846,6 +855,7 @@ class BenchmarkStats:
         self.normalize = normalize
         self.zscale = zscale
         self.ilr = ilr
+        self.norm_eps = norm_eps
         self.errorbar = errorbar
 
         self.runs = []
@@ -974,10 +984,15 @@ class BenchmarkStats:
 
         record.rel_err = parsed["rel_err"]
         if record.rel_err:
-            mean_vals = [abs(v) for (_, _, stat), v in record.rel_err.items() if stat == "mean"]
-            std_vals = [abs(v) for (_, _, stat), v in record.rel_err.items() if stat == "std"]
-            record.mean_relerr_agg = sum(mean_vals) / len(mean_vals) if mean_vals else None
-            record.covar_relerr_agg = sum(std_vals) / len(std_vals) if std_vals else None
+            # KL is already non-negative by construction, so no abs() (unlike
+            # the old rel-err aggregate) -- averaged across topologies, split
+            # by state (Null vs Alt) rather than by statistic (mean vs std),
+            # since KL is a property of the whole (mean, std) pair, not of
+            # either statistic alone.
+            null_vals = [v for (_, state), v in record.rel_err.items() if state == "Null"]
+            alt_vals = [v for (_, state), v in record.rel_err.items() if state == "Alt"]
+            record.null_kl_agg = sum(null_vals) / len(null_vals) if null_vals else None
+            record.alt_kl_agg = sum(alt_vals) / len(alt_vals) if alt_vals else None
 
         record.em_hd = parsed["em_hd"]
         record.em_gt_hd = parsed["em_gt_hd"]
@@ -997,7 +1012,7 @@ class BenchmarkStats:
         caster_dir = get_expected_caster_sim_dir(
             leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
             pair=self.pair, site=self.site, chunk_size=self.chunk_size,
-            normalize=self.normalize, zscale=self.zscale, ilr=self.ilr,
+            normalize=self.normalize, zscale=self.zscale, ilr=self.ilr, norm_eps=self.norm_eps,
         )
         gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
         for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
@@ -1065,11 +1080,11 @@ class BenchmarkStats:
         else:
             record.in_panel_a = True
 
-        if record.x_bin is not None and record.mean_relerr_agg is not None and record.covar_relerr_agg is not None:
+        if record.x_bin is not None and record.null_kl_agg is not None and record.alt_kl_agg is not None:
             record.in_panel_relerr = True
         elif not record.exclusion:
             record.exclusion = (
-                "no rel-err table in report (relerr panel only)"
+                "no KL table in report (relerr panel only)"
                 if record.x_bin is not None
                 else f"x value {record.x_value} outside every x bin (relerr panel only)"
             )
@@ -1196,18 +1211,18 @@ class BenchmarkStats:
         panel_relerr = {}
         for key, records in panel_relerr_groups.items():
             column, fraction_bin, x_bin = key
-            mean_relerr, mean_relerr_sd, mean_minus, mean_plus = summarize_values(
-                [r.mean_relerr_agg for r in records], self.errorbar, low=0.0, high=math.inf
+            null_kl, null_kl_sd, null_minus, null_plus = summarize_values(
+                [r.null_kl_agg for r in records], self.errorbar, low=0.0, high=math.inf
             )
-            covar_relerr, covar_relerr_sd, covar_minus, covar_plus = summarize_values(
-                [r.covar_relerr_agg for r in records], self.errorbar, low=0.0, high=math.inf
+            alt_kl, alt_kl_sd, alt_minus, alt_plus = summarize_values(
+                [r.alt_kl_agg for r in records], self.errorbar, low=0.0, high=math.inf
             )
             panel_relerr[key] = RelErrCell(
                 column=column, fraction_bin=fraction_bin, x_bin=x_bin, n_runs=len(records),
-                mean_relerr=mean_relerr, mean_relerr_sd=mean_relerr_sd,
-                mean_relerr_err_minus=mean_minus, mean_relerr_err_plus=mean_plus,
-                covar_relerr=covar_relerr, covar_relerr_sd=covar_relerr_sd,
-                covar_relerr_err_minus=covar_minus, covar_relerr_err_plus=covar_plus,
+                null_kl=null_kl, null_kl_sd=null_kl_sd,
+                null_kl_err_minus=null_minus, null_kl_err_plus=null_plus,
+                alt_kl=alt_kl, alt_kl_sd=alt_kl_sd,
+                alt_kl_err_minus=alt_minus, alt_kl_err_plus=alt_plus,
                 run_ids=sorted(r.run_id for r in records),
             )
 
@@ -1281,10 +1296,9 @@ class BenchmarkStats:
 
 
     RELERR_RUN_COLUMNS = [
-        f"relerr_{topo}_{state}_{stat}"
+        f"relerr_{topo}_{state}"
         for topo in TOPOLOGY_NAMES
         for state in RELERR_STATES
-        for stat in RELERR_STATISTICS
     ]
 
     RUN_COLUMNS = [
@@ -1297,7 +1311,7 @@ class BenchmarkStats:
         "n_windows", "label_flipped",
         "in_panel_a", "in_panel_b", "in_panel_relerr", "in_panel_em_divergence",
         "in_panel_hd_alt", "hd_bin",
-        "mean_relerr_agg", "covar_relerr_agg",
+        "null_kl_agg", "alt_kl_agg",
         "em_hd", "em_gt_hd",
         "null_mean_norm", "null_cov_norm",
         "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
@@ -1381,8 +1395,8 @@ class BenchmarkStats:
                     "in_panel_em_divergence": record.in_panel_em_divergence,
                     "in_panel_hd_alt": record.in_panel_hd_alt,
                     "hd_bin": record.hd_bin,
-                    "mean_relerr_agg": record.mean_relerr_agg,
-                    "covar_relerr_agg": record.covar_relerr_agg,
+                    "null_kl_agg": record.null_kl_agg,
+                    "alt_kl_agg": record.alt_kl_agg,
                     "em_hd": record.em_hd,
                     "em_gt_hd": record.em_gt_hd,
                     "null_mean_norm": record.null_mean_norm,
@@ -1415,8 +1429,7 @@ class BenchmarkStats:
                 }
                 for topo in TOPOLOGY_NAMES:
                     for state in RELERR_STATES:
-                        for stat in RELERR_STATISTICS:
-                            row[f"relerr_{topo}_{state}_{stat}"] = record.rel_err.get((topo, state, stat))
+                        row[f"relerr_{topo}_{state}"] = record.rel_err.get((topo, state))
                 handle.write("\t".join(self._fmt(row[c]) for c in self.RUN_COLUMNS) + "\n")
 
         bins_path = out_dir / "bins.tsv"
@@ -1450,11 +1463,11 @@ class BenchmarkStats:
 
             for key in sorted(figure_data.panel_relerr.keys()):
                 cell = figure_data.panel_relerr[key]
-                emit("RELERR", cell.column, cell.fraction_bin, cell.x_bin, "mean_relerr", cell.n_runs,
-                     cell.mean_relerr, cell.mean_relerr_sd, cell.mean_relerr_err_minus, cell.mean_relerr_err_plus,
+                emit("RELERR", cell.column, cell.fraction_bin, cell.x_bin, "null_kl", cell.n_runs,
+                     cell.null_kl, cell.null_kl_sd, cell.null_kl_err_minus, cell.null_kl_err_plus,
                      cell.run_ids)
-                emit("RELERR", cell.column, cell.fraction_bin, cell.x_bin, "covar_relerr", cell.n_runs,
-                     cell.covar_relerr, cell.covar_relerr_sd, cell.covar_relerr_err_minus, cell.covar_relerr_err_plus,
+                emit("RELERR", cell.column, cell.fraction_bin, cell.x_bin, "alt_kl", cell.n_runs,
+                     cell.alt_kl, cell.alt_kl_sd, cell.alt_kl_err_minus, cell.alt_kl_err_plus,
                      cell.run_ids)
 
             for key in sorted(figure_data.panel_em_divergence.keys()):
@@ -1477,8 +1490,8 @@ _ORDINAL_BLUE = ["#86b6ef", "#3987e5", "#1c5cab"]
 
 _SERIES_PHLAG = "#2a78d6"
 
-_SERIES_RELERR_MEAN = "#2B4C7E"
-_SERIES_RELERR_COVAR = "#E05A47"
+_SERIES_RELERR_NULL = "#2B4C7E"
+_SERIES_RELERR_ALT = "#E05A47"
 _SERIES_GT_DIVERGENCE = "#1B998B"
 
 _BAR_WIDTH = 0.62
@@ -1762,10 +1775,11 @@ class BenchmarkFigurePlotter:
     def render_relerr(self, filename="relerr.png"):
         """
         Same grid as f1.png (fraction bin x category x branch-length/divergence
-        bin), but each cell holds two bars instead of one: mean |relative
-        error| (decimal, e.g. 0.05 = 5%) of the EM-fitted mean, and of the
-        EM-fitted covariance (std), vs. the ground-truth-split empirical fit.
-        Lower is better -- this is EM fit quality, not detection performance.
+        bin), but each cell holds two bars instead of one: mean KL divergence
+        KL(Fitted || GroundTruth) between the EM-fitted 1D Gaussian and the
+        ground-truth-split empirical fit, averaged across topologies, for the
+        Null state and for the Alt state. Lower is better -- this is EM fit
+        quality, not detection performance.
         """
         data = self.data
         n_rows, n_cols = len(data.fraction_bins), len(data.columns)
@@ -1773,12 +1787,18 @@ class BenchmarkFigurePlotter:
         pair_offset = _BAR_WIDTH * 0.27
         pair_width = _BAR_WIDTH * 0.42
 
-        # Fixed axis -- relerr is a decimal fraction, so a consistent 0-1.5
-        # scale with every-0.25 gridlines makes cells comparable at a glance
-        # instead of rescaling per run. Bars/whiskers past 1.5 are simply
-        # clipped at the top edge.
-        y_top = 1.5
-        yticks = np.arange(0, 1.51, 0.25)
+        # KL divergence is unbounded in [0, inf) -- unlike the old decimal-
+        # fraction relative error, there's no natural fixed ceiling, so scale
+        # the axis to whatever this run set actually produced (with a floor
+        # so a near-all-zero run set doesn't render as a razor-thin axis).
+        finite_tops = [
+            v for cell in data.panel_relerr.values() if cell.n_runs > 0
+            for v in (cell.null_kl + cell.null_kl_err_plus, cell.alt_kl + cell.alt_kl_err_plus)
+            if v is not None and math.isfinite(v)
+        ]
+        raw_max = max(finite_tops) if finite_tops else 1.0
+        y_top = max(raw_max * 1.15, 0.5)
+        yticks = np.linspace(0, y_top, 7)
 
         self._apply_theme()
         fig, axes = plt.subplots(
@@ -1808,30 +1828,30 @@ class BenchmarkFigurePlotter:
                     drew_any = True
 
                     ax.bar(
-                        pos - pair_offset, cell.mean_relerr, width=pair_width,
-                        color=_SERIES_RELERR_MEAN, edgecolor=_SURFACE, linewidth=1.0,
-                        zorder=2, label="Mean rel.err",
+                        pos - pair_offset, cell.null_kl, width=pair_width,
+                        color=_SERIES_RELERR_NULL, edgecolor=_SURFACE, linewidth=1.0,
+                        zorder=2, label="Null KL",
                     )
                     ax.errorbar(
-                        pos - pair_offset, cell.mean_relerr,
-                        yerr=[[cell.mean_relerr_err_minus], [cell.mean_relerr_err_plus]],
+                        pos - pair_offset, cell.null_kl,
+                        yerr=[[cell.null_kl_err_minus], [cell.null_kl_err_plus]],
                         fmt="none", ecolor=_INK_SECONDARY,
                         elinewidth=1.0, capsize=2.5, capthick=1.0, zorder=3,
                     )
                     ax.bar(
-                        pos + pair_offset, cell.covar_relerr, width=pair_width,
-                        color=_SERIES_RELERR_COVAR, edgecolor=_SURFACE, linewidth=1.0,
-                        zorder=2, label="Covariance rel.err",
+                        pos + pair_offset, cell.alt_kl, width=pair_width,
+                        color=_SERIES_RELERR_ALT, edgecolor=_SURFACE, linewidth=1.0,
+                        zorder=2, label="Alt KL",
                     )
                     ax.errorbar(
-                        pos + pair_offset, cell.covar_relerr,
-                        yerr=[[cell.covar_relerr_err_minus], [cell.covar_relerr_err_plus]],
+                        pos + pair_offset, cell.alt_kl,
+                        yerr=[[cell.alt_kl_err_minus], [cell.alt_kl_err_plus]],
                         fmt="none", ecolor=_INK_SECONDARY,
                         elinewidth=1.0, capsize=2.5, capthick=1.0, zorder=3,
                     )
                     top = max(
-                        cell.mean_relerr + cell.mean_relerr_err_plus,
-                        cell.covar_relerr + cell.covar_relerr_err_plus,
+                        cell.null_kl + cell.null_kl_err_plus,
+                        cell.alt_kl + cell.alt_kl_err_plus,
                     )
                     ax.text(
                         pos, top * 1.03, f"n={cell.n_runs}",
@@ -1867,7 +1887,7 @@ class BenchmarkFigurePlotter:
             )
 
         fig.suptitle(
-            "Phlag EM fit quality: mean |relative error| (decimal) of fitted mean/covariance vs. ground truth",
+            "Phlag EM fit quality: mean KL(Fitted || GroundTruth) by state, averaged across topologies",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
         fig.tight_layout(rect=[0, 0.045, 1, 0.93])
@@ -2119,6 +2139,7 @@ CASTER_ARG_SPECS = [
     ("step_size", "-s", False),
     ("dist_type", "-d", False),
     ("normalize", "-n", True),
+    ("norm_eps", "--norm-eps", False),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
     ("site", "--site", True),
@@ -2227,7 +2248,7 @@ def _build_parser():
         help="Error bar shown on each aggregated cell (default: sd)",
     )
 
-    from phlag.caster import int_or_abbrev
+    from phlag.caster import int_or_abbrev, DEFAULT_NORM_EPS
     caster_group = parser.add_argument_group(
         "caster flags", "Forwarded to caster (and, when both stages run, to phlagster)."
     )
@@ -2246,6 +2267,11 @@ def _build_parser():
     caster_group.add_argument(
         "-n", "--normalize", dest="normalize", action="store_true",
         help="Forwarded to caster's -n.",
+    )
+    caster_group.add_argument(
+        "--norm-eps", dest="norm_eps", type=float, default=None,
+        help="Forwarded to caster's --norm-eps (default: caster's own default, "
+             f"{DEFAULT_NORM_EPS}).",
     )
     caster_group.add_argument(
         "--shift-caster", dest="shift_caster", action="store_true",
@@ -2432,7 +2458,8 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                                pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False):
+                                pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
+                                norm_eps=None):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2453,7 +2480,14 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     still appends a flat "_z" suffix to the size segment itself. ``ilr``
     implies closure, so it nests in place of (not stacked with)
     ``normalize``, even if ``normalize`` is also True -- mirrors
-    phlag/caster.py's own `_derive_output_path` precedence.
+    phlag/caster.py's own `_derive_output_path` precedence. ``norm_eps``
+    (None here means "caster's own default", not "no normalize" -- pass the
+    actual value whenever the caller's args.norm_eps was explicitly set)
+    nests its own 'eps<value>' segment under 'normalize', same reasoning as
+    site/normalize/ilr: a non-default eps changes what's in scores.tsv, so it
+    must not share a cache entry with the default-eps tree. Any new caster/
+    phlag flag that changes cached output should get the same treatment here
+    and in phlag/caster.py's `_derive_output_path`.
 
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
@@ -2477,6 +2511,8 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
         base = base / "ilr"
     elif normalize:
         base = base / "normalize"
+        if norm_eps is not None:
+            base = base / f"eps{norm_eps:g}"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
@@ -2484,13 +2520,15 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
-                             pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False):
+                             pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
+                             norm_eps=None):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
         pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale, ilr=ilr,
+        norm_eps=norm_eps,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2682,7 +2720,7 @@ def run_all(args, sim_root, out_dir):
         scores_path = get_expected_scores_path(
             fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
             pair=args.pair, site=args.site, chunk_size=args.chunk_size,
-            normalize=args.normalize, zscale=args.zscale, ilr=args.ilr,
+            normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
         )
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
@@ -2767,10 +2805,9 @@ def run_all(args, sim_root, out_dir):
 
 
 ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["tp", "fp", "fn", "tn"] + [
-    f"relerr_{topo}_{state}_{stat}"
+    f"relerr_{topo}_{state}"
     for topo in TOPOLOGY_NAMES
     for state in RELERR_STATES
-    for stat in RELERR_STATISTICS
 ] + ["em_hd", "em_gt_hd"] + [
     "null_mean_norm", "null_cov_norm",
     "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
@@ -2788,7 +2825,7 @@ def compute_analysis(runs_path, out_path=None):
     """
     Reads runs.tsv into a pandas DataFrame and reduces every metric
     in ANALYSIS_METRICS (accuracy/tpr/fpr/f1, the raw confusion counts
-    tp/fp/fn/tn, every per-topology EM mean/covariance relative-error column,
+    tp/fp/fn/tn, every per-topology per-state KL divergence column,
     EM state divergence, and the fitted Null/Alt transition probabilities) to
     its mean plus the run with the maximum and the minimum value -- so an
     outlier is traceable straight back to its run_id without re-scanning
@@ -3032,6 +3069,7 @@ def main(argv=None):
             normalize=for_args.normalize,
             zscale=for_args.zscale,
             ilr=for_args.ilr,
+            norm_eps=for_args.norm_eps,
             errorbar=for_args.errorbar,
         )
 

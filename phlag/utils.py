@@ -161,6 +161,33 @@ def gaussian_hellinger2_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
     bc = np.exp(log_coef - 0.125 * quad)
     return float(max(1.0 - bc, 0.0))
 
+def exponential_hellinger2_nd(rates1, rates2, eps=1e-12):
+    """
+    Squared Hellinger distance between two independent-per-dimension
+    Exponential distributions, given per-dimension rate vectors. Used in
+    place of gaussian_hellinger2_nd wherever dist_type="exponential" --
+    covers both the 1D per-topology dist-plot case (pass 1-element arrays)
+    and the 3D joint gt_stats case (ABBA/BABA/AABB rates).
+
+    Per-dimension Bhattacharyya coefficient BC_d = 2*sqrt(r1_d*r2_d)/(r1_d+r2_d);
+    assuming independence across dimensions, the joint coefficient is the
+    product BC = prod_d BC_d, and squared Hellinger is H^2 = 1 - BC.
+    Non-positive rates (undefined for an Exponential) return NaN. eps here
+    is only a numerical floor against exact zero/negative rates -- unlike
+    gaussian_hellinger2_nd's eps (added to a covariance diagonal, so scaled
+    to that matrix), a rate is 1/mean of shifted, un-normalized topology
+    counts and can legitimately be as small as ~1e-6 or smaller, so this
+    guard must stay far below that rather than reusing 1e-6 itself.
+    """
+    import numpy as np
+    r1 = np.asarray(rates1, dtype=float)
+    r2 = np.asarray(rates2, dtype=float)
+    if np.any(r1 <= eps) or np.any(r2 <= eps):
+        return float("nan")
+    bc_d = 2.0 * np.sqrt(r1 * r2) / (r1 + r2)
+    bc = float(np.prod(bc_d))
+    return float(max(1.0 - bc, 0.0))
+
 def write_gt_stats_file(path, stats):
     """
     Writes stats (a dict with any subset of keys "Null", "Alt", "Overall",

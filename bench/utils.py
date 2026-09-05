@@ -32,8 +32,8 @@ _METRIC_PANEL_COLUMN = {
     "f1": "in_panel_a",
     "em_hd": "in_panel_em_divergence",
     "em_gt_hd": "in_panel_em_divergence",
-    "mean_relerr_agg": "in_panel_relerr",
-    "covar_relerr_agg": "in_panel_relerr",
+    "null_kl_agg": "in_panel_relerr",
+    "alt_kl_agg": "in_panel_relerr",
 }
 
 _SIGNED_METRIC_SUFFIX = "_signed"
@@ -895,8 +895,8 @@ class CrossRunAnalysis:
         follow-up print_configs() (no args) can reuse them without
         re-resolving. Renders one bar/violin per config for each metric in
         `metrics` (any
-        runs.tsv numeric column -- "f1", "em_hd", "em_gt_hd", "mean_relerr_agg",
-        "covar_relerr_agg", "transition_null_to_alt", "roc_auc", ... -- or the
+        runs.tsv numeric column -- "f1", "em_hd", "em_gt_hd", "null_kl_agg",
+        "alt_kl_agg", "transition_null_to_alt", "roc_auc", ... -- or the
         special name "tpr_fpr", which renders the full fraction_bin x column x
         x_bin TPR/FPR scatter grid as its own figure instead of a bar/violin,
         since ROC shape needs that breakdown).
@@ -1056,9 +1056,16 @@ class CrossRunAnalysis:
             }
             n = len(configs)
             n_rows, n_cols = len(FRACTION_BINS), len(hd_bins)
+            # Reserve canvas height for however many config legend rows there
+            # are, then re-measure the legend's actual rendered extent below
+            # (rather than trusting a fixed bbox_to_anchor/tight_layout
+            # margin) -- a long config sweep otherwise pushes the legend past
+            # the suptitle or into the axes. See _plot_tpr_fpr_grouped.
+            legend_extra_in = 0.24 * n
             for metric in metrics:
                 panel_col = _METRIC_PANEL_COLUMN.get(metric)
-                fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.0 * n_cols, 3.0 * n_rows + 0.6), squeeze=False)
+                fig, axes = plt.subplots(
+                    n_rows, n_cols, figsize=(2.0 * n_cols, 3.0 * n_rows + 0.6 + legend_extra_in), squeeze=False)
                 for row_idx, fraction_bin in enumerate(FRACTION_BINS):
                     for col_idx, hd_bin in enumerate(hd_bins):
                         ax = axes[row_idx][col_idx]
@@ -1086,14 +1093,26 @@ class CrossRunAnalysis:
                 fig.suptitle(_compose_title(suffix, metric_part, "by HD bin"), fontsize=12, y=0.995)
                 metric_values = self._metric_by_label(configs, metric)
                 agg_legend_labels = [f"{label} ({metric}={metric_values[label]:.4f})" for label in legend_labels]
-                fig.legend(legend_handles, agg_legend_labels, loc="upper right",
-                           bbox_to_anchor=(0.995, 0.97), fontsize=8, framealpha=0.9)
-                fig.tight_layout(rect=[0, 0.02, 1, 0.93])
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+                fig_h_px = fig.bbox.height
+                cursor_y = (fig._suptitle.get_window_extent(renderer).y0 - 4) / fig_h_px
+                legend = fig.legend(legend_handles, agg_legend_labels, loc="upper right",
+                                     bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
+                fig.canvas.draw()
+                cursor_y = (legend.get_window_extent(renderer).y0 - 4) / fig_h_px
+                fig.tight_layout(rect=[0, 0.02, 1, cursor_y])
                 figs.append(fig)
             return figs
 
         n = len(configs)
-        fig, axes = plt.subplots(1, len(metrics), figsize=(2.8 * len(metrics), 4.0), squeeze=False)
+        # Same dynamic-height + remeasured-extent legend placement as the
+        # grid_by="hd_bin" branch above -- a fixed bbox/tight_layout margin
+        # here overlapped the suptitle or axes once configs/metrics grew
+        # long enough to wrap the legend onto extra lines.
+        legend_extra_in = 0.24 * n
+        fig, axes = plt.subplots(
+            1, len(metrics), figsize=(2.8 * len(metrics), 4.0 + legend_extra_in), squeeze=False)
         for ax, panel in zip(axes[0], metrics):
             ax.set_xlim(-0.7, n - 0.3)
             ax.set_xticks(range(n))
@@ -1141,9 +1160,15 @@ class CrossRunAnalysis:
             f"{label} (" + ", ".join(f"{m}={metric_values[m][label]:.4f}" for m in flat_metrics) + ")"
             for label in legend_labels
         ]
-        fig.legend(legend_handles, agg_legend_labels, loc="upper right",
-                   bbox_to_anchor=(0.995, 0.90), fontsize=8, framealpha=0.9)
-        fig.tight_layout(rect=[0, 0, 1, 0.8])
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        fig_h_px = fig.bbox.height
+        cursor_y = (fig._suptitle.get_window_extent(renderer).y0 - 4) / fig_h_px
+        legend = fig.legend(legend_handles, agg_legend_labels, loc="upper right",
+                             bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
+        fig.canvas.draw()
+        cursor_y = (legend.get_window_extent(renderer).y0 - 4) / fig_h_px
+        fig.tight_layout(rect=[0, 0, 1, cursor_y])
         figs.append(fig)
         return figs
 

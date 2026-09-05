@@ -2,6 +2,7 @@ import sys
 import pathlib
 import os
 import argparse
+import math
 
 import jax
 import numpy as np
@@ -61,10 +62,17 @@ def get_state_mu_sigma_pdf(params, model_design, state, dim, x_vals):
     return mu, sigma, pdf_vals
 
 
-def format_rel_err(value):
+def format_report_value(value):
     """Formats a report table numeric value: up to 3 decimals, none if >=1000."""
     from .utils import format_number
     return format_number(value)
+
+
+def kl_divergence_1d(mu1, std1, mu2, std2):
+    """KL(N(mu1, std1) || N(mu2, std2)) for two 1D Gaussians. NaN if either std is non-positive."""
+    if std1 <= 0 or std2 <= 0:
+        return float('nan')
+    return math.log(std2 / std1) + (std1 ** 2 + (mu1 - mu2) ** 2) / (2 * std2 ** 2) - 0.5
 
 
 def count_trainable_params(params, props):
@@ -542,14 +550,20 @@ class Phlag:
             if caster_idx is not None and caster_idx + 1 < len(parts) - 1:
                 w_s_part = parts[caster_idx + 1]
                 rel_parts = list(parts[caster_idx + 2:-1])
-                # caster's tree nests site/ilr/normalize variant markers right
-                # after the size segment (get_expected_caster_sim_dir), but
-                # the report tree never carries that nesting -- reports sit
-                # flat under <category>/<subcategory>/<sim_name>/ regardless
-                # of variant, so strip them instead of mirroring them into
-                # out_dir (which otherwise doubled up with an --output-base
-                # that already names the variant, e.g. .../ilr/rho.../reports).
-                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize"):
+                # caster's tree nests site/ilr/normalize variant markers (plus
+                # normalize's own nested 'eps<value>' segment for a
+                # non-default --norm-eps, see get_expected_caster_sim_dir)
+                # right after the size segment, but the report tree never
+                # carries that nesting -- reports sit flat under
+                # <category>/<subcategory>/<sim_name>/ regardless of variant,
+                # so strip them instead of mirroring them into out_dir (which
+                # otherwise doubled up with an --output-base that already
+                # names the variant, e.g. .../ilr/rho.../reports). Any future
+                # marker segment nested here needs adding to this strip set
+                # too, or it leaks into out_dir the same way 'eps<value>'
+                # would have (see phlag/caster.py's own naming-convention
+                # note in _derive_output_path).
+                while rel_parts and (rel_parts[0] in ("site", "ilr", "normalize") or re.match(r'eps[\d.eE+-]+$', rel_parts[0])):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -1000,7 +1014,7 @@ class Phlag:
         headers.append(f"{metrics_str}")
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
-            headers.append("Topology\tState\tStatistic\tFitted\tGroundTruth\tRel.err")
+            headers.append("Topology\tState\tFittedMean\tFittedStd\tGTMean\tGTStd\tKL")
             # State index 0/1 is an arbitrary EM cluster label, not a fixed
             # Null/Alt identity -- flipped_for_eval (established above from
             # which orientation matches y_true) says which physical state
@@ -1012,15 +1026,14 @@ class Phlag:
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
                 mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, null_state, d, np.array([0.0]))
                 mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, alt_state, d, np.array([0.0]))
-                rel_mu_null = (mu_null_fit - mu_null_gt) / mu_null_gt if mu_null_gt != 0 else float('nan')
-                rel_std_null = (std_null_fit - std_null_gt) / std_null_gt if std_null_gt != 0 else float('nan')
-                rel_mu_alt = (mu_alt_fit - mu_alt_gt) / mu_alt_gt if mu_alt_gt != 0 else float('nan')
-                rel_std_alt = (std_alt_fit - std_alt_gt) / std_alt_gt if std_alt_gt != 0 else float('nan')
+                # KL(Fitted || GroundTruth) for the 1D marginal Gaussian at this
+                # topology/state -- how much the fitted distribution diverges
+                # from the true one, playing the "error" role Rel.err used to.
+                kl_null = kl_divergence_1d(mu_null_fit, std_null_fit, mu_null_gt, std_null_gt)
+                kl_alt = kl_divergence_1d(mu_alt_fit, std_alt_fit, mu_alt_gt, std_alt_gt)
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
-                headers.append(f"{topo_name}\tNull\tmean\t{format_rel_err(mu_null_fit)}\t{format_rel_err(mu_null_gt)}\t{format_rel_err(rel_mu_null)}")
-                headers.append(f"{topo_name}\tNull\tstd\t{format_rel_err(std_null_fit)}\t{format_rel_err(std_null_gt)}\t{format_rel_err(rel_std_null)}")
-                headers.append(f"{topo_name}\tAlt\tmean\t{format_rel_err(mu_alt_fit)}\t{format_rel_err(mu_alt_gt)}\t{format_rel_err(rel_mu_alt)}")
-                headers.append(f"{topo_name}\tAlt\tstd\t{format_rel_err(std_alt_fit)}\t{format_rel_err(std_alt_gt)}\t{format_rel_err(rel_std_alt)}")
+                headers.append(f"{topo_name}\tNull\t{format_report_value(mu_null_fit)}\t{format_report_value(std_null_fit)}\t{format_report_value(mu_null_gt)}\t{format_report_value(std_null_gt)}\t{format_report_value(kl_null)}")
+                headers.append(f"{topo_name}\tAlt\t{format_report_value(mu_alt_fit)}\t{format_report_value(std_alt_fit)}\t{format_report_value(mu_alt_gt)}\t{format_report_value(std_alt_gt)}\t{format_report_value(kl_alt)}")
             # Joint (all-topologies-at-once) ground-truth squared Hellinger
             # distance -- including cross-topology covariance, unlike the
             # per-topology marginal fits above -- so it's directly comparable
