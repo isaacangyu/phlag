@@ -15,6 +15,7 @@ and ``phlag.py`` uses for ``PhlagPlotter``):
 """
 
 import ast
+import os
 import re
 import sys
 import json
@@ -25,6 +26,7 @@ import pathlib
 import datetime
 import argparse
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 from zoneinfo import ZoneInfo
 
@@ -41,12 +43,31 @@ from tqdm import tqdm
 RED = "\033[91m"
 RESET = "\033[0m"
 
+# Total core budget shared across however many sibling `benchmark --create`
+# invocations bench/benchmark.sh's outer `xargs -P` is running concurrently
+# (passed down as PHLAG_BENCH_JOBS) -- this process's own inner worker count
+# is scaled down so outer_jobs * inner_workers stays <= this.
+TOTAL_CORE_BUDGET = 50
+
+
+def inner_worker_cap():
+    outer_jobs = max(1, int(os.environ.get("PHLAG_BENCH_JOBS", "1")))
+    return max(1, TOTAL_CORE_BUDGET // outer_jobs)
+
 DEFAULT_DIST_TYPE = "gaussian"
 DEFAULT_WINDOW_SIZE = 50000
 DEFAULT_STEP_SIZE = 1000
 
 TOPOLOGY_NAMES = ["ABBA", "BABA", "AABB"]
 RELERR_STATES = ["Null", "Alt"]
+
+# Upper-triangle entries of the 3x3 (ABBA/BABA/AABB) gt_stats covariance
+# matrix -- diagonal (variance) as var_<topo>, off-diagonal as
+# cov_<topo1>_<topo2>, matching TOPOLOGY_NAMES order.
+TOPO_VAR_COV_COLUMNS = [
+    "var_ABBA", "var_BABA", "var_AABB",
+    "cov_ABBA_BABA", "cov_ABBA_AABB", "cov_BABA_AABB",
+]
 
 DEFAULT_CONCAT_PATTERNS = ["37-62", "40-60", "42-57", "45-55", "47-52", "49-51"]
 
@@ -160,6 +181,11 @@ _RE_TRANSITION_MATRIX = re.compile(
     r'^Final transition matrix \(after EM\):\s*'
     r'\[\[([-\d.eE+]+),\s*([-\d.eE+]+)\],\s*\[([-\d.eE+]+),\s*([-\d.eE+]+)\]\]\s*$'
 )
+_RE_TRANSITION_ROW = re.compile(
+    r'^(Ground truth|Viterbi path|Final) transition matrix(?: \(after EM\))? \((Null|Alt) row\):\s*'
+    r'\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\]\s*$'
+)
+_TRANSITION_ROW_PREFIX = {"Ground truth": "gt_transition", "Viterbi path": "viterbi_transition", "Final": "transition"}
 _RE_CASTER_MTIME = re.compile(r'^Caster source mtime:\s*([\d.eE+]+)\s*$')
 _RE_PHLAG_MTIME = re.compile(r'^Phlag source mtime:\s*([\d.eE+]+)\s*$')
 _RE_CLIP_ACTIVATIONS = re.compile(
@@ -266,6 +292,10 @@ def parse_report(report_path):
         "em_gt_hd_is_joint": False,
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
+        "gt_transition_null_to_null": None, "gt_transition_null_to_alt": None,
+        "gt_transition_alt_to_null": None, "gt_transition_alt_to_alt": None,
+        "viterbi_transition_null_to_null": None, "viterbi_transition_null_to_alt": None,
+        "viterbi_transition_alt_to_null": None, "viterbi_transition_alt_to_alt": None,
         "caster_source_mtime": None, "phlag_source_mtime": None,
         "bic": None, "log_likelihood": None, "n_trainable_params": None,
         "clip_activation_count": None, "clip_activation_rate": None, "clip_unsafe": None,
@@ -418,6 +448,14 @@ def parse_report(report_path):
                 except (ValueError, SyntaxError):
                     mat = None
                 parsed[f"fitted_{state.lower()}_cov"] = mat
+                continue
+
+            m = _RE_TRANSITION_ROW.match(line)
+            if m:
+                prefix, state, to_null, to_alt = m.groups()
+                state = state.lower()
+                parsed[f"{_TRANSITION_ROW_PREFIX[prefix]}_{state}_to_null"] = float(to_null)
+                parsed[f"{_TRANSITION_ROW_PREFIX[prefix]}_{state}_to_alt"] = float(to_alt)
                 continue
 
             m = _RE_TRANSITION_MATRIX.match(line)
@@ -603,16 +641,34 @@ class RunRecord:
     null_mean_ABBA: Optional[float] = None
     null_mean_BABA: Optional[float] = None
     null_mean_AABB: Optional[float] = None
+    null_var_ABBA: Optional[float] = None
+    null_var_BABA: Optional[float] = None
+    null_var_AABB: Optional[float] = None
+    null_cov_ABBA_BABA: Optional[float] = None
+    null_cov_ABBA_AABB: Optional[float] = None
+    null_cov_BABA_AABB: Optional[float] = None
     alt_mean_norm: Optional[float] = None
     alt_cov_norm: Optional[float] = None
     alt_mean_ABBA: Optional[float] = None
     alt_mean_BABA: Optional[float] = None
     alt_mean_AABB: Optional[float] = None
+    alt_var_ABBA: Optional[float] = None
+    alt_var_BABA: Optional[float] = None
+    alt_var_AABB: Optional[float] = None
+    alt_cov_ABBA_BABA: Optional[float] = None
+    alt_cov_ABBA_AABB: Optional[float] = None
+    alt_cov_BABA_AABB: Optional[float] = None
     pooled_mean_norm: Optional[float] = None
     pooled_cov_norm: Optional[float] = None
     pooled_mean_ABBA: Optional[float] = None
     pooled_mean_BABA: Optional[float] = None
     pooled_mean_AABB: Optional[float] = None
+    pooled_var_ABBA: Optional[float] = None
+    pooled_var_BABA: Optional[float] = None
+    pooled_var_AABB: Optional[float] = None
+    pooled_cov_ABBA_BABA: Optional[float] = None
+    pooled_cov_ABBA_AABB: Optional[float] = None
+    pooled_cov_BABA_AABB: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -834,7 +890,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                 norm_eps=None, errorbar="sd"):
+                 norm_eps=False, errorbar="sd"):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -1024,6 +1080,12 @@ class BenchmarkStats:
             setattr(record, f"{prefix}_cov_norm", float(np.linalg.norm(cov_arr)))
             for topo, val in zip(TOPOLOGY_NAMES, mean_arr):
                 setattr(record, f"{prefix}_mean_{topo}", float(val))
+            for i, ti in enumerate(TOPOLOGY_NAMES):
+                for j, tj in enumerate(TOPOLOGY_NAMES):
+                    if j < i:
+                        continue
+                    attr = f"var_{ti}" if i == j else f"cov_{ti}_{tj}"
+                    setattr(record, f"{prefix}_{attr}", float(cov_arr[i, j]))
 
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
@@ -1315,10 +1377,13 @@ class BenchmarkStats:
         "em_hd", "em_gt_hd",
         "null_mean_norm", "null_cov_norm",
         "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
+    ] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
         "alt_mean_norm", "alt_cov_norm",
         "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
+    ] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
         "pooled_mean_norm", "pooled_cov_norm",
         "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
+    ] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
@@ -1332,13 +1397,22 @@ class BenchmarkStats:
         "n_runs", "mean", "sd", "err_minus", "err_plus", "errorbar", "run_ids",
     ]
 
-    @staticmethod
-    def _fmt(value):
+    # Columns whose float values are written at full precision instead of
+    # format_number's 3-decimal rounding -- em_gt_hd (the ground-truth joint
+    # Hellinger2, straight from gt_stats.txt) is often small enough that
+    # 3-decimal rounding destroys most of its significant digits (e.g.
+    # 0.0026 -> "0.003"), same reasoning as phlag.py's own report.tsv header.
+    _FULL_PRECISION_COLUMNS = {"em_gt_hd"}
+
+    @classmethod
+    def _fmt(cls, value, column=None):
         if value is None:
             return ""
         if isinstance(value, bool):
             return "True" if value else "False"
         if isinstance(value, float):
+            if column in cls._FULL_PRECISION_COLUMNS:
+                return str(value)
             from phlag.utils import format_number
             formatted = format_number(value)
             return str(formatted) if formatted is not None else ""
@@ -1404,16 +1478,19 @@ class BenchmarkStats:
                     "null_mean_ABBA": record.null_mean_ABBA,
                     "null_mean_BABA": record.null_mean_BABA,
                     "null_mean_AABB": record.null_mean_AABB,
+                    **{f"null_{c}": getattr(record, f"null_{c}") for c in TOPO_VAR_COV_COLUMNS},
                     "alt_mean_norm": record.alt_mean_norm,
                     "alt_cov_norm": record.alt_cov_norm,
                     "alt_mean_ABBA": record.alt_mean_ABBA,
                     "alt_mean_BABA": record.alt_mean_BABA,
                     "alt_mean_AABB": record.alt_mean_AABB,
+                    **{f"alt_{c}": getattr(record, f"alt_{c}") for c in TOPO_VAR_COV_COLUMNS},
                     "pooled_mean_norm": record.pooled_mean_norm,
                     "pooled_cov_norm": record.pooled_cov_norm,
                     "pooled_mean_ABBA": record.pooled_mean_ABBA,
                     "pooled_mean_BABA": record.pooled_mean_BABA,
                     "pooled_mean_AABB": record.pooled_mean_AABB,
+                    **{f"pooled_{c}": getattr(record, f"pooled_{c}") for c in TOPO_VAR_COV_COLUMNS},
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -1430,7 +1507,7 @@ class BenchmarkStats:
                 for topo in TOPOLOGY_NAMES:
                     for state in RELERR_STATES:
                         row[f"relerr_{topo}_{state}"] = record.rel_err.get((topo, state))
-                handle.write("\t".join(self._fmt(row[c]) for c in self.RUN_COLUMNS) + "\n")
+                handle.write("\t".join(self._fmt(row[c], c) for c in self.RUN_COLUMNS) + "\n")
 
         bins_path = out_dir / "bins.tsv"
         with open(bins_path, "w") as handle:
@@ -2139,7 +2216,7 @@ CASTER_ARG_SPECS = [
     ("step_size", "-s", False),
     ("dist_type", "-d", False),
     ("normalize", "-n", True),
-    ("norm_eps", "--norm-eps", False),
+    ("norm_eps", "--norm-eps", True),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
     ("site", "--site", True),
@@ -2166,6 +2243,68 @@ PHLAG_ARG_SPECS = [
     ("beta", "--beta", False),
 ]
 MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, _ in PHLAG_ARG_SPECS]
+
+# Path-segment <-> phlag-flag conventions used by hand-typed --create paths
+# (see bench/script.sh, e.g. ".../rho0.9_beta4.0", ".../annealing",
+# ".../var2x", ".../repulsion", ".../lam2.0") -- nothing derives these
+# segments automatically, so --create's literal path can silently drift from
+# the flags actually passed. Shared by resolve_run_dir's fail-fast check
+# below and .claude/skills/check-run-args/audit_args.py's retroactive sweep,
+# so the two stay in sync instead of duplicating the regexes by hand.
+SEGMENT_CONVENTIONS = [
+    dict(
+        name="rho_beta",
+        regex=re.compile(r"^rho([\d.]+)_beta([\d.]+)$"),
+        is_set=lambda d: d.get("rho") is not None or d.get("beta") is not None,
+        matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta") == float(m.group(2)),
+        expected=lambda d: f"rho{d.get('rho')}_beta{d.get('beta')}",
+    ),
+    dict(
+        name="lam",
+        regex=re.compile(r"^lam([\d.]+)$"),
+        is_set=lambda d: d.get("emission_lambda") not in (None, 1.0),
+        matches=lambda m, d: d.get("emission_lambda") == float(m.group(1)),
+        expected=lambda d: f"lam{d.get('emission_lambda')}",
+    ),
+    dict(
+        name="annealing",
+        regex=re.compile(r"^annealing$"),
+        is_set=lambda d: bool(d.get("annealing")),
+        matches=lambda m, d: bool(d.get("annealing")),
+        expected=lambda d: "annealing",
+    ),
+    dict(
+        name="var2x",
+        regex=re.compile(r"^var2x$"),
+        is_set=lambda d: bool(d.get("double_variance_init")),
+        matches=lambda m, d: bool(d.get("double_variance_init")),
+        expected=lambda d: "var2x",
+    ),
+    dict(
+        name="repulsion",
+        regex=re.compile(r"^repulsion$"),
+        is_set=lambda d: d.get("alt_emission_parameterization") == "repulsion",
+        matches=lambda m, d: d.get("alt_emission_parameterization") == "repulsion",
+        expected=lambda d: "repulsion",
+    ),
+]
+
+
+def check_segment_conventions(rel_parts, data):
+    """Cross-checks SEGMENT_CONVENTIONS both ways against a run dir's path
+    parts and its (would-be or on-disk) args.json dict: a convention segment
+    present in rel_parts must match data's value, and a non-default value in
+    data must have a matching segment somewhere in rel_parts. Returns a list
+    of human-readable problem strings, empty if consistent."""
+    problems = []
+    for conv in SEGMENT_CONVENTIONS:
+        matched_part = next((p for p in rel_parts if conv["regex"].match(p)), None)
+        if matched_part is not None:
+            if not conv["matches"](conv["regex"].match(matched_part), data):
+                problems.append(f"'{matched_part}' segment present but args disagree (expected {conv['expected'](data)!r})")
+        elif conv["is_set"](data):
+            problems.append(f"{conv['name']} flags imply a {conv['expected'](data)!r} segment, but none found in the path")
+    return problems
 
 
 def _build_forward_args(args, specs):
@@ -2269,9 +2408,12 @@ def _build_parser():
         help="Forwarded to caster's -n.",
     )
     caster_group.add_argument(
-        "--norm-eps", dest="norm_eps", type=float, default=None,
-        help="Forwarded to caster's --norm-eps (default: caster's own default, "
-             f"{DEFAULT_NORM_EPS}).",
+        "--norm-eps", dest="norm_eps", action="store_true",
+        help="Forwarded to caster's --norm-eps: guards -n/--normalize's near-zero "
+             f"divisor blowup (clamped to {DEFAULT_NORM_EPS}) instead of the "
+             "original unguarded division. Off by default; on writes to its own "
+             "'normalize/norm-eps' cache entry rather than overwriting the "
+             "existing 'normalize' one.",
     )
     caster_group.add_argument(
         "--shift-caster", dest="shift_caster", action="store_true",
@@ -2459,7 +2601,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                                 pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                                norm_eps=None):
+                                norm_eps=False):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2480,14 +2622,13 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     still appends a flat "_z" suffix to the size segment itself. ``ilr``
     implies closure, so it nests in place of (not stacked with)
     ``normalize``, even if ``normalize`` is also True -- mirrors
-    phlag/caster.py's own `_derive_output_path` precedence. ``norm_eps``
-    (None here means "caster's own default", not "no normalize" -- pass the
-    actual value whenever the caller's args.norm_eps was explicitly set)
-    nests its own 'eps<value>' segment under 'normalize', same reasoning as
-    site/normalize/ilr: a non-default eps changes what's in scores.tsv, so it
-    must not share a cache entry with the default-eps tree. Any new caster/
-    phlag flag that changes cached output should get the same treatment here
-    and in phlag/caster.py's `_derive_output_path`.
+    phlag/caster.py's own `_derive_output_path` precedence. ``norm_eps`` is a
+    boolean (mirrors --norm-eps, itself a boolean -- see apply_normalize) that
+    nests its own 'norm-eps' segment under 'normalize' when True, same
+    reasoning as site/normalize/ilr: it changes what's in scores.tsv, so it
+    must not share a cache entry with the (default, unguarded) 'normalize'
+    tree. Any new caster/phlag flag that changes cached output should get the
+    same treatment here and in phlag/caster.py's `_derive_output_path`.
 
     ``sim_path``/``leaf_dir`` semantics match get_expected_sim_output_dir.
     """
@@ -2511,8 +2652,8 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
         base = base / "ilr"
     elif normalize:
         base = base / "normalize"
-        if norm_eps is not None:
-            base = base / f"eps{norm_eps:g}"
+        if norm_eps:
+            base = base / "norm-eps"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
@@ -2521,7 +2662,7 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                              pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                             norm_eps=None):
+                             norm_eps=False):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
@@ -2708,15 +2849,13 @@ def run_all(args, sim_root, out_dir):
     skipped_present = 0
     failures = []
 
-    def record_failure(msg):
+    def record_failure(progress, msg):
         progress.write(f"{RED}[fail] {msg}{RESET}")
         failures.append(msg)
 
     items = []
-    progress = tqdm(work_items, desc="", unit="file")
-    for leaf_dir, rel_path, fasta_path in progress:
+    for leaf_dir, rel_path, fasta_path in work_items:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
-
         scores_path = get_expected_scores_path(
             fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
             pair=args.pair, site=args.site, chunk_size=args.chunk_size,
@@ -2725,47 +2864,51 @@ def run_all(args, sim_root, out_dir):
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
         )
-        items.append((leaf_dir, rel_path, fasta_path, scores_path, report_path))
+        items.append((rel_path, fasta_path, scores_path, report_path))
 
-        if scores_path.exists():
-            continue
-
-        progress.set_description(f"[caster] {pattern_rel} is being processed", refresh=False)
-        caster_ok, caster_out = run_step(
+    # Phase 1: caster, run in parallel (one worker per pending item, capped
+    # at the machine's core count) over every item still missing scores.tsv.
+    # Phase 2 only starts once every item above has had its chance to get
+    # one -- phlag never runs against an item still missing it (a caster
+    # failure is recorded in phase 1, not re-raised here). Results are
+    # consumed from pool.map in the main thread only, so caster_processed/
+    # failures/the progress bar all stay single-threaded despite the actual
+    # subprocess work running concurrently.
+    def run_caster_item(item):
+        rel_path, fasta_path, scores_path, report_path = item
+        ok, out = run_step(
             [sys.executable, "-m", "phlag.caster", str(fasta_path)]
             + ["--bench"] + caster_forward_args
             + ["--plot", "topology_pairs", "correlation"],
             "caster",
             cwd=str(snapshot_root), env=snapshot_env,
         )
-        if not caster_ok:
-            record_failure(f"{pattern_rel}: caster failed\n{caster_out}")
-            continue
-        if not scores_path.exists():
-            record_failure(
-                f"{pattern_rel}: caster reported success but scores file not found at {scores_path}"
-            )
-            continue
-        caster_processed += 1
-    progress.set_description("")
+        return item, ok, out
+
+    pending_caster = [item for item in items if not item[2].exists()]
+    progress = tqdm(total=len(items), desc="[caster]", unit="file")
+    progress.update(len(items) - len(pending_caster))
+    if pending_caster:
+        workers = min(len(pending_caster), inner_worker_cap())
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for item, ok, out in pool.map(run_caster_item, pending_caster):
+                rel_path, fasta_path, scores_path, report_path = item
+                pattern_rel = f"{rel_path}/{fasta_path.stem}"
+                if not ok:
+                    record_failure(progress, f"{pattern_rel}: caster failed\n{out}")
+                elif not scores_path.exists():
+                    record_failure(
+                        progress,
+                        f"{pattern_rel}: caster reported success but scores file not found at {scores_path}",
+                    )
+                else:
+                    caster_processed += 1
+                progress.update(1)
     progress.close()
 
-    # Phase 2 only starts once every item above has had its chance to get a
-    # scores.tsv -- phlag never runs against an item still missing one (a
-    # caster failure just above is recorded there, not re-raised here).
-    progress = tqdm(items, desc="", unit="file")
-    for leaf_dir, rel_path, fasta_path, scores_path, report_path in progress:
-        pattern_rel = f"{rel_path}/{fasta_path.stem}"
-
-        if report_path.exists():
-            skipped_present += 1
-            continue
-        if not scores_path.exists():
-            record_failure(f"{pattern_rel}: scores.tsv missing (caster failed above), skipping phlag")
-            continue
-
-        progress.set_description(f"[phlag] {pattern_rel} is being processed", refresh=False)
-        phlag_ok, phlag_out = run_step(
+    def run_phlag_item(item):
+        rel_path, fasta_path, scores_path, report_path = item
+        ok, out = run_step(
             [sys.executable, "-m", "phlag.phlag", str(scores_path)]
             + ["--output-base", report_base_override, "--bench"]
             + phlag_forward_args
@@ -2773,17 +2916,39 @@ def run_all(args, sim_root, out_dir):
             "phlag",
             cwd=str(snapshot_root), env=snapshot_env,
         )
-        if not phlag_ok:
-            record_failure(f"{pattern_rel}: phlag failed\n{phlag_out}")
-            continue
-        if not report_path.exists():
-            record_failure(
-                f"{pattern_rel}: phlag reported success but report file not found at {report_path}"
-            )
-            continue
+        return item, ok, out
 
-        processed += 1
-    progress.set_description("")
+    pending_phlag = []
+    for item in items:
+        rel_path, fasta_path, scores_path, report_path = item
+        pattern_rel = f"{rel_path}/{fasta_path.stem}"
+        if report_path.exists():
+            skipped_present += 1
+        elif not scores_path.exists():
+            msg = f"{pattern_rel}: scores.tsv missing (caster failed above), skipping phlag"
+            tqdm.write(f"{RED}[fail] {msg}{RESET}")
+            failures.append(msg)
+        else:
+            pending_phlag.append(item)
+
+    progress = tqdm(total=len(items), desc="[phlag]", unit="file")
+    progress.update(len(items) - len(pending_phlag))
+    if pending_phlag:
+        workers = min(len(pending_phlag), inner_worker_cap())
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for item, ok, out in pool.map(run_phlag_item, pending_phlag):
+                rel_path, fasta_path, scores_path, report_path = item
+                pattern_rel = f"{rel_path}/{fasta_path.stem}"
+                if not ok:
+                    record_failure(progress, f"{pattern_rel}: phlag failed\n{out}")
+                elif not report_path.exists():
+                    record_failure(
+                        progress,
+                        f"{pattern_rel}: phlag reported success but report file not found at {report_path}",
+                    )
+                else:
+                    processed += 1
+                progress.update(1)
     progress.close()
 
     shutil.rmtree(snapshot_root, ignore_errors=True)
@@ -2811,11 +2976,13 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["
 ] + ["em_hd", "em_gt_hd"] + [
     "null_mean_norm", "null_cov_norm",
     "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
+] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
     "alt_mean_norm", "alt_cov_norm",
     "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
+] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
     "pooled_mean_norm", "pooled_cov_norm",
     "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
-] + [
+] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
 ] + ["bic"] + ["clip_activation_count", "clip_activation_rate"]
@@ -2952,8 +3119,25 @@ def resolve_run_dir(args):
     whether it's new, partially done, or already finished -- to force a
     clean redo, delete out_dir's own report.txt/args.json/source/runs.tsv/
     bins.tsv/analysis.tsv/reports/*.png first.
+
+    Also fails fast (see SEGMENT_CONVENTIONS/check_segment_conventions) if
+    this invocation's rho/beta/lam/annealing/var2x/repulsion flags disagree
+    with -- or aren't reflected in -- the path's own segments, so a mistyped
+    --create can't silently write args.json out of step with its directory.
     """
-    return _validate_store_path("--create", args.create)
+    candidate = _validate_store_path("--create", args.create)
+
+    from phlag.utils import get_repo_root, get_data_dir, get_phlag_output_base
+    phlag_base = get_phlag_output_base(get_data_dir()).resolve()
+    rel_parts = candidate.relative_to(phlag_base).parts
+    problems = check_segment_conventions(rel_parts, vars(args))
+    if problems:
+        sys.exit(
+            f"{RED}--create {args.create!r} is inconsistent with its flags:\n  "
+            + "\n  ".join(problems)
+            + RESET
+        )
+    return candidate
 
 
 def _read_args_json(args_json_path):

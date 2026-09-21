@@ -1,0 +1,35 @@
+/home/iang/.local/share/mamba/envs/phlag/bin/phlag out/c25k_s25k/N109_p/N109.tsv
+Clade: N/A
+Branch length (CU): N/A
+Height (Ngen): N/A
+Clade size: N/A
+Anomaly fraction: 0.25 (60/240 windows)
+Label polarity flipped for evaluation: False
+Caster source mtime: 1788074478.154238
+Phlag source mtime: 1788073747.104816
+State divergence: nan
+em_hd: nan
+Outer EM iterations: 10
+Inner EM iterations: 5
+Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
+Final transition matrix (after EM): [[nan, nan], [nan, nan]]
+Viterbi decoding: EM's final transition matrix diverged to NaN -- decoded against the initial transition matrix instead
+EM final joint log-likelihood: nan
+BIC: nan (log-likelihood=nan, k=30 trainable params, n=240 windows)
+N/A (Viterbi decoding failed -- no valid path found)
+Topology	State	Statistic	Fitted	GroundTruth	Rel.err
+ABBA	Null	mean	nan	9623703	nan
+ABBA	Null	std	nan	409559	nan
+ABBA	Alt	mean	nan	9401691	nan
+ABBA	Alt	std	nan	467011	nan
+BABA	Null	mean	nan	8861258	nan
+BABA	Null	std	nan	546400	nan
+BABA	Alt	mean	nan	8425380	nan
+BABA	Alt	std	nan	627533	nan
+AABB	Null	mean	nan	8860754	nan
+AABB	Null	std	nan	546242	nan
+AABB	Alt	mean	nan	8426685	nan
+AABB	Alt	std	nan	628329	nan
+em_gt_hd: 0.172
+--- Bookkeeping ---
+Confusion: TP=0 FP=0 FN=0 TN=0

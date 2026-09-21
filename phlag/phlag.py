@@ -20,6 +20,7 @@ from sklearn.metrics import silhouette_score
 
 from . import hmm
 from . import utils
+from .caster import step_size_or_fraction
 
 E_STEP_EPS = 0.0001
 PSI_EPS = 0.001
@@ -102,6 +103,15 @@ def _cluster_mean_cov(pts, D, eps=1e-4):
         cov = np.zeros((D, D))
     cov = cov + np.eye(D) * eps
     return mu, cov
+
+
+def get_title_locus(caster_scores, output_file):
+    from .utils import get_locus_description
+    if output_file:
+        parts = pathlib.Path(output_file).resolve().parent.parts
+        if "out" in parts:
+            return "/".join(parts[len(parts) - parts[::-1].index("out"):])
+    return get_locus_description(caster_scores)
 
 
 def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, n_clusters=2):
@@ -476,28 +486,28 @@ class Phlag:
         parsed = parse_filename_to_dir_structure(input_path.stem)
 
         if not getattr(self.args, "bench", False):
-            # Standalone use (the default): mirror whatever nesting caster.py
-            # wrote under out/w<W>_s<S>[_z][_n]/ or
-            # out/c<chunk>_s<step>[_site][_z][_n]/ -- <node_name>/ for
-            # sim/plain-file inputs, <node_name>/<pattern>/ for experiment
-            # (parsed null/alt) inputs -- by locating that size-dir segment
-            # in the input path and reusing everything between it and the
-            # scores filename, so report.tsv/plots land alongside the scores
-            # file exactly, regardless of nesting depth. A 'caster' ancestor
-            # instead means the file was found (via -r's broadened search, or
-            # passed explicitly) in the canonical --bench tree's
-            # <node_name>/<pattern>/scores.tsv, where node_name sits a fixed
-            # two directories up (get_simulation_node_name) -- that flattens
-            # to out/<node_name>/, same as any other input with no
-            # recognizable size-dir segment.
+            from .utils import SIM_CATEGORY_PAIRS, get_phlag_param_segments
+            segments = pathlib.Path(*get_phlag_param_segments(self.args))
             parts = input_path.parts
             size_dir_idx = None
             for i, part in enumerate(parts[:-1]):
-                if re.fullmatch(r'[cw]\w+_s\w+', part, re.IGNORECASE):
+                if re.fullmatch(r'[cw]\d+[km]?_s\d+[km]?(_site)?(_z)?(_i)?(_n)?(_norm-eps)?', part, re.IGNORECASE):
                     size_dir_idx = i
                     break
             if size_dir_idx is not None and "caster" not in parts:
-                return get_repo_root() / "out" / pathlib.Path(*parts[size_dir_idx:-1])
+                variant_end = size_dir_idx + 1
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps"):
+                    variant_end += 1
+                if "out" in parts[:size_dir_idx]:
+                    prefix_start = len(parts[:size_dir_idx]) - parts[:size_dir_idx][::-1].index("out")
+                elif size_dir_idx >= 4 and tuple(parts[size_dir_idx - 4:size_dir_idx - 2]) in SIM_CATEGORY_PAIRS:
+                    prefix_start = size_dir_idx - 4
+                else:
+                    prefix_start = size_dir_idx - 1
+                return (
+                    get_repo_root() / "out" / pathlib.Path(*parts[prefix_start:variant_end])
+                    / segments
+                )
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
             elif "caster" in input_path.parts:
@@ -505,7 +515,7 @@ class Phlag:
                 node_name = get_simulation_node_name(input_path) or input_path.parent.name
             else:
                 node_name = input_path.parent.name
-            return get_repo_root() / "out" / node_name
+            return get_repo_root() / "out" / segments / node_name
 
         # --bench (set only by benchmark's own subprocess invocations) keeps
         # output in the shared canonical tree.
@@ -551,19 +561,19 @@ class Phlag:
                 w_s_part = parts[caster_idx + 1]
                 rel_parts = list(parts[caster_idx + 2:-1])
                 # caster's tree nests site/ilr/normalize variant markers (plus
-                # normalize's own nested 'eps<value>' segment for a
-                # non-default --norm-eps, see get_expected_caster_sim_dir)
-                # right after the size segment, but the report tree never
-                # carries that nesting -- reports sit flat under
+                # normalize's own nested 'norm-eps' segment when --norm-eps
+                # was set, see get_expected_caster_sim_dir) right after the
+                # size segment, but the report tree never carries that
+                # nesting -- reports sit flat under
                 # <category>/<subcategory>/<sim_name>/ regardless of variant,
                 # so strip them instead of mirroring them into out_dir (which
                 # otherwise doubled up with an --output-base that already
                 # names the variant, e.g. .../ilr/rho.../reports). Any future
                 # marker segment nested here needs adding to this strip set
-                # too, or it leaks into out_dir the same way 'eps<value>'
+                # too, or it leaks into out_dir the same way 'norm-eps'
                 # would have (see phlag/caster.py's own naming-convention
                 # note in _derive_output_path).
-                while rel_parts and (rel_parts[0] in ("site", "ilr", "normalize") or re.match(r'eps[\d.eE+-]+$', rel_parts[0])):
+                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps"):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -974,17 +984,56 @@ class Phlag:
         _phlag_mtime = max((_pkg_dir / f).stat().st_mtime for f in ("phlag.py", "hmm.py"))
         headers.append(f"Caster source mtime: {_caster_mtime:.6f}")
         headers.append(f"Phlag source mtime: {_phlag_mtime:.6f}")
+        headers.append(
+            "Window averaging: raw sum (--pair, no per-site normalization)"
+            if getattr(self, "used_pair_scores", False)
+            else "Window averaging: per-site (divided by informative-site count)"
+        )
 
         headers.append("State divergence: " + emission_divergence_str)
         if em_hellinger2_distance is not None:
             headers.append(f"em_hd: {format_number(em_hellinger2_distance)}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
+        def _empirical_transition_matrix(state_path, null_state, alt_state, pair_mask=None):
+            # Row-normalized by each state's own count of "from" occurrences
+            # (not total windows), same convention as the fitted transition
+            # matrix so the two are directly comparable row-for-row.
+            state_path = np.asarray(state_path)
+            prev, nxt = state_path[:-1], state_path[1:]
+            if pair_mask is not None:
+                prev, nxt = prev[pair_mask], nxt[pair_mask]
+            n_null = int(np.sum(prev == null_state))
+            n_alt = int(np.sum(prev == alt_state))
+            p_null_alt = float(np.sum((prev == null_state) & (nxt == alt_state)) / n_null) if n_null > 0 else float("nan")
+            p_alt_null = float(np.sum((prev == alt_state) & (nxt == null_state)) / n_alt) if n_alt > 0 else float("nan")
+            return [[1.0 - p_null_alt, p_null_alt], [p_alt_null, 1.0 - p_alt_null]]
+
+        def _append_transition_rows(label, matrix):
+            for state, row in zip(("Null", "Alt"), matrix):
+                headers.append(f"{label} ({state} row): [{', '.join(f'{float(x):.5g}' for x in row)}]")
+
+        if self.has_ground_truth:
+            _append_transition_rows("Ground truth transition matrix", _empirical_transition_matrix(y_true, 0, 1))
+        else:
+            headers.append("Ground truth transition matrix: N/A (no ground truth pattern)")
+
+        if paths:
+            null_state, alt_state = (1, 0) if flipped_for_eval else (0, 1)
+            _append_transition_rows("Viterbi path transition matrix (pooled)", _empirical_transition_matrix(paths[0], null_state, alt_state))
+            if self.has_ground_truth:
+                gt_arr = np.asarray(y_true)
+                for region, region_state in (("Null", 0), ("Alt", 1)):
+                    pair_mask = (gt_arr[:-1] == region_state) & (gt_arr[1:] == region_state)
+                    _append_transition_rows(
+                        f"Viterbi path transition matrix ({region} region)",
+                        _empirical_transition_matrix(paths[0], null_state, alt_state, pair_mask),
+                    )
+        else:
+            headers.append("Viterbi path transition matrix: N/A (Viterbi decoding failed)")
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
-            tm_before_str = ", ".join(f"[{', '.join(format_number(x) for x in row)}]" for row in self.initial_transition_matrix.tolist())
-            headers.append(f"Initial transition matrix (before EM): [{tm_before_str}]")
-        tm_after_str = ", ".join(f"[{', '.join(str(format_number(x)) for x in row)}]" for row in transition_matrix_np.tolist())
-        headers.append(f"Final transition matrix (after EM): [{tm_after_str}]")
+            _append_transition_rows("Initial transition matrix (before EM)", self.initial_transition_matrix.tolist())
+        _append_transition_rows("Final transition matrix (after EM)", transition_matrix_np.tolist())
         if viterbi_fallback_used:
             headers.append(
                 "Viterbi decoding: EM's final transition matrix diverged to NaN -- "
@@ -1012,6 +1061,7 @@ class Phlag:
             )
 
         headers.append(f"{metrics_str}")
+        relerr_rows = []
         if self.ground_truth_fits:
             topology_names = get_topology_names(self.Y.shape[-1])
             headers.append("Topology\tState\tFittedMean\tFittedStd\tGTMean\tGTStd\tKL")
@@ -1034,6 +1084,16 @@ class Phlag:
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
                 headers.append(f"{topo_name}\tNull\t{format_report_value(mu_null_fit)}\t{format_report_value(std_null_fit)}\t{format_report_value(mu_null_gt)}\t{format_report_value(std_null_gt)}\t{format_report_value(kl_null)}")
                 headers.append(f"{topo_name}\tAlt\t{format_report_value(mu_alt_fit)}\t{format_report_value(std_alt_fit)}\t{format_report_value(mu_alt_gt)}\t{format_report_value(std_alt_gt)}\t{format_report_value(kl_alt)}")
+                # (fitted - ground_truth) / ground_truth per topology/state/statistic --
+                # the metric the KL/Hellinger divergence above replaced as the report's
+                # primary error measure; kept available here only to feed --plot relerr.
+                relerr_rows.append((
+                    topo_name,
+                    (mu_null_fit - mu_null_gt) / mu_null_gt if mu_null_gt != 0 else float('nan'),
+                    (std_null_fit - std_null_gt) / std_null_gt if std_null_gt != 0 else float('nan'),
+                    (mu_alt_fit - mu_alt_gt) / mu_alt_gt if mu_alt_gt != 0 else float('nan'),
+                    (std_alt_fit - std_alt_gt) / std_alt_gt if std_alt_gt != 0 else float('nan'),
+                ))
             # Joint (all-topologies-at-once) ground-truth squared Hellinger
             # distance -- including cross-topology covariance, unlike the
             # per-topology marginal fits above -- so it's directly comparable
@@ -1052,7 +1112,7 @@ class Phlag:
 
             if "Hellinger2" in gt_stats:
                 gt_hellinger2_joint = gt_stats["Hellinger2"]
-                headers.append(f"em_gt_hd: {format_number(float(gt_hellinger2_joint))}")
+                headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
             else:
                 if "Null" in gt_stats and "Alt" in gt_stats:
                     mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
@@ -1074,7 +1134,7 @@ class Phlag:
                         jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
                         jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
                     )
-                    headers.append(f"em_gt_hd: {format_number(float(gt_hellinger2_joint))}")
+                    headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
@@ -1094,7 +1154,15 @@ class Phlag:
                 import seaborn as sns
                 
                 sns.set_theme(style="white")
-                fig, ax1 = plt.subplots(figsize=(12, 6))
+                agg = getattr(self.args, "agg", None)
+                if agg:
+                    fig, (ax1, ax_hist) = plt.subplots(
+                        2, 1, figsize=(12, 8), sharex=True,
+                        gridspec_kw={"height_ratios": [3, 2], "hspace": 0.08},
+                    )
+                else:
+                    fig, ax1 = plt.subplots(figsize=(12, 6))
+                    ax_hist = None
                 
                 input_path = pathlib.Path(self.args.caster_scores)
                 sorted_positions = sorted(self.pos_to_caster.keys())
@@ -1112,16 +1180,39 @@ class Phlag:
                 if self.has_ground_truth:
                     ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
 
-                ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
+                if ax_hist is not None:
+                    edges = list(range(0, len(positions_kb), agg))
+                    centers = []
+                    widths = []
+                    flagged = []
+                    truth_flagged = []
+                    primary = (1 - paths[0]) if flipped_for_eval else paths[0]
+                    primary = np.asarray(primary)
+                    for start in edges:
+                        end = min(start + agg, len(positions_kb))
+                        lo = positions_kb[start]
+                        hi = positions_kb[end - 1]
+                        centers.append((lo + hi) / 2)
+                        widths.append(max(hi - lo, positions_kb[min(start + 1, len(positions_kb) - 1)] - lo, 1e-9))
+                        flagged.append(int(np.sum(primary[start:end] == 1)))
+                        if self.has_ground_truth:
+                            truth_flagged.append(int(np.sum(np.asarray(y_true)[start:end] == 1)))
+                    ax_hist.bar(centers, flagged, width=widths, color=colors[0], alpha=0.7, label="Path 1 flagged")
+                    if self.has_ground_truth:
+                        ax_hist.step(centers, truth_flagged, where="mid", color="black", linestyle="--", linewidth=1.5, label="Ground Truth")
+                    ax_hist.set_ylabel(f"Alt windows per {agg}", fontsize=12, labelpad=10)
+                    ax_hist.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
+                    ax_hist.legend(loc="upper left", framealpha=0.9)
+                else:
+                    ax1.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
                 ax1.set_ylim(-0.05, 1.05)
                 ax1.set_yticks([0, 1])
-                from .utils import get_locus_description
-                locus_desc = get_locus_description(input_path)
+                locus_desc = get_title_locus(input_path, self.output_file)
                 if locus_desc:
-                    plt.title(f"Genomic Profile: {locus_desc}\nTop {len(paths)} Viterbi Paths", fontsize=12, fontweight="bold", pad=12)
+                    ax1.set_title(f"Genomic Profile: {locus_desc}\nTop {len(paths)} Viterbi Paths", fontsize=12, fontweight="bold", pad=12)
                 else:
-                    plt.title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
+                    ax1.set_title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
                 
                 lines1, labels1 = ax1.get_legend_handles_labels()
                 ax1.legend(lines1, labels1, loc="upper left", framealpha=0.9)
@@ -1135,6 +1226,46 @@ class Phlag:
                 print(f"Saved visual HMM states plot to: {plot_path}")
             except Exception as e:
                 print(f"Warning: Could not generate visual states plot: {e}")
+
+
+        # Generate the visual plot if configured: relerr
+        if self.args.plot and "relerr" in self.args.plot:
+            if not relerr_rows:
+                print("Warning: --plot relerr requested but no ground truth available -- skipping.")
+            else:
+                try:
+                    import matplotlib.pyplot as plt
+                    import seaborn as sns
+
+                    sns.set_theme(style="white")
+                    topo_labels = [row[0] for row in relerr_rows]
+                    null_mean = [row[1] * 100 for row in relerr_rows]
+                    null_std = [row[2] * 100 for row in relerr_rows]
+                    alt_mean = [row[3] * 100 for row in relerr_rows]
+                    alt_std = [row[4] * 100 for row in relerr_rows]
+
+                    x = np.arange(len(topo_labels))
+                    bar_width = 0.2
+                    fig, ax = plt.subplots(figsize=(max(6, len(topo_labels) * 2), 6))
+                    ax.bar(x - 1.5 * bar_width, null_mean, bar_width, label="Null mean", color="#4C72B0")
+                    ax.bar(x - 0.5 * bar_width, null_std, bar_width, label="Null std", color="#8CA8D8")
+                    ax.bar(x + 0.5 * bar_width, alt_mean, bar_width, label="Alt mean", color="#C44E52")
+                    ax.bar(x + 1.5 * bar_width, alt_std, bar_width, label="Alt std", color="#DC8A8D")
+                    ax.axhline(0, color="black", linewidth=1)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(topo_labels)
+                    ax.set_ylabel("Relative Error (%)")
+                    ax.set_title("Fitted vs Ground-Truth Relative Error")
+                    ax.legend(framealpha=0.9)
+                    fig.tight_layout()
+
+                    output_path = pathlib.Path(self.output_file)
+                    plot_path = output_path.with_name("relerr.png")
+                    plt.savefig(plot_path, dpi=300)
+                    plt.close()
+                    print(f"Saved relative-error plot to: {plot_path}")
+                except Exception as e:
+                    print(f"Warning: Could not generate relerr plot: {e}")
 
     def initialize_hmm(self):
         # Prior hyperparameters
@@ -1275,7 +1406,7 @@ class Phlag:
             self.clip_activation_attempts += clip_attempts
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
-            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str}")
+            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str} - {hmm.emission_norm_str(self.params)}")
         # log_probs is dynamax's own "joint log probability" trace for this fit_em call
         # (log_prior(params) + sum of per-step data log-likelihoods); its last entry is
         # the final joint log-likelihood EM converged to.
@@ -1352,11 +1483,13 @@ class PhlagPlotter:
             ypad = (ymax - ymin) * 0.20 or 0.1
             ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
 
+        bin_edges = self._compute_bin_edges(ranges)
+
         # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian)
         if self.phlag.args.model_design == "gmm":
             self._plot_gmm_init_row(axes[0], ranges)
         elif self.phlag.ground_truth_fits:
-            self._plot_ground_truth_row(axes[0], ranges)
+            self._plot_ground_truth_row(axes[0], ranges, bin_edges)
         else:
             for d in range(self.emission_dim):
                 axes[0][d].text(0.5, 0.5, "No ground truth available", ha="center", va="center", transform=axes[0][d].transAxes, fontsize=10, color="gray")
@@ -1364,12 +1497,11 @@ class PhlagPlotter:
                 axes[0][d].set_yticks([])
 
         # Row 1: After EM (fitted emission curves and HMM-assigned empirical data)
-        self._plot_em_row(axes[1], ranges)
+        self._plot_em_row(axes[1], ranges, bin_edges)
 
         self._finalize_legend(fig, axes)
 
-        from .utils import get_locus_description
-        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+        locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
         if locus_desc:
             fig.suptitle(f"EM Distributions | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
             plt.tight_layout(rect=[0, 0, 1, 0.93])
@@ -1394,7 +1526,31 @@ class PhlagPlotter:
                 fontsize=7.5, framealpha=0.9
             )
 
-    def _plot_ground_truth_row(self, row_axes, ranges):
+    def _compute_bin_edges(self, ranges):
+        """Computes per-dimension equal-width bin edges spanning the full plotted x-range, sized
+        off the largest std among the ground-truth-split and EM-fitted state Gaussians, so the
+        ground-truth and after-EM histograms (and Null/Alt within each) share identical bins --
+        avoiding the ragged/gapped look from each subset picking its own bin count and range."""
+        params = self.phlag.params
+        model_design = self.phlag.args.model_design
+        bin_edges = {}
+        for d in range(self.emission_dim):
+            stds = []
+            if self.phlag.ground_truth_fits:
+                _, std_null, _, std_alt = self.phlag.ground_truth_fits[d]
+                stds += [std_null, std_alt]
+            for state in [0, 1]:
+                _, sigma, _ = get_state_mu_sigma_pdf(params, model_design, state, d, ranges[d])
+                stds.append(sigma)
+            max_std = max(stds)
+
+            x_min, x_max = ranges[d][0], ranges[d][-1]
+            bin_width = max(max_std / 4, 1e-6)
+            n_bins = int(np.clip(np.ceil((x_max - x_min) / bin_width), 15, 60))
+            bin_edges[d] = np.linspace(x_min, x_max, n_bins + 1)
+        return bin_edges
+
+    def _plot_ground_truth_row(self, row_axes, ranges, bin_edges):
         """Plots the ground-truth-split empirical histogram and independent Null/Alt gaussian fits."""
         y_true = self.phlag.y_true
         ground_truth_fits = self.phlag.ground_truth_fits
@@ -1412,9 +1568,9 @@ class PhlagPlotter:
             alt_vals = vals[y_true == 1]
 
             if len(null_vals) > 0:
-                sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[0]['fill'], label='Null Histogram', bins=30)
+                sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[0]['fill'], label='Null Histogram', bins=bin_edges[d])
             if len(alt_vals) > 0:
-                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[1]['fill'], label='Alt Histogram', bins=30)
+                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[1]['fill'], label='Alt Histogram', bins=bin_edges[d])
 
             pdf_null = stats.norm.pdf(x_vals, mu_null, std_null)
             ax.plot(x_vals, pdf_null, color=self.colors[0]['line'], linewidth=2.2, label='Null Fit')
@@ -1473,7 +1629,7 @@ class PhlagPlotter:
             ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
             ax.tick_params(axis='both', which='major', labelsize=8)
 
-    def _plot_em_row(self, row_axes, ranges):
+    def _plot_em_row(self, row_axes, ranges, bin_edges):
         """Plots the empirical HMM-assigned histogram and EM-fitted emission curves."""
         params = self.phlag.params
         title_prefix = "After EM"
@@ -1491,13 +1647,13 @@ class PhlagPlotter:
             if len(y_state0) > 0:
                 sns.histplot(
                     y_state0, ax=ax, color=self.colors[0]['fill'],
-                    stat="density", kde=False, alpha=0.12,
+                    stat="density", kde=False, alpha=0.12, bins=bin_edges[d],
                     element="step", label=f"{self.colors[0]['label']} Histogram"
                 )
             if len(y_state1) > 0:
                 sns.histplot(
                     y_state1, ax=ax, color=self.colors[1]['fill'],
-                    stat="density", kde=False, alpha=0.12,
+                    stat="density", kde=False, alpha=0.12, bins=bin_edges[d],
                     element="step", label=f"{self.colors[1]['label']} Histogram"
                 )
 
@@ -1578,58 +1734,76 @@ class PhlagPlotter:
         Y_np = np.array(self.phlag.Y)
         most_likely_states = np.array(self.phlag.hmm.most_likely_states(params, self.phlag.Y))
 
+        # Same underlying (Y_np) points in both rows -- only the Null/Alt label
+        # assignment differs (ground truth vs EM-assigned), mirroring
+        # plot_topologies_3d's Before/After EM split. "Before EM" needs a real
+        # y_true to split on, so it's skipped (After EM only) without ground truth.
+        stages = [("After EM", most_likely_states)]
+        if self.phlag.has_ground_truth:
+            stages.insert(0, ("Before EM", np.array(self.phlag.y_true)))
+
         sns.set_theme(style="whitegrid")
-        fig, axes = plt.subplots(1, len(pairs), figsize=(5.5 * len(pairs), 5.5), squeeze=False)
-        axes = axes[0]
+        fig, axes = plt.subplots(
+            len(stages), len(pairs), figsize=(5.5 * len(pairs), 5.5 * len(stages)), squeeze=False
+        )
 
-        for col_idx, (i, j) in enumerate(pairs):
-            ax = axes[col_idx]
+        for row_idx, (stage_label, state_labels) in enumerate(stages):
+            for col_idx, (i, j) in enumerate(pairs):
+                ax = axes[row_idx][col_idx]
 
-            for state in [0, 1]:
-                color_config = self.colors[state]
-                mask = most_likely_states == state
-                ax.scatter(
-                    Y_np[mask, i], Y_np[mask, j],
-                    s=8, alpha=0.25, color=color_config['fill'], linewidths=0,
-                    label=f"{color_config['label']} Windows",
-                )
-
-            for state in [0, 1]:
-                color_config = self.colors[state]
-                mean_xy = np.array(params.emissions.means[state])[[i, j]]
-                cov2x2 = np.array(params.emissions.covariances[state])[np.ix_([i, j], [i, j])]
-
-                for n_std, alpha, linestyle, sigma_label in [(1.0, 0.9, '-', '1σ'), (2.0, 0.5, '--', '2σ')]:
-                    ellipse = self._covariance_ellipse(
-                        mean_xy, cov2x2, n_std=n_std,
-                        edgecolor=color_config['line'], facecolor='none',
-                        linewidth=1.6, linestyle=linestyle, alpha=alpha,
-                        label=f"{color_config['label']} {sigma_label}",
+                for state in [0, 1]:
+                    color_config = self.colors[state]
+                    mask = state_labels == state
+                    ax.scatter(
+                        Y_np[mask, i], Y_np[mask, j],
+                        s=8, alpha=0.25, color=color_config['fill'], linewidths=0,
+                        label=f"{color_config['label']} Windows",
                     )
-                    ax.add_patch(ellipse)
-                ax.plot(mean_xy[0], mean_xy[1], marker='x', color=color_config['line'], markersize=8, markeredgewidth=2)
 
-                denom = np.sqrt(cov2x2[0, 0] * cov2x2[1, 1])
-                corr = float(cov2x2[0, 1] / denom) if denom > 0 else 0.0
-                y_text = 0.95 if state == 0 else 0.88
-                ax.text(
-                    0.03, y_text, f"$\\rho_{{{color_config['label'].lower()}}} = {corr:.3f}$",
-                    transform=ax.transAxes, color=color_config['line'], fontsize=9,
-                    fontweight='bold', va='top',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1),
-                )
+                for state in [0, 1]:
+                    color_config = self.colors[state]
+                    if stage_label == "After EM":
+                        mean_xy = np.array(params.emissions.means[state])[[i, j]]
+                        cov2x2 = np.array(params.emissions.covariances[state])[np.ix_([i, j], [i, j])]
+                    else:
+                        mask = state_labels == state
+                        if mask.sum() < 2:
+                            continue
+                        mean_xy = np.mean(Y_np[mask][:, [i, j]], axis=0)
+                        cov2x2 = np.cov(Y_np[mask][:, [i, j]], rowvar=False)
 
-            ax.set_title(f"{self.topology_names[i]} vs {self.topology_names[j]}", fontsize=11, fontweight='bold', pad=8)
-            ax.set_xlabel(f"{self.topology_names[i]} Score", fontsize=9, labelpad=4)
-            ax.set_ylabel(f"{self.topology_names[j]} Score", fontsize=9, labelpad=4)
-            ax.tick_params(axis='both', which='major', labelsize=8)
+                    for n_std, alpha, linestyle, sigma_label in [(1.0, 0.9, '-', '1σ'), (2.0, 0.5, '--', '2σ')]:
+                        ellipse = self._covariance_ellipse(
+                            mean_xy, cov2x2, n_std=n_std,
+                            edgecolor=color_config['line'], facecolor='none',
+                            linewidth=1.6, linestyle=linestyle, alpha=alpha,
+                            label=f"{color_config['label']} {sigma_label}",
+                        )
+                        ax.add_patch(ellipse)
+                    ax.plot(mean_xy[0], mean_xy[1], marker='x', color=color_config['line'], markersize=8, markeredgewidth=2)
 
-        self._finalize_legend(fig, axes.reshape(1, -1))
+                    denom = np.sqrt(cov2x2[0, 0] * cov2x2[1, 1])
+                    corr = float(cov2x2[0, 1] / denom) if denom > 0 else 0.0
+                    y_text = 0.95 if state == 0 else 0.88
+                    ax.text(
+                        0.03, y_text, f"$\\rho_{{{color_config['label'].lower()}}} = {corr:.3f}$",
+                        transform=ax.transAxes, color=color_config['line'], fontsize=9,
+                        fontweight='bold', va='top',
+                        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1),
+                    )
 
-        from .utils import get_locus_description
-        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+                title_prefix = f"{stage_label} | " if len(stages) > 1 else ""
+                ax.set_title(f"{title_prefix}{self.topology_names[i]} vs {self.topology_names[j]}", fontsize=11, fontweight='bold', pad=8)
+                ax.set_xlabel(f"{self.topology_names[i]} Score", fontsize=9, labelpad=4)
+                ax.set_ylabel(f"{self.topology_names[j]} Score", fontsize=9, labelpad=4)
+                ax.tick_params(axis='both', which='major', labelsize=8)
+
+        self._finalize_legend(fig, axes)
+
+        suptitle_stage = "" if len(stages) > 1 else " (After EM)"
+        locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
         if locus_desc:
-            fig.suptitle(f"Cross-Topology Correlation (After EM) | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
+            fig.suptitle(f"Cross-Topology Correlation{suptitle_stage} | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
             plt.tight_layout(rect=[0, 0, 1, 0.88])
         else:
             plt.tight_layout(rect=[0, 0, 1, 0.92])
@@ -1702,8 +1876,7 @@ class PhlagPlotter:
             ax.tick_params(axis='both', which='major', labelsize=7)
             ax.legend(fontsize=8, loc='upper right')
 
-        from .utils import get_locus_description
-        locus_desc = get_locus_description(self.phlag.args.caster_scores)
+        locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
         if locus_desc:
             fig.suptitle(f"Topology Score Space (3D) | {locus_desc}", fontsize=13, fontweight="bold", y=0.99)
             plt.tight_layout(rect=[0, 0, 1, 0.93])
@@ -1777,9 +1950,13 @@ def build_parser():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["em", "states"],
+        choices=["em", "states", "relerr"],
         default=["em", "states"],
-        help="List of plots to generate (choices: em, states. Default: both em and states)",
+        help="List of plots to generate (choices: em, states, relerr. Default: "
+             "em and states; relerr is opt-in, saving relerr.png -- fitted-vs-"
+             "ground-truth relative error per topology/state/statistic, "
+             "requires ground truth. Passing --plot with no choices explicitly "
+             "requests all of the above, including relerr).",
     )
     parser.add_argument(
         "-L",
@@ -1790,13 +1967,51 @@ def build_parser():
         help="Number of outer EM iterations (default: 10)",
     )
     parser.add_argument(
+        "-w",
+        dest="window_size",
+        type=int_or_abbrev,
+        nargs="+",
+        required=False,
+        default=None,
+        help="Window size(s) to substitute into caster_scores' 'w<...>_s<...>'/"
+             "'c<...>_s<...>' path segment (see caster.py's own -w), locating a "
+             "sibling scores.tsv for the same node/pattern instead of the one "
+             "given -- unset by default (uses caster_scores exactly as given/"
+             "resolved). Multiple space-separated values run one phlag run per "
+             "value (cartesian product with -s if it also has multiple values); "
+             "omitted -s defaults each -w value's step to itself (ratio 1.0, "
+             "non-overlapping -- see -s). Errors if caster_scores has no such "
+             "path segment, or if a substituted path doesn't exist."
+    )
+    parser.add_argument(
         "-s",
         "--step-size",
         dest="step_size",
-        type=int_or_abbrev,
+        type=step_size_or_fraction,
+        nargs="+",
         required=False,
         default=None,
-        help="Genomic step size (in rows/positions) to compute a text-based ASCII histogram and save a visual bar chart plot",
+        help="Genomic step size (in rows/positions), matching caster.py's own "
+             "-s (default: inferred from caster_scores' path). Used, like -w, "
+             "to substitute into caster_scores' path segment when explicitly "
+             "passed. A value with a decimal point (e.g. 1.0) is a ratio of "
+             "each combo's -w value, resolved per-combo like caster.py's own "
+             "-s (1.0 -> that window's own non-overlapping step); a whole "
+             "value (e.g. 1000, 1k) is a literal step. Multiple space-separated "
+             "values run one phlag run per value (cartesian product with -w "
+             "if it also has multiple values); omitted -w keeps "
+             "caster_scores' own window."
+    )
+
+    parser.add_argument(
+        "--agg",
+        dest="agg",
+        type=int_or_abbrev,
+        default=None,
+        help="Pool flagged (Alt-state) windows into buckets of this many "
+             "consecutive windows and draw the counts as a histogram panel "
+             "under the states plot in states.png (requires --plot states; "
+             "omitted = no histogram; unrelated to -s/--step-size)."
     )
 
     hmm_group = parser.add_argument_group("HMM parameters")
@@ -1899,9 +2114,10 @@ def build_parser():
              "not meant to be passed by hand. When set, report.tsv is written as a "
              "flat '<output-base>/<pattern>.tsv' file instead of the default "
              "'<pattern>/report.tsv', and the output root is the shared canonical "
-             "tree (default: off, writes report.tsv + plots to "
-             "<repo_root>/out/w<W>_s<S>/<node_name>/ instead of the shared tree, for "
-             "standalone use, alongside caster.py's scores.tsv for that node).",
+             "tree (default: off, writes report.tsv + plots to <repo_root>/out/"
+             "<category>/<subcategory>/<node_name>/<pattern>/w<W>_s<S>[/variant]/<dist_type>"
+             "[/rho..._beta.../var2x/repulsion/annealing/lam...]/ instead of the "
+             "shared tree, for standalone use).",
     )
     hmm_group.add_argument(
         "-t",
@@ -1969,13 +2185,18 @@ def parse_arguments(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.plot == []:
+        # Bare "--plot" (no choices given): plot everything, same as
+        # caster.py's own --plot (see phlag/caster.py's main()).
+        args.plot = ["em", "states", "relerr"]
+
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
     data_dir = get_data_dir()
 
     dist_type = getattr(args, "model_design", "gaussian")
 
-    def resolve_model_scores(target_name=None):
+    def resolve_model_scores(target_name=None, return_all=False):
         from .utils import get_phlag_output_base
         # Canonical bases (--bench's shared tree) key scores.tsv under a
         # 'caster' ancestor directory, so candidates there are filtered on
@@ -2047,10 +2268,54 @@ def parse_arguments(argv=None):
                     if is_score_candidate(sfile):
                         add(flat_candidates, sfile)
 
+        # return_all: every candidate (flat pool first, newest-first within
+        # each pool), for resolve_sibling_scores below to verify by content
+        # (recover_source_fasta) rather than trust the newest mtime blindly.
+        all_matches = []
         for candidates in (flat_candidates, canonical_candidates):
             if candidates:
                 candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                return candidates[0].resolve()
+                if return_all:
+                    all_matches.extend(candidates)
+                else:
+                    return candidates[0].resolve()
+        return all_matches if return_all else None
+
+    def resolve_sibling_scores(fasta_path):
+        """
+        Given a raw source FASTA (not caster's own scores.tsv/chunk_scores.tsv
+        output), locates the scores.tsv caster.py already produced from it --
+        so phlag can be pointed at the same FASTA path caster.py itself
+        takes, instead of requiring the caller to separately locate caster's
+        output first. Derives the same node-name directory caster.py's
+        standalone out/ tree and the canonical store/caster/ tree key
+        scores.tsv under (get_default_out_dir above resolves the reverse
+        direction the same way), searches under it via resolve_model_scores,
+        then cross-checks each candidate's own recorded source FASTA
+        (recover_source_fasta, the 'file' column's first data row) against
+        fasta_path -- multiple patterns/window-step combos can share one
+        node directory, so matching the directory alone isn't proof it's
+        the same source file. Returns the most recently modified verified
+        match (mirrors -r's own convention), or None if caster hasn't been
+        run on this FASTA yet.
+        """
+        from .utils import parse_filename_to_dir_structure, get_short_sim_name, get_simulation_node_name
+        from .caster import recover_source_fasta
+
+        parsed = parse_filename_to_dir_structure(fasta_path.stem)
+        if parsed:
+            node_name = get_short_sim_name(parsed["alt"])
+        else:
+            node_name = get_simulation_node_name(fasta_path) or fasta_path.stem
+
+        fasta_resolved = fasta_path.resolve()
+        for candidate in resolve_model_scores(target_name=node_name, return_all=True):
+            try:
+                src = recover_source_fasta(candidate)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if src is not None and src.resolve() == fasta_resolved:
+                return candidate.resolve()
         return None
 
     if args.recent or args.caster_scores == pathlib.Path("-r") or args.caster_scores is None:
@@ -2068,7 +2333,18 @@ def parse_arguments(argv=None):
         args.caster_scores = recent_file
     else:
         resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
-        if resolved.exists() and resolved.is_file():
+        if resolved.exists() and resolved.is_file() and resolved.suffix.lower() in (".fa", ".fasta", ".fna"):
+            # A raw source FASTA (what caster.py itself takes) rather than
+            # caster's own scores.tsv output -- locate the sibling scores.tsv
+            # it already produced (see resolve_sibling_scores) instead of
+            # erroring out later at -w/-s substitution (which needs an
+            # existing 'w<...>_s<...>' path segment a raw FASTA never has).
+            sibling = resolve_sibling_scores(resolved)
+            if sibling is None:
+                sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv found for it yet -- run caster.py on it first.")
+            print(f"'{resolved}' is a FASTA file -- using its sibling scores: {sibling}")
+            args.caster_scores = sibling
+        elif resolved.exists() and resolved.is_file():
             args.caster_scores = resolved
         else:
             sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
@@ -2085,18 +2361,10 @@ def parse_arguments(argv=None):
                 args.step_size = int_or_abbrev(m.group(1))
                 break
 
-    # Check if --plot is supplied
-    check_argv = argv if argv is not None else sys.argv[1:]
-    plot_supplied = any(arg == "--plot" or arg.startswith("--plot=") for arg in check_argv)
-    if plot_supplied and args.step_size is None:
-        parser.error("argument -s/--step-size is required if --plot is supplied")
-
     return args
 
 
-def main(argv=None):
-    args = parse_arguments(argv)
-
+def _run_single(args):
     if not args.bench:
         flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
         print(f"[phlag] Effective flags: {flags_str}")
@@ -2108,6 +2376,52 @@ def main(argv=None):
 
     if args.plot and "em" in args.plot:
         PhlagPlotter(phlag)
+
+    return phlag.output_file
+
+
+def main(argv=None):
+    args = parse_arguments(argv)
+
+    window_sizes = args.window_size
+    step_sizes = args.step_size
+    batch_w = window_sizes is not None
+    batch_s = isinstance(step_sizes, list)
+
+    if batch_w or batch_s:
+        import copy
+        import itertools
+        from .caster import parse_ws_from_path, substitute_ws_in_path
+
+        base_path = pathlib.Path(args.caster_scores)
+        ws = parse_ws_from_path(base_path)
+        if ws is None:
+            sys.exit(f"Error: -w/-s requires a 'w<...>_s<...>'/'c<...>_s<...>' "
+                      f"path segment in '{base_path}' to substitute into, none found.")
+        orig_val = ws[1]
+
+        w_list = window_sizes if batch_w else [orig_val]
+        # Omitted -s defaults to ratio 1.0 (non-overlapping, step==that combo's
+        # own -w) rather than reusing caster_scores' own literal step -- the
+        # standard sweep convention (see feedback_standard_window_sizes) pairs
+        # step with window per size, not one fixed absolute step across sizes.
+        s_list = step_sizes if batch_s else [1.0]
+
+        results = []
+        for w, s in itertools.product(w_list, s_list):
+            step = s if isinstance(s, int) else max(1, round(s * w))
+            new_path = substitute_ws_in_path(base_path, w, step)
+            if not new_path.exists():
+                sys.exit(f"Error: no scores file found at '{new_path}' for -w {w} -s {s} (step={step}).")
+            print(f"[phlag] -w/-s batch -- running w={w} s={step} ({new_path})...")
+            run_args = copy.copy(args)
+            run_args.caster_scores = new_path
+            run_args.window_size = w
+            run_args.step_size = step
+            results.append(_run_single(run_args))
+        return results
+
+    return _run_single(args)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,40 @@
+/home/iang/.local/share/mamba/envs/phlag/bin/phlag -r
+Clade: N/A
+Branch length (CU): N/A
+Height (Ngen): N/A
+Clade size: N/A
+Anomaly fraction: 0.25 (60/240 windows)
+Label polarity flipped for evaluation: False
+Caster source mtime: 1788074478.154238
+Phlag source mtime: 1788073747.104816
+State divergence: 1044.281982421875
+em_hd: 0.338
+Outer EM iterations: 10
+Inner EM iterations: 5
+Ground truth transition matrix (Null row): [0.99441, 0.0055866]
+Ground truth transition matrix (Alt row): [0.016667, 0.98333]
+Viterbi path transition matrix (Null row): [0.99444, 0.0055556]
+Viterbi path transition matrix (Alt row): [0.016949, 0.98305]
+Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
+Final transition matrix (after EM): [[0.994, 0.006], [0.018, 0.982]]
+EM final joint log-likelihood: -4185
+BIC: 8534 (log-likelihood=-4185, k=30 trainable params, n=240 windows)
+TPR: 0.983, FPR: 0, Precision: 1, F1: 0.992, Accuracy: 0.996, ROC-AUC: 1
+Topology	State	Statistic	Fitted	GroundTruth	Rel.err
+ABBA	Null	mean	4291	4291	0
+ABBA	Null	std	641.846	642.569	-0.001
+ABBA	Alt	mean	5335	5329	0.001
+ABBA	Alt	std	656.713	659.745	-0.005
+BABA	Null	mean	16.572	16.522	0.003
+BABA	Null	std	30.2	30.268	-0.002
+BABA	Alt	mean	10.804	10.986	-0.017
+BABA	Alt	std	23.29	23.104	0.008
+AABB	Null	mean	19.628	19.802	-0.009
+AABB	Null	std	31.193	31.147	0.001
+AABB	Alt	mean	12.217	11.734	0.041
+AABB	Alt	std	25.556	25.604	-0.002
+em_gt_hd: 0.335
+Path 1 final joint log-likelihood: -4186
+--- Bookkeeping ---
+Confusion: TP=59 FP=0 FN=1 TN=180
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0

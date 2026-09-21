@@ -12,5 +12,12 @@ run_job() {
   fi
 }
 export -f run_job
+
+# outer_jobs (one per script.sh line, all run at once) times each one's own
+# inner worker count (PHLAG_BENCH_JOBS, read by bench/benchmark.py's
+# inner_worker_cap(), which enforces the actual TOTAL_CORE_BUDGET=50) stays
+# <= that budget -- no argument needed.
+outer_jobs=$(grep -c '^benchmark' bench/script.sh)
+export PHLAG_BENCH_JOBS="$outer_jobs"
 grep '^benchmark' bench/script.sh | sed 's/;$//' | \
-  xargs -P "$1" -I CMD env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 bash -c 'run_job "CMD"'
+  xargs -P "$outer_jobs" -I CMD env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 bash -c 'run_job "CMD"'

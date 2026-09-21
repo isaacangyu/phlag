@@ -177,8 +177,17 @@ def gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2):
     return jnp.exp(log_coef - 0.125 * quad)
 
 
+def emission_norm_str(params):
+    means = params.emissions.means
+    covs = params.emissions.covariances
+    mn = jnp.linalg.norm(means.reshape(means.shape[0], -1), axis=1)
+    cn = jnp.linalg.norm(covs.reshape(covs.shape[0], -1), axis=1)
+    return f"Null |mean|={mn[0]:.4g} |cov|={cn[0]:.4g}, Alt |mean|={mn[1]:.4g} |cov|={cn[1]:.4g}"
+
+
 def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
-    return 1.0 - gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
+    bc = gaussian_bhattacharyya_coefficient(mu1, Sigma1, mu2, Sigma2)
+    return jnp.maximum(1.0 - bc, 0.0)
 
 
 class ParamsGMMHMMEmissions(NamedTuple):
@@ -1064,7 +1073,7 @@ class PhlagHMM(HMM):
             if verbose:
                 tm = params.transitions.transition_matrix
                 tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
-                print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str}")
+                print(f"EM iteration {step + 1}/{num_iters} - Transition matrix: {tm_str} - {emission_norm_str(params)}")
 
         # Gradient clip diagnostics only exist for gaussian/REPULSION fits --
         # PhlagGMMHMMEmissions.m_step passes emissions_m_step_state through

@@ -1,0 +1,40 @@
+/home/iang/.local/share/mamba/envs/phlag/bin/phlag -r
+Clade: N/A
+Branch length (CU): N/A
+Height (Ngen): N/A
+Clade size: N/A
+Anomaly fraction: 0.253 (19/75 windows)
+Label polarity flipped for evaluation: False
+Caster source mtime: 1787550763.262926
+Phlag source mtime: 1787551686.081370
+State divergence: 1583162.125
+EM divergence (Hellinger^2): 0.615
+Outer EM iterations: 10
+Inner EM iterations: 5
+Ground truth transition matrix (Null row): [0.98182, 0.018182]
+Ground truth transition matrix (Alt row): [0.052632, 0.94737]
+Viterbi path transition matrix (Null row): [0.98148, 0.018519]
+Viterbi path transition matrix (Alt row): [0.05, 0.95]
+Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
+Final transition matrix (after EM): [[0.981, 0.019], [0.053, 0.947]]
+EM final joint log-likelihood: -3329
+BIC: 6787 (log-likelihood=-3329, k=30 trainable params, n=75 windows)
+TPR: 1, FPR: 0.018, Precision: 0.95, F1: 0.974, Accuracy: 0.987, ROC-AUC: 0.999
+Topology	State	Statistic	Fitted	GroundTruth	Rel.err
+ABBA	Null	mean	4788564	4763094	0.005
+ABBA	Null	std	680602	706139	-0.036
+ABBA	Alt	mean	4830576	4907653	-0.016
+ABBA	Alt	std	756973	677984	0.117
+BABA	Null	mean	4770668	4766862	0.001
+BABA	Null	std	726976	721938	0.007
+BABA	Alt	mean	4638834	4643746	-0.001
+BABA	Alt	std	755350	772110	-0.022
+AABB	Null	mean	5149422	5154039	-0.001
+AABB	Null	std	738365	733460	0.007
+AABB	Alt	mean	6726526	6788351	-0.009
+AABB	Alt	std	848839	818684	0.037
+Ground truth EM divergence (Hellinger^2): 0.595
+Path 1 final joint log-likelihood: -3329
+--- Bookkeeping ---
+Confusion: TP=19 FP=1 FN=0 TN=55
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0

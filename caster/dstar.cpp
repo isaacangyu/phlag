@@ -236,8 +236,8 @@ public:
                 pos += line.size();
             }
         }
-        if (header) fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
-        else cerr << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\n";
+        if (header) fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\tSiteCnt\n";
+        else cerr << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tD*\tQuartetCnt\tSiteCnt\n";
 
         // Diagnostic-only companion output: per-window quartet counts (each
         // site's raw per-site score classified zero/negative/positive by
@@ -281,7 +281,7 @@ public:
                     c3z += counts3[i][0]; c3n += counts3[i][1]; c3p += counts3[i][2];
                 }
             }
-            fout << input << "\t" << pos << "\t" << sum1 << "\t" << sum2 << "\t" << sum3 << "\t" << (sum1 - sum2) / (sum1 + sum2 + sum3) << "\t" << qcnt << endl;
+            fout << input << "\t" << pos << "\t" << sum1 << "\t" << sum2 << "\t" << sum3 << "\t" << (sum1 - sum2) / (sum1 + sum2 + sum3) << "\t" << qcnt << "\t" << (end - pos) << endl;
             if (writeQuartetCounts){
                 quartetCountsOut << input << "\t" << pos << "\t" << c1z << "\t" << c1n << "\t" << c1p
                         << "\t" << c2z << "\t" << c2n << "\t" << c2p

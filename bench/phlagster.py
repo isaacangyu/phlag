@@ -279,11 +279,7 @@ def main(argv=None):
     if scores_path is None:
         sys.exit("Error: caster did not produce a scores file.")
 
-    # phlag's CLI requires -s/--step-size whenever --plot is passed at all, even
-    # with no plot names -- unused by the report itself, so any placeholder
-    # value satisfies it.
-    phlag_step_size = args.step_size if args.step_size is not None else 1000
-    phlag_plot_args = ["--plot", "-s", str(phlag_step_size)] if args.no_plots else []
+    phlag_plot_args = ["--plot"] if args.no_plots else []
     phlag_extra_args = []
     if args.null_emission_parameterization is not None:
         phlag_extra_args += ["--np", args.null_emission_parameterization]

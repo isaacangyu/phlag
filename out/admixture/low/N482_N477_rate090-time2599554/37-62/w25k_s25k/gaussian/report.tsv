@@ -1,0 +1,35 @@
+/home/iang/.local/share/mamba/envs/phlag/bin/phlag out/w25k_s25k/N482_N477_rate090-time2599554/N482_N477_rate090-time2599554.tsv -w 50 500 5k 25k -s 1.0 --plot em
+Clade: N/A
+Branch length (CU): N/A
+Height (Ngen): N/A
+Clade size: N/A
+Anomaly fraction: 0.25 (60/240 windows)
+Label polarity flipped for evaluation: True
+Caster source mtime: 1789446623.151899
+Phlag source mtime: 1789537043.958534
+Window averaging: per-site (divided by informative-site count)
+State divergence: 0.0027260647621005774
+em_hd: 0.078
+Outer EM iterations: 10
+Inner EM iterations: 5
+Ground truth transition matrix (Null row): [0.99441, 0.0055866]
+Ground truth transition matrix (Alt row): [0.016667, 0.98333]
+Viterbi path transition matrix (Null row): [1, 0]
+Viterbi path transition matrix (Alt row): [0.1, 0.9]
+Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
+Final transition matrix (after EM): [[0.872, 0.128], [1.662e-05, 1]]
+EM final joint log-likelihood: 2763
+BIC: -5362 (log-likelihood=2763, k=30 trainable params, n=240 windows)
+TPR: 0, FPR: 0.056, Precision: 0, F1: 0, Accuracy: 0.708, ROC-AUC: 0.406
+Topology	State	FittedMean	FittedStd	GTMean	GTStd	KL
+ABBA	Null	0.006	0.005	0.006	0.004	0.099
+ABBA	Alt	0.009	0.005	0.006	0.004	0.241
+BABA	Null	0.006	0.005	0.006	0.003	0.134
+BABA	Alt	0.007	0.005	0.006	0.004	0.095
+AABB	Null	0.035	0.01	0.034	0.01	0.003
+AABB	Alt	0.034	0.011	0.037	0.01	0.057
+em_gt_hd: 0.012203834472004682
+Path 1 final joint log-likelihood: 2762
+--- Bookkeeping ---
+Confusion: TP=0 FP=10 FN=60 TN=170
+1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0

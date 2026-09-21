@@ -10,6 +10,9 @@ def format_number(value):
     trailing zeros trimmed. A value whose magnitude is >= 1000 is rounded to
     a plain integer instead -- decimal precision doesn't add useful
     information at that scale for phlag's metrics/likelihoods/BIC/etc.
+    A nonzero value that would otherwise round to "0" at 3 decimals (e.g.
+    6.36e-07) is written in exponential form instead, so it stays
+    distinguishable from an actual zero.
     None/NaN/Inf/non-numeric values pass through unchanged (as their
     original type, not stringified) so callers can still distinguish a
     missing value from a formatted one.
@@ -25,7 +28,30 @@ def format_number(value):
     if abs(f) >= 1000:
         return f"{f:.0f}"
     s = f"{f:.3f}".rstrip("0").rstrip(".")
+    if s in ("", "-", "-0", "0") and f != 0:
+        return f"{f:.3e}"
     return s if s not in ("", "-", "-0") else "0"
+
+
+def format_adaptive(value, *others, min_decimals=2, max_decimals=8):
+    """
+    Formats `value` at `min_decimals` places, adding more (up to
+    `max_decimals`) only as needed to keep it distinguishable from zero (when
+    the true value is nonzero) and from each of `others` at the same
+    precision -- so a small-but-nonzero value doesn't render as "0.00", and
+    two close-but-different values (e.g. Null vs Alt fitted means) don't
+    render identically on a plot.
+    """
+    f = float(value)
+    other_vals = [float(o) for o in others if o is not None]
+    for decimals in range(min_decimals, max_decimals + 1):
+        s = f"{f:.{decimals}f}"
+        if f != 0 and float(s) == 0:
+            continue
+        if any(f"{ov:.{decimals}f}" == s for ov in other_vals):
+            continue
+        return s
+    return f"{f:.{max_decimals}f}"
 
 
 def count_lines(filepath):
@@ -165,7 +191,7 @@ def exponential_hellinger2_nd(rates1, rates2, eps=1e-12):
     """
     Squared Hellinger distance between two independent-per-dimension
     Exponential distributions, given per-dimension rate vectors. Used in
-    place of gaussian_hellinger2_nd wherever dist_type="exponential" --
+    place of gaussian_hellinger2_nd wherever dist_type="exp" --
     covers both the 1D per-topology dist-plot case (pass 1-element arrays)
     and the 3D joint gt_stats case (ABBA/BABA/AABB rates).
 
@@ -188,24 +214,87 @@ def exponential_hellinger2_nd(rates1, rates2, eps=1e-12):
     bc = float(np.prod(bc_d))
     return float(max(1.0 - bc, 0.0))
 
+def laplace_hellinger2_nd(loc1, scale1, loc2, scale2, eps=1e-12):
+    """
+    Squared Hellinger distance between two independent-per-dimension
+    Laplace (double-exponential) distributions, given per-dimension
+    loc/scale vectors. Used in place of gaussian_hellinger2_nd/
+    exponential_hellinger2_nd wherever dist_type="dexp" -- the two-sided,
+    peaked-at-the-median counterpart to "exp"'s one-sided fit, for data
+    (like raw CASTER scoreCnt() topology sums) whose empirical histogram
+    is peaked and decays on both sides rather than being cut off at a
+    left edge.
+
+    Per-dimension Bhattacharyya coefficient, closed-form (derived by
+    direct integration of sqrt(f1*f2), verified against scipy.integrate.quad
+    to ~1e-11 or better away from a1≈a2):
+        a_d = 1/scale1_d, c_d = 1/scale2_d, delta_d = |loc1_d - loc2_d|
+        p_d = exp(-0.5*a_d*delta_d), q_d = exp(-0.5*c_d*delta_d)
+        BC_d = sqrt(a_d*c_d)/2 * I_d, where
+          I_d = q_d*(2/a_d + delta_d)                          if a_d == c_d
+          I_d = 2/(a_d+c_d)*(p_d+q_d) + 2/(a_d-c_d)*(q_d-p_d)   otherwise
+    (I_d is the same-location Bhattacharyya integral 2*sqrt(scale1*scale2)/
+    (scale1+scale2) when delta_d=0, matching exponential_hellinger2_nd's
+    form in terms of rate.) Joint coefficient is the product over
+    dimensions (independence assumption), H^2 = 1 - BC. Non-positive
+    scales (undefined for a Laplace) return NaN; eps is a numerical floor
+    against exact zero/negative scales, same role as exponential_hellinger2_nd's.
+    """
+    import numpy as np
+    loc1 = np.asarray(loc1, dtype=float)
+    loc2 = np.asarray(loc2, dtype=float)
+    scale1 = np.asarray(scale1, dtype=float)
+    scale2 = np.asarray(scale2, dtype=float)
+    if np.any(scale1 <= eps) or np.any(scale2 <= eps):
+        return float("nan")
+    a = 1.0 / scale1
+    c = 1.0 / scale2
+    delta = np.abs(loc1 - loc2)
+    p = np.exp(-0.5 * a * delta)
+    q = np.exp(-0.5 * c * delta)
+    same_scale = np.abs(a - c) < 1e-9 * np.maximum(a, c)
+    safe_diff = np.where(same_scale, 1.0, a - c)  # dummy nonzero denom where unused
+    i_diff_case = 2.0 / (a + c) * (p + q) + 2.0 / safe_diff * (q - p)
+    i_same_case = q * (2.0 / a + delta)
+    i_val = np.where(same_scale, i_same_case, i_diff_case)
+    bc_d = np.sqrt(a * c) / 2.0 * i_val
+    bc = float(np.prod(bc_d))
+    return float(max(1.0 - bc, 0.0))
+
 def write_gt_stats_file(path, stats):
     """
     Writes stats (a dict with any subset of keys "Null", "Alt", "Overall",
     each an array-like (mean, covariance) pair over the 3 topology
-    dimensions, plus an optional "Hellinger2" float) as a small
-    ast.literal_eval-parseable text file, mirroring phlag.py's old
-    "Null/Alt fitted mean/covariance" bookkeeping convention so
-    read_gt_stats_file can recover it exactly. Writes nothing if stats
-    is empty.
+    dimensions, plus an optional "Hellinger2" float and an optional
+    "TransitionMatrix" 2x2 array-like -- the ground-truth Null/Alt
+    transition matrix, row-normalized by each state's own count of "from"
+    occurrences, same convention as phlag.py's fitted transition matrix)
+    as a small ast.literal_eval-parseable text file, mirroring phlag.py's
+    old "Null/Alt fitted mean/covariance" bookkeeping convention so
+    read_gt_stats_file can recover it exactly. Also writes a "<label>
+    mean norm" line (L2 norm of the mean vector) and a "<label>
+    covariance norm" line (Frobenius norm, matching bench/benchmark.py's
+    np.linalg.norm(cov_arr) computation) per label for quick eyeballing --
+    read_gt_stats_file doesn't parse either back since they're derivable
+    from the mean/covariance themselves. Writes nothing if stats is empty.
     """
     import pathlib as _pathlib
     lines = []
+    if "TransitionMatrix" in stats:
+        tm_rows = [list(float(x) for x in row) for row in stats["TransitionMatrix"]]
+        lines.append(f"TransitionMatrix: {tm_rows}")
     for label in ("Null", "Alt", "Overall"):
         if label not in stats:
             continue
         mean, cov = stats[label]
-        lines.append(f"{label} mean: {list(float(x) for x in mean)}")
-        lines.append(f"{label} covariance: {[list(float(x) for x in row) for row in cov]}")
+        mean_vals = [float(x) for x in mean]
+        lines.append(f"{label} mean: {mean_vals}")
+        mean_norm = sum(x * x for x in mean_vals) ** 0.5
+        lines.append(f"{label} mean norm: {mean_norm}")
+        cov_rows = [list(float(x) for x in row) for row in cov]
+        lines.append(f"{label} covariance: {cov_rows}")
+        cov_norm = sum(x * x for row in cov_rows for x in row) ** 0.5
+        lines.append(f"{label} covariance norm: {cov_norm}")
     if "Hellinger2" in stats:
         lines.append(f"Hellinger2: {float(stats['Hellinger2'])}")
     if lines:
@@ -215,9 +304,9 @@ def read_gt_stats_file(path):
     """
     Reads back a gt_stats.txt written by write_gt_stats_file. Returns
     {"Null": (mean, cov), "Alt": (mean, cov), "Overall": (mean, cov),
-    "Hellinger2": float} for whichever sections are present (each mean/cov
-    a plain nested list), or {} if the file doesn't exist or has no
-    parseable sections.
+    "Hellinger2": float, "TransitionMatrix": [[float, float], [float, float]]}
+    for whichever sections are present (each mean/cov a plain nested list),
+    or {} if the file doesn't exist or has no parseable sections.
     """
     import re
     import ast
@@ -227,7 +316,21 @@ def read_gt_stats_file(path):
         return {}
     means, covs = {}, {}
     hellinger2 = None
+    transition_matrix = None
     for line in p.read_text().splitlines():
+        m = re.match(r'^TransitionMatrix:\s*(\[\[.+\]\])\s*$', line)
+        if m:
+            # A cell can be the literal token "nan" (a state with no "from"
+            # occurrences), which ast.literal_eval can't parse -- pull the 4
+            # numbers out with a tolerant regex instead.
+            nums = re.findall(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?|nan', m.group(1))
+            if len(nums) == 4:
+                try:
+                    vals = [float(x) for x in nums]
+                    transition_matrix = [[vals[0], vals[1]], [vals[2], vals[3]]]
+                except ValueError:
+                    pass
+            continue
         m = re.match(r'^(Null|Alt|Overall) mean:\s*(\[.+\])\s*$', line)
         if m:
             try:
@@ -251,7 +354,59 @@ def read_gt_stats_file(path):
     result = {label: (means[label], covs[label]) for label in ("Null", "Alt", "Overall") if label in means and label in covs}
     if hellinger2 is not None:
         result["Hellinger2"] = hellinger2
+    if transition_matrix is not None:
+        result["TransitionMatrix"] = transition_matrix
     return result
+
+def collect_gt_stats(root_dir, variant_markers=("site", "ilr", "normalize")):
+    """
+    Walks root_dir for every gt_stats.txt written by caster.py's
+    write_ground_truth_stats (skipping variant_markers subtrees, e.g. the
+    nested site/ilr/normalize dirs under store/caster/), and returns one
+    row per file with every stat it records: per-topology (ABBA/BABA/AABB)
+    Null/Alt/Overall means and covariances, plus the ground-truth
+    Hellinger2 as "em_gt_hd" -- the same value phlag.py's em_gt_hd header
+    line prefers (see read_gt_stats_file). This is the single place
+    callers like bench/caster.ipynb should read caster-side ground-truth
+    stats from, rather than recomputing them or reading them back out of
+    report.tsv/runs.tsv, which can lag behind a caster-side gt_stats.txt
+    backfill until the corresponding phlag run is redone.
+
+    Expects root_dir's own canonical <category>/<subcategory>/<sim>/
+    <pattern>/gt_stats.txt layout; a gt_stats.txt shallower than that is
+    skipped. Returns an empty DataFrame if nothing matches.
+    """
+    import pandas as pd
+    import pathlib as _pathlib
+    root_dir = _pathlib.Path(root_dir)
+    rows = []
+    for f in sorted(root_dir.rglob(GT_STATS_FILENAME)):
+        rel_parts = f.relative_to(root_dir).parts
+        if any(p in variant_markers for p in rel_parts[:-1]):
+            continue
+        if len(rel_parts) < 4:
+            continue
+        category, subcategory, sim, pattern = rel_parts[:4]
+        stats = read_gt_stats_file(f)
+        if not stats:
+            continue
+        row = {
+            "path": str(f),
+            "category": category,
+            "subcategory": subcategory,
+            "sim": sim,
+            "changes": pattern,
+        }
+        for region in ("Null", "Alt", "Overall"):
+            if region in stats:
+                mean, cov = stats[region]
+                for topo, m in zip(("ABBA", "BABA", "AABB"), mean):
+                    row[f"{region.lower()}_mean_{topo}"] = m
+                row[f"{region.lower()}_cov"] = cov
+        if "Hellinger2" in stats:
+            row["em_gt_hd"] = stats["Hellinger2"]
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 def clean_locus_name(locus_str):
     """
@@ -454,6 +609,34 @@ def get_admixture_divergence_time(sim_name):
         return None
     val = float(m.group(1))
     return val / 1000000.0 if val > 1000 else val
+
+
+SIM_CATEGORY_PAIRS = {
+    ("10X", "up"), ("10X", "down"),
+    ("recombination", "up"), ("recombination", "down"),
+    ("admixture", "low"), ("admixture", "high"),
+}
+
+
+def get_phlag_param_segments(args):
+    """
+    Phlag-param directory segments, in store/phlag's order:
+    <dist_type>[/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>].
+    """
+    segments = [getattr(args, "model_design", None) or "gaussian"]
+    rho, beta = getattr(args, "rho", None), getattr(args, "beta", None)
+    if rho is not None and beta is not None:
+        segments.append(f"rho{float(rho)}_beta{float(beta)}")
+    if getattr(args, "double_variance_init", False):
+        segments.append("var2x")
+    if getattr(args, "alt_emission_parameterization", None) == "repulsion":
+        segments.append("repulsion")
+    if getattr(args, "annealing", False):
+        segments.append("annealing")
+    lam = getattr(args, "emission_lambda", None)
+    if lam not in (None, 1.0):
+        segments.append(f"lam{lam}")
+    return segments
 
 
 def get_simulation_categories(sim_name):
