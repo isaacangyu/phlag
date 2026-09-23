@@ -1,23 +1,23 @@
-/home/iang/.local/share/mamba/envs/phlag/bin/phlag out/w25k_s25k/N482_N477_rate090-time2599554/N482_N477_rate090-time2599554.tsv -w 50 500 5k 25k -s 1.0 --plot em
+/home/iang/.local/share/mamba/envs/phlag/bin/phlag out/admixture/low/N482_N477_rate090-time2599554/37-62/w5k_s5k/scores.tsv -w 100 500 1k 5k 10k 25k --plot states em
 Clade: N/A
-Branch length (CU): N/A
+Branch length (CU): N/A (not applicable for admixture)
 Height (Ngen): N/A
 Clade size: N/A
 Anomaly fraction: 0.25 (60/240 windows)
 Label polarity flipped for evaluation: True
-Caster source mtime: 1789446623.151899
-Phlag source mtime: 1789537043.958534
+Caster source mtime: 1789853412.705481
+Phlag source mtime: 1790021834.760308
 Window averaging: per-site (divided by informative-site count)
 State divergence: 0.0027260647621005774
 em_hd: 0.078
 Outer EM iterations: 10
 Inner EM iterations: 5
-Ground truth transition matrix (Null row): [0.99441, 0.0055866]
-Ground truth transition matrix (Alt row): [0.016667, 0.98333]
-Viterbi path transition matrix (Null row): [1, 0]
-Viterbi path transition matrix (Alt row): [0.1, 0.9]
+Ground truth transition matrix: [[0.99441, 0.0055866], [0.016667, 0.98333]]
+Viterbi path transition matrix (pooled): [[1, 0], [0.1, 0.9]]
+Viterbi path transition matrix (Null region): [[1, 0], [0.1, 0.9]]
+Viterbi path transition matrix (Alt region): [[1, 0], [nan, nan]]
 Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
-Final transition matrix (after EM): [[0.872, 0.128], [1.662e-05, 1]]
+Final transition matrix (after EM): [[0.87232, 0.12768], [1.6615e-05, 0.99998]]
 EM final joint log-likelihood: 2763
 BIC: -5362 (log-likelihood=2763, k=30 trainable params, n=240 windows)
 TPR: 0, FPR: 0.056, Precision: 0, F1: 0, Accuracy: 0.708, ROC-AUC: 0.406

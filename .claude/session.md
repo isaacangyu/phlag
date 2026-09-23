@@ -4,6 +4,71 @@ Shared status board for concurrent Claude sessions working in this repo. Each se
 
 ---
 
+## session-20260923-scatter-prediction-overlay
+
+**Status:** done
+**Task:** User: if `scatter.png` exists in the (non-`--bench`) experiment dir, overlay phlag's own predictions shaded in yellow, same style as the existing ground-truth shading.
+**Change:** `caster.py` `CasterPlotter` gains `predicted_intervals` (list of `(start_bp, end_bp)`) + `_shade_predicted_intervals` (yellow `#F4D03F` axvspan, mirrors `_shade_locus_pattern`'s red), called from `plot_topology_scatter` right after the ground-truth shading — overlap reads as blended color, disagreement as pure red/yellow. `phlag.py` `Phlag._predicted_alt_intervals` (static) merges contiguous Viterbi-Alt windows into bp spans (step recovered from consecutive `pos` values, not stored elsewhere on Phlag); `compute_output`, right after the states.png block, checks `not args.bench` and `<caster_scores dir>/scatter.png` exists, then re-instantiates `CasterPlotter` on the same scores.tsv with `predicted_intervals` set (only `plot_scores` runs) to overwrite it in place. Independent of `--plot`.
+**Verified:** real N276 `10X/down/37-62/w1k_s1k` scores.tsv copied to scratchpad, ran phlag end-to-end (`~/.local/share/mamba/envs/phlag/bin/python`) — scatter.png's md5/mtime changed, rendered image confirmed yellow "Predicted Alt" shading + legend entry alongside the existing red "Alt" band, blended in the overlap region. Scratchpad cleaned up after.
+
+---
+
+## session-20260923-report-tsv-replay
+
+**Status:** done
+**Task:** User: if phlag's positional arg is a relative path to an existing `report.tsv` (not scores.tsv), rerun phlag using that report's own recorded config, with this invocation's own flags taking precedence.
+**Change:** `phlag.py` `parse_arguments` — report.tsv's first line already records the exact `sys.argv` that produced it (`initialize_output`). New check right after the initial `parser.parse_args`: if `caster_scores` is relative, named `report.tsv`, and exists, `shlex.split` that first line (minus program name) as recovered tokens, strip the report.tsv positional out of this run's own raw argv as override tokens, and recurse via `parse_arguments(recovered_tokens + override_tokens)` — argparse's left-to-right store semantics (no `action="append"` flags in this parser) make later (override) tokens win over earlier (recovered) ones automatically. Absolute report.tsv paths untouched (existing behavior).
+**Verified:** real `out/10X/up/N635/37-62/w500_s500/gaussian/report.tsv` via `~/.local/share/mamba/envs/phlag/bin/python` — relative path replays the recorded `10X/up/N635/37-62 --plot -w 100 500 1k 2k 5k` invocation and resolves through the normal FASTA->sibling-scores path; new `--rho`/`--beta` passed this run land on top; absolute path to the same file falls through unchanged; a real scores.tsv path unaffected.
+
+---
+
+## session-20260922-within-window-variance
+
+**Status:** active (code done, production backfill not started)
+**Task:** Add within-window mean/variance (site-level spread inside one window, distinct from gt_stats' existing between-window covariance) to gt_stats.txt/runs.tsv/report.tsv; new aggregate cra.plot cell in caster.ipynb mirroring the existing per-topology-means-by-window-size figure; confirm per-window-average vs pooled-average equivalence.
+**Change:** `caster.py` `write_ground_truth_stats` buckets the sibling non-overlapping w1_s1 (per-site) scores.tsv by `pos // window` (mirrors the notebook's existing `topology_variance_within_window`) into `<Label>WithinMean`/`<Label>WithinVariance` (only for `w<...>_s<...>` with step==window). Round-tripped via `write_gt_stats_file`/`read_gt_stats_file`/`collect_gt_stats` (phlag/utils.py), `_out_gt_stats_columns` (bench/utils.py, out/ tree), and `RunRecord`/`RUN_COLUMNS`/`TOPO_WITHIN_COLUMNS` (bench/benchmark.py, store tree). `phlag.py` report.tsv gets new within-window mean/variance lines per label (Overall = "total stats by averaging").
+**Verified:** real N635 10X/up 37-62 data (scratchpad output only) — mean of per-bucket means exactly equals the pooled raw-site mean (float precision); mean of per-bucket variances is close to but NOT exactly the pooled raw-site variance (law of total variance: pooled = within + between-bucket variance of means; between term ~1000x smaller here, so they nearly agree for this dataset but aren't identically equal in general). New notebook cells (10-11 aggregate, 20-21 per-run) execute cleanly against the real store tree but render empty — existing gt_stats.txt/runs.tsv predate this change and need backfill.
+**Next:** user to decide whether/how to backfill gt_stats.txt (rerun `write_ground_truth_stats` per existing scores.tsv, no caster/phlag recompute) + resummarize runs.tsv, before the new plots show real data.
+
+---
+
+## session-20260921-locus-spec
+
+**Status:** done
+**Task:** caster/phlag/phlagster accept `<category>/<sub>/<node>/<pattern>` (e.g. `recombination/down/N564/37-62`).
+**Change:** `utils.resolve_locus_spec` -> `<sims root>/<cat>/<sub>/<node dir>/concat/<pattern>.fa` (node = full dir name, short name, or leading token). Hooked into `caster.main` (before regen check) and phlag `main` (before `resolve_input_file`, then existing FASTA->sibling-scores path); phlagster inherits via caster.
+**Verified:** all three at `-w 2k` on N564/37-62 (dir removed after); a live user phlagster run was writing other windows there, untouched.
+
+---
+
+## session-20260921-phlagster-ws
+
+**Status:** done
+**Task:** phlagster accepts scores.tsv + multi `-w`/`-s`.
+**Change:** `bench/phlagster.py`: `-w`/`-s` now `nargs="+"` (`-s` uses `step_size_or_fraction`), forwarded to caster's cartesian loop; phlag then runs on each returned scores path. `.tsv` input with no `-w`/`-s` skips caster, runs phlag as-is; with `-w`/`-s`, caster regen recomputes from the source FASTA.
+**Verified:** stubbed caster/phlag dispatch only (no real run, to avoid writing to `out/`).
+
+---
+
+## session-20260921-em-kde
+
+**Status:** done
+**Task:** em.png: KDE (smooth curve) instead of histograms.
+**Change:** `phlag.py` `PhlagPlotter._plot_kde` (seaborn `kdeplot`, clipped to plot range, skipped if <2 pts/zero spread) replaces both rows' `histplot`s; legend now "Null/Alt KDE"; dead `_compute_bin_edges` and `bin_edges` params removed.
+**Update:** KDE lines dashed, Null light blue `#7CC4F2` / Alt orange `#FF9F1C` (`colors[..]["kde"]`); fits keep steel blue/coral.
+**Update:** em.png "After EM" row now honors the Viterbi/Hamming flip: `Phlag.flipped_for_eval` (set in `compute_output`) -> `_plot_em_row` swaps state indices for KDE split + fitted curves. Checked on N276 w250k_s200k (flipped=True).
+**Verified:** N276 w1k_s1k, `-o` scratchpad, `--plot em`.
+
+---
+
+## session-20260921-squash-for-push
+
+**Status:** done, push pending (no credentials in this shell)
+**Task:** Push out/ PNGs and new work but no scores.tsv/quartet_counts.tsv, without the old commits.
+**Change:** squashed the 6 local commits since `52c1697` into `82fe225` (tree identical to old HEAD, 0 scores/quartet tsv). Old history kept on local branch `backup-all-commits` (contains the tsv blobs; don't push it).
+
+---
+
 ## session-20260920-partial-push
 
 **Status:** blocked on credentials
@@ -204,3 +269,53 @@ Could not render-test locally (no matplotlib in this shell, same limitation as t
 **Task:** Null/Alt-region + pooled transition matrices in report.tsv.
 **Change:** `phlag.py` adds Viterbi-path matrices counted only over window pairs inside GT Null / Alt region; existing Viterbi line relabeled `(pooled)`. GT-label matrices unchanged (region-split would be trivial).
 **Verified:** N635 w1k_s1k, `-o` scratchpad.
+
+---
+
+## session-20260921-transition-matrix-points
+
+**Status:** done
+**Task:** One transition matrix per report line; states.png as points.
+**Change:** `phlag.py` `_append_transition_rows` writes `label: [[a, b], [c, d]]` (was separate Null/Alt row lines). states.png: Viterbi paths plotted as dots, ground truth as x (under paths), no step interpolation. `bench/benchmark.py` `_RE_TRANSITION_MATRIX` now parses GT/Viterbi (pooled)/Final matrix lines (old row-form regex kept for archived reports).
+**Verified:** w5k_s5k, `-o` scratchpad; parse_report yields gt_/viterbi_/transition_ keys.
+
+---
+
+## session-20260921-em-window-counts
+
+**Status:** done
+**Task:** em.png: print Alt/Null window counts left of legend.
+**Change:** `phlag.py` `_finalize_legend` returns the legend; new `PhlagPlotter._annotate_state_counts` writes `$N_a$ (Alt)` / `$N_b$ (Null)` for ground truth (if available) and After EM (flip-aware), right-aligned at the legend's left edge.
+**Verified:** w5k_s5k admixture, `-o` scratchpad.
+
+---
+
+## session-20260922-fisher-skewness
+
+**Status:** done
+**Task:** Compute Fisher's skewness metric, output in gt_stats and report.
+**Change:** `caster.py` `write_ground_truth_stats` computes per-topology (ABBA/BABA/AABB) Fisher-Pearson skewness (`scipy.stats.skew`, `bias=True`, g1=m3/m2^1.5) for Null/Alt/Overall, stored as `"<label>Skewness"` in the stats dict. `utils.py`: `write_gt_stats_file` writes `"<label> skewness: [...]"` lines after each label's covariance norm; `read_gt_stats_file` parses them back as `result["<label>Skewness"]`; `collect_gt_stats` adds `<region>_skew_<topo>` columns. `phlag.py`'s `compute_output` reads gt_stats.txt's skewness (same "prefer caster's file" convention as em_gt_hd) and appends `"<label> skewness (ABBA, BABA, AABB): [...]"` lines to report.tsv, gated on `self.ground_truth_fits` (same block as the other gt_stats-derived lines).
+**Verified:** real run on `out/10X/down/N276/37-62/w1k_s1k/scores.tsv` copied to scratchpad (`-o` scratchpad, not touching `out/`) — gt_stats.txt round-trips through `read_gt_stats_file`, `collect_gt_stats` produces the 9 skew columns, report.tsv shows matching skewness lines.
+**Next:** not wired into `bench/benchmark.py`'s `RunRecord`/runs.tsv (only gt_stats.txt + report.tsv were asked for) — flag if runs.tsv-level skewness columns are wanted later.
+
+---
+
+## session-20260921-em-rows-swap
+
+**Status:** done
+**Task:** em.png rows: top = KDEs, bottom = fits; GT dashed/light, EM solid/dark.
+**Change:** `phlag.py` `_plot_kde_row` (GT KDE `colors[..]['kde']` dashed + HMM-assigned KDE `['line']` solid) and `_plot_fit_row`/`_draw_fit` (GT or GMM-seed fit dashed/light, EM fit solid/dark; GT labels at lower y). Old `_plot_ground_truth_row`/`_plot_gmm_init_row`/`_plot_em_row` removed. Legend 2 columns in em.png. Fit-row μ/σ labels and mean/±σ lines removed.
+**Verified:** w5k_s5k gaussian, `-o` scratchpad; gmm path not run.
+
+---
+
+## session-20260922-em-autolog
+
+**Status:** done
+**Task:** em.png: auto log scale, same heuristic as scatter.png.
+**Change:** `phlag.py` new `PhlagPlotter._apply_log_scales`, called after both rows are drawn in `plot_distributions`. Reuses `CasterPlotter._needs_log_scale` (imported from `.caster`) independently per axis per topology column: x off raw `Y[:,d]` scores (shared by both rows), y off the actual drawn line y-data (KDE + fit curves) in that column. Symlog (linthresh=1e-9, matching scatter's NOISE_FLOOR) when negatives present, else plain log.
+**Verified:** N564 recombination/down w1k_s1k gaussian, `-o` scratchpad, `~/micromamba/envs/phlag/bin/python`; em.png now shows y in log (density spans 1e-5 to 1e2) and x in symlog (scores straddle 0).
+**Update:** `LOG_SCALE_RATIO_THRESHOLD=1000.0` (10x `_needs_log_scale`'s 100x default) for em.png's x/y calls only, other callers untouched -- default was flagging nearly every column, cluttering symlog ticks. New `_separate_overlapping_lines` (called per-axis after both rows draw, before log scaling): when a dashed (GT/seed) line coincides with its solid (EM) counterpart within 0.1% relative, multiplicatively nudges the dashed one's y by 2% so both colors stay visible (additive would've been invisible at the peak or swamped the tails on log-y).
+**Verified:** N564 w1k_s1k (linear x now, threshold fix confirmed) and N635 10X/up w5k_s5k (ROC-AUC=1, near-perfect GT/EM overlap) -- cropped AABB Fit panel shows light-blue/orange dashed GT lines as distinct thin traces beside the solid EM fits instead of fully hidden.
+**Bugfix (user report: "blue dashed line not showing up" on real out/10X/down/N276/37-62/w1k_s1k/gaussian/em.png):** two bugs. (1) `_separate_overlapping_lines` only compared dashed-vs-solid pairs -- missed Null GT Fit (light blue dashed) fully hidden under Alt GT Fit (orange dashed, drawn second) when both ground-truth fits land on near-identical mu/sigma for a topology; now compares every line pair and nudges whichever was drawn earlier (lower zorder). (2) coincidence was judged by linear relative difference (`rel_tol=1e-3` of peak) and the offset was `value * (1+0.02)` -- both wrong for a 50+-decade log axis: debug-verified real reldiff for the hidden pair was 1-3% (10-30x over tol, so it never even triggered), and even forcing it, a 2% *value*-relative shift is ~0.01 decades, sub-pixel against a ~56-decade span. Fixed: coincidence on a log/symlog axis is now judged by max decade gap (`decade_tol=1.0`, i.e. curves within 1 order of magnitude everywhere -- linear rel_tol kept only for non-log axes), and the offset is sized as `offset_frac` (2%) of the axis' own visible decade span (or linear span), so it's the same few-pixel gap regardless of how many decades the panel covers. Order fixed too: `_separate_overlapping_lines` must run after `_apply_log_scales` now (needs the final scale to size the offset).
+**Verified:** debug-printed real reldiff/decdiff for all 6 line pairs across N276 w1k_s1k's 3 Fit panels before fixing (confirmed the miss: ABBA/BABA Null-vs-Alt GT pairs at decdiff 0.2-0.4 decades, everything else 2.9-55 decades); after the fix, re-ran against the same real input (`-o` scratchpad) -- Null GT Fit now visibly separated from Alt GT Fit in all 3 Fit panels, and the N635 AABB re-check still shows clean separation (no regression).

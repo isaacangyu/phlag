@@ -919,7 +919,7 @@ class CrossRunAnalysis:
         df = collect_out_runs(path, exclude_keywords)
         if df.empty:
             raise FileNotFoundError(f"No report.tsv found under {path}")
-        df, skipped = _filter_out_runs(df, axes)
+        df, _ = _filter_out_runs(df, axes)
         if df.empty:
             raise ValueError(f"No report under {path} matches {axes}")
         panels = [(m,) if isinstance(m, str) else tuple(m) for m in metrics]
@@ -968,7 +968,7 @@ class CrossRunAnalysis:
             labels += list(widest)
         if len(handles) > 1:
             fig.legend(handles, labels, loc="lower center", ncol=min(len(handles), 4), fontsize=7, frameon=False)
-        fig.suptitle(title or _path_after_out(path) + (f" (not in path, unfiltered: {', '.join(skipped)})" if skipped else ""), fontsize=9)
+        fig.suptitle(title or _path_after_out(path), fontsize=9)
         fig.tight_layout(rect=[0, 0.08 if len(handles) > 1 else 0, 1, 0.95])
         plt.show()
         return fig
@@ -983,8 +983,8 @@ class CrossRunAnalysis:
         (dist/variant/rho_beta/...), one subplot per `metrics` element (a
         tuple overlays its members, e.g. ("gt_transition_null_to_alt",
         "fitted_transition_null_to_alt")). An axes value may be a list (any
-        of); flags the out/ path doesn't encode (--np, ...) are skipped and
-        named in the figure's title. Pass {} to keep every report.
+        of); flags the out/ path doesn't encode (--np, ...) are skipped.
+        Pass {} to keep every report.
         `exclude_keywords` drops report paths containing any keyword; `logy`
         log-scales y; agg/grid_by/plot_type don't apply. Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
         (see its docstring, including its "" placeholder and tuple-axis
@@ -2146,6 +2146,8 @@ _OUT_GT_STATS_COLUMNS = [
         + [f"mean_{t}" for t in TOPOLOGY_NAMES]
         + [f"var_{t}" for t in TOPOLOGY_NAMES]
         + [f"cov_{TOPOLOGY_NAMES[i]}_{TOPOLOGY_NAMES[j]}" for i in range(3) for j in range(i + 1, 3)]
+        + [f"within_mean_{t}" for t in TOPOLOGY_NAMES]
+        + [f"within_var_{t}" for t in TOPOLOGY_NAMES]
     )
 ]
 _OUT_SIZE_SEGMENT = re.compile(r"^([wc])\d+[km]?_s\d+[km]?(.*)$", re.IGNORECASE)
@@ -2234,8 +2236,8 @@ def _filter_out_runs(df, axes):
 
 
 def _out_gt_stats_columns(report):
-    """null_/alt_/pooled_ mean/var/cov(_norm) columns, named as in store
-    runs.tsv (benchmark.py's summarize), from the gt_stats.txt caster wrote
+    """null_/alt_/pooled_ mean/var/cov(_norm)/within_mean/within_var columns,
+    named as in store runs.tsv (benchmark.py's summarize), from the gt_stats.txt caster wrote
     next to the report's scores.tsv -- the nearest one walking up from the
     report, since phlag's own dist/rho_beta/... dirs sit below the size dir.
     Empty if none is found."""
@@ -2258,6 +2260,13 @@ def _out_gt_stats_columns(report):
             out[f"{prefix}_var_{ti}"] = float(cov[i, i])
             for j in range(i + 1, 3):
                 out[f"{prefix}_cov_{ti}_{TOPOLOGY_NAMES[j]}"] = float(cov[i, j])
+        within_mean, within_var = stats.get(f"{label}WithinMean"), stats.get(f"{label}WithinVariance")
+        if within_mean is not None:
+            for ti, v in zip(TOPOLOGY_NAMES, within_mean):
+                out[f"{prefix}_within_mean_{ti}"] = float(v)
+        if within_var is not None:
+            for ti, v in zip(TOPOLOGY_NAMES, within_var):
+                out[f"{prefix}_within_var_{ti}"] = float(v)
     return out
 
 

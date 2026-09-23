@@ -1,6 +1,7 @@
 import time
 import argparse
 import math
+import re
 
 from functools import wraps
 
@@ -276,7 +277,15 @@ def write_gt_stats_file(path, stats):
     covariance norm" line (Frobenius norm, matching bench/benchmark.py's
     np.linalg.norm(cov_arr) computation) per label for quick eyeballing --
     read_gt_stats_file doesn't parse either back since they're derivable
-    from the mean/covariance themselves. Writes nothing if stats is empty.
+    from the mean/covariance themselves. An optional "<label>Skewness"
+    key (per-topology Fisher-Pearson skewness, ABBA/BABA/AABB order) is
+    written as a "<label> skewness" line right after that label's
+    covariance norm, for whichever labels have it. Optional "<label>
+    WithinMean"/"<label>WithinVariance" keys (per-topology mean/variance
+    of the raw per-site scores WITHIN each window, averaged across that
+    label's windows -- distinct from the BETWEEN-window mean/covariance
+    above) are written as "<label> within mean"/"<label> within variance"
+    lines. Writes nothing if stats is empty.
     """
     import pathlib as _pathlib
     lines = []
@@ -295,6 +304,15 @@ def write_gt_stats_file(path, stats):
         lines.append(f"{label} covariance: {cov_rows}")
         cov_norm = sum(x * x for row in cov_rows for x in row) ** 0.5
         lines.append(f"{label} covariance norm: {cov_norm}")
+        skew_key = f"{label}Skewness"
+        if skew_key in stats:
+            skew_vals = [float(x) for x in stats[skew_key]]
+            lines.append(f"{label} skewness: {skew_vals}")
+        within_mean_key, within_var_key = f"{label}WithinMean", f"{label}WithinVariance"
+        if within_mean_key in stats:
+            lines.append(f"{label} within mean: {[float(x) for x in stats[within_mean_key]]}")
+        if within_var_key in stats:
+            lines.append(f"{label} within variance: {[float(x) for x in stats[within_var_key]]}")
     if "Hellinger2" in stats:
         lines.append(f"Hellinger2: {float(stats['Hellinger2'])}")
     if lines:
@@ -304,7 +322,9 @@ def read_gt_stats_file(path):
     """
     Reads back a gt_stats.txt written by write_gt_stats_file. Returns
     {"Null": (mean, cov), "Alt": (mean, cov), "Overall": (mean, cov),
-    "Hellinger2": float, "TransitionMatrix": [[float, float], [float, float]]}
+    "Hellinger2": float, "TransitionMatrix": [[float, float], [float, float]],
+    "NullSkewness"/"AltSkewness"/"OverallSkewness": [float, float, float],
+    "<label>WithinMean"/"<label>WithinVariance": [float, float, float]}
     for whichever sections are present (each mean/cov a plain nested list),
     or {} if the file doesn't exist or has no parseable sections.
     """
@@ -314,7 +334,8 @@ def read_gt_stats_file(path):
     p = _pathlib.Path(path)
     if not p.exists():
         return {}
-    means, covs = {}, {}
+    means, covs, skews = {}, {}, {}
+    within_means, within_vars = {}, {}
     hellinger2 = None
     transition_matrix = None
     for line in p.read_text().splitlines():
@@ -345,6 +366,27 @@ def read_gt_stats_file(path):
             except (ValueError, SyntaxError):
                 pass
             continue
+        m = re.match(r'^(Null|Alt|Overall) skewness:\s*(\[.+\])\s*$', line)
+        if m:
+            try:
+                skews[m.group(1)] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+            continue
+        m = re.match(r'^(Null|Alt|Overall) within mean:\s*(\[.+\])\s*$', line)
+        if m:
+            try:
+                within_means[m.group(1)] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+            continue
+        m = re.match(r'^(Null|Alt|Overall) within variance:\s*(\[.+\])\s*$', line)
+        if m:
+            try:
+                within_vars[m.group(1)] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+            continue
         m = re.match(r'^Hellinger2:\s*([-\d.eE+]+)\s*$', line)
         if m:
             try:
@@ -352,6 +394,13 @@ def read_gt_stats_file(path):
             except ValueError:
                 pass
     result = {label: (means[label], covs[label]) for label in ("Null", "Alt", "Overall") if label in means and label in covs}
+    for label in ("Null", "Alt", "Overall"):
+        if label in skews:
+            result[f"{label}Skewness"] = skews[label]
+        if label in within_means:
+            result[f"{label}WithinMean"] = within_means[label]
+        if label in within_vars:
+            result[f"{label}WithinVariance"] = within_vars[label]
     if hellinger2 is not None:
         result["Hellinger2"] = hellinger2
     if transition_matrix is not None:
@@ -364,7 +413,9 @@ def collect_gt_stats(root_dir, variant_markers=("site", "ilr", "normalize")):
     write_ground_truth_stats (skipping variant_markers subtrees, e.g. the
     nested site/ilr/normalize dirs under store/caster/), and returns one
     row per file with every stat it records: per-topology (ABBA/BABA/AABB)
-    Null/Alt/Overall means and covariances, plus the ground-truth
+    Null/Alt/Overall means, covariances, Fisher-Pearson skewness
+    (as "<region>_skew_<topo>"), and within-window mean/variance (as
+    "<region>_within_mean_<topo>"/"<region>_within_var_<topo>"), plus the ground-truth
     Hellinger2 as "em_gt_hd" -- the same value phlag.py's em_gt_hd header
     line prefers (see read_gt_stats_file). This is the single place
     callers like bench/caster.ipynb should read caster-side ground-truth
@@ -403,6 +454,15 @@ def collect_gt_stats(root_dir, variant_markers=("site", "ilr", "normalize")):
                 for topo, m in zip(("ABBA", "BABA", "AABB"), mean):
                     row[f"{region.lower()}_mean_{topo}"] = m
                 row[f"{region.lower()}_cov"] = cov
+            if f"{region}Skewness" in stats:
+                for topo, s in zip(("ABBA", "BABA", "AABB"), stats[f"{region}Skewness"]):
+                    row[f"{region.lower()}_skew_{topo}"] = s
+            if f"{region}WithinMean" in stats:
+                for topo, m in zip(("ABBA", "BABA", "AABB"), stats[f"{region}WithinMean"]):
+                    row[f"{region.lower()}_within_mean_{topo}"] = m
+            if f"{region}WithinVariance" in stats:
+                for topo, v in zip(("ABBA", "BABA", "AABB"), stats[f"{region}WithinVariance"]):
+                    row[f"{region.lower()}_within_var_{topo}"] = v
         if "Hellinger2" in stats:
             row["em_gt_hd"] = stats["Hellinger2"]
         rows.append(row)
@@ -439,22 +499,46 @@ def get_short_sim_name(sim_name):
     return s
 
 
+_NODE_NAME_PATH_MODIFIERS = {
+    "site", "ilr", "normalize", "norm-eps", "gaussian", "gmm",
+    "var2x", "repulsion", "annealing",
+}
+_NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
+_NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[\d.]+_beta[\d.]+$')
+_NODE_NAME_LAM_RE = re.compile(r'^lam[\d.]+$')
+
+
+def _is_node_name_path_modifier(segment):
+    return (
+        segment in _NODE_NAME_PATH_MODIFIERS
+        or _NODE_NAME_WINDOW_RE.match(segment)
+        or _NODE_NAME_RHO_BETA_RE.match(segment)
+        or _NODE_NAME_LAM_RE.match(segment)
+    )
+
+
 def get_simulation_node_name(file_path):
     """
     Extracts the simulation directory segment (the clade/node identifier, e.g.
     'Strigiformes_N297_rate090-time7099554' or 'N555') directly from a caster/phlag
-    output path. Both scores.tsv (.../caster/.../<node_name>/<pattern>/scores.tsv,
-    caster/ base-independent and possibly many levels up) and report.tsv
-    (.../<node_name>/<pattern>/report.tsv, no phlag/ subdir) sit exactly two
-    directories below their simulation's node_name segment, a fixed offset
-    from the filename regardless of how many segments come before it.
+    output path. In the canonical, base-independent store/caster/ layout,
+    scores.tsv/report.tsv sit exactly two directories below their simulation's
+    node_name segment (.../<node_name>/<pattern>/scores.tsv), a fixed offset
+    regardless of how many segments come before it. The ad-hoc out/ tree
+    layout instead inserts w<window>_s<step>[_z] (or c<chunk>_s<step>[_z] for
+    --pair), optional site/ilr/normalize[/norm-eps], and for phlag reports
+    <dist>[/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>] between
+    <pattern> and the filename -- so instead of a fixed offset, the two
+    segments right above the filename that are NOT one of those recognized
+    modifiers are taken as (in order, walking up) the pattern and the node.
     Returns None if the path is too shallow to contain one.
     """
     import pathlib
-    parts = pathlib.Path(file_path).parts
-    if len(parts) < 3:
+    parts = pathlib.Path(file_path).parts[:-1]
+    non_modifiers = [p for p in reversed(parts) if not _is_node_name_path_modifier(p)]
+    if len(non_modifiers) < 2:
         return None
-    return clean_locus_name(parts[-3])
+    return clean_locus_name(non_modifiers[1])
 
 
 def get_simulation_clade(caster_scores_path, sim_root=None):
@@ -1122,6 +1206,43 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
                     return files[0].resolve()
 
     return path_obj
+
+
+def resolve_locus_spec(spec):
+    """
+    Resolves a '<category>/<sub>/<node>/<pattern>' locus spec (e.g.
+    'recombination/down/N564/37-62') to that simulation's concat FASTA,
+    <simulations root>/<category>/<sub>/<node dir>/concat/<pattern>.fa. <node>
+    may be the full directory name or its short form (get_short_sim_name, or
+    the leading token before the first '_'). Returns None if spec isn't of
+    that shape or no matching FASTA exists.
+    """
+    import pathlib
+    parts = pathlib.PurePath(str(spec)).parts
+    if len(parts) != 4:
+        return None
+    cat, sub, node, pattern = parts
+    roots = [get_repo_root() / "store" / "simulations", get_repo_root() / "simulations", pathlib.Path("/drive2/iang/simulations")]
+    try:
+        roots.insert(1, get_data_dir() / "simulations")
+    except Exception:
+        pass
+    for root in roots:
+        level = root / cat / sub
+        if not level.is_dir():
+            continue
+        node_dirs = sorted(
+            (d for d in level.iterdir() if d.is_dir()),
+            key=lambda d: (d.name != node, get_short_sim_name(d.name) != node, d.name.split("_")[0] != node),
+        )
+        for d in node_dirs:
+            if d.name != node and get_short_sim_name(d.name) != node and d.name.split("_")[0] != node:
+                continue
+            for ext in (".fa", ".fasta", ".fa.gz"):
+                cand = d / "concat" / f"{pattern}{ext}"
+                if cand.is_file():
+                    return cand.resolve()
+    return None
 
 
 def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefixes=None, target_dir_name=None):

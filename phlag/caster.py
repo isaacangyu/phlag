@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import norm, expon, laplace
+from scipy.stats import norm, expon, laplace, skew
 
 def format_val(val):
     """
@@ -476,12 +476,13 @@ def get_fasta_length(fasta_path):
 
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, locus_pattern=None):
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, locus_pattern=None, predicted_intervals=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
         self.topologies = topologies
         self.locus_pattern = locus_pattern
+        self.predicted_intervals = predicted_intervals
 
         os.makedirs(self.data_dir, exist_ok=True)
 
@@ -533,6 +534,7 @@ class CasterPlotter:
                 self.plot_correlation()
             if plot_quartet_counts:
                 self.plot_quartet_counts()
+                self.plot_quartet_dists()
             if plot_sums:
                 self.plot_sums()
 
@@ -613,6 +615,22 @@ class CasterPlotter:
 
                 curr_pos_bp = end_pos
             ax.axvline(x=curr_pos_bp, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
+
+    def _shade_predicted_intervals(self, ax):
+        """
+        Overlays phlag's own Viterbi-predicted Alt regions in yellow, same
+        axvspan style as _shade_locus_pattern's ground-truth shading -- set
+        by Phlag re-opening an already-plotted scatter.png (see
+        Phlag.compute_output) so agreement with the ground truth reads as
+        blended red+yellow, disagreement as pure red or pure yellow.
+        """
+        if not self.predicted_intervals:
+            return
+        shaded = False
+        for start_pos, end_pos in self.predicted_intervals:
+            lbl = 'Predicted Alt' if not shaded else None
+            ax.axvspan(start_pos, end_pos, color='#F4D03F', alpha=0.18, label=lbl)
+            shaded = True
 
     def calculate_summary_statistics(self, series):
         """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
@@ -749,18 +767,30 @@ class CasterPlotter:
         palette = self.topo_colors if set(clean_cols) <= set(self.topo_colors) else None
         sns.scatterplot(data=melted_df, x='pos', y='Score', hue='Topology', palette=palette, alpha=0.6, s=12)
 
-        if self._needs_log_scale(melted_df['Score'].to_numpy(dtype=float)):
-            # Auto-detected (see _needs_log_scale): same treatment as
-            # plot_dist/plot_sums, so a scatter of raw c*/avg* sums (which
-            # can span orders of magnitude across window sizes) doesn't
-            # squash the low end flat. Non-positive Score values (e.g. an
-            # ILR-transformed file's c*ILR1/c*ILR2, which can be negative)
-            # are simply dropped from a log axis by matplotlib rather than
-            # raising.
-            plt.gca().set_yscale('log')
+        scores = melted_df['Score'].to_numpy(dtype=float)
+        finite_scores = scores[np.isfinite(scores)]
+        abs_scores = np.abs(finite_scores)
+        if self._needs_log_scale(abs_scores):
+            # Auto-detected off magnitude (see _needs_log_scale), same
+            # treatment as plot_dist/plot_sums, so a scatter of raw c*/avg*
+            # sums (which can span orders of magnitude across window sizes)
+            # doesn't squash the low end flat. c*ABBA/c*BABA are CASTER's
+            # signed scoreCnt() evidence (not a plain count) and are
+            # genuinely negative roughly half the time -- a plain log axis
+            # silently drops those points, so switch to symlog instead
+            # whenever negatives are present, with the same NOISE_FLOOR
+            # (1e-9, see apply_normalize) as linthresh: below that, values
+            # are float cancellation residue around a "should be exactly 0"
+            # result, not real signal, so they belong in the linear zone
+            # around zero rather than stretched out over more log decades.
+            if (finite_scores < 0).any():
+                plt.gca().set_yscale('symlog', linthresh=1e-9)
+            else:
+                plt.gca().set_yscale('log')
 
         # Draw vertical split lines and shade alt regions if a ground truth pattern is known
         self._shade_locus_pattern(plt.gca())
+        self._shade_predicted_intervals(plt.gca())
 
         # Format names for cleaner legend and title
         title = f'Genomic Topology Profile: {self.gene_name}'
@@ -1024,20 +1054,24 @@ class CasterPlotter:
             return None
         return col_for_topo
 
-    def _compute_null_alt_labels(self):
+    def _compute_null_alt_labels(self, df=None):
         """
         Shared ground-truth Null/Alt per-window labeling, factored out so
         plot_topology_pairs and plot_correlation's null/alt split can reuse
         the exact same parse_pattern_string logic
         instead of re-deriving it. Returns a numpy object array of
-        'Null'/'Alt' (one per row of self.df, positional) or None if no
-        ground-truth locus pattern is resolvable.
+        'Null'/'Alt' (one per row of df, positional) or None if no
+        ground-truth locus pattern is resolvable. df defaults to self.df;
+        plot_quartet_counts passes its own quartet_counts_df instead, since
+        that file's 'pos' column is a separate per-window table.
         """
+        if df is None:
+            df = self.df
         pattern_str = self._ground_truth_pattern()
-        if not (pattern_str and 'pos' in self.df.columns and len(self.df) > 0):
+        if not (pattern_str and 'pos' in df.columns and len(df) > 0):
             return None
         from .utils import parse_pattern_string
-        positions = self.df['pos'].to_numpy()
+        positions = df['pos'].to_numpy()
         total_span = positions.max()
         _, anomaly_intervals, _ = parse_pattern_string(pattern_str, block_size_bp=500000, total_span=total_span)
         if not anomaly_intervals:
@@ -1181,42 +1215,61 @@ class CasterPlotter:
         print(f"Saved topology correlation heatmap to: {save_path_corr}")
         plt.close()
 
-    def plot_quartet_counts(self):
+    def _load_quartet_counts_df(self):
         """
-        Diagnostic plot for dstar.cpp/caster-site.cpp's optional quartet_counts.tsv
-        companion file (per-window, per-topology counts of raw per-site
-        scores classified zero/negative/positive -- see caster/dstar.cpp's
-        scoreIntervalWithCounts and sequence.hpp's
-        Quadripartition::Gene::signCounts). Purely diagnostic: this file is
-        never read by phlag's HMM and has no bearing on scores.tsv/
-        chunk_scores.tsv. Skips gracefully (prints a warning, doesn't raise)
-        when quartet_counts.tsv is missing, matching the convention the other
-        optional plots in this class already follow.
+        Shared quartet_counts.tsv loader/validator for plot_quartet_counts
+        and plot_quartet_dists -- both need the same optional per-window,
+        per-topology zero/negative/positive raw per-site score counts (see
+        caster/dstar.cpp's scoreIntervalWithCounts and sequence.hpp's
+        Quadripartition::Gene::signCounts), parsed and column-checked the
+        same way. Purely diagnostic: this file is never read by phlag's
+        HMM and has no bearing on scores.tsv/chunk_scores.tsv. Returns the
+        DataFrame, or None (after printing why) if it's missing, unreadable,
+        or missing expected columns -- callers skip gracefully rather than
+        raising, matching the convention the other optional plots in this
+        class already follow.
         """
         quartet_counts_path = pathlib.Path(self.scores_file).parent / "quartet_counts.tsv"
         if not quartet_counts_path.exists():
             print(f"No quartet_counts.tsv found at '{quartet_counts_path}'; skipping quartet counts plot.")
-            return
+            return None
 
         try:
             quartet_counts_df = pd.read_csv(quartet_counts_path, sep='\t')
         except Exception as e:
             print(f"Error reading quartet counts file {quartet_counts_path}: {e}; skipping quartet counts plot.")
-            return
+            return None
 
         if 'pos' not in quartet_counts_df.columns:
             print(f"Quartet counts file '{quartet_counts_path}' has no 'pos' column; skipping quartet counts plot.")
+            return None
+
+        topo_order = ['ABBA', 'BABA', 'AABB']
+        kind_cols = {'zero': '_zero', 'negative': '_neg', 'positive': '_pos'}
+        missing = [f"{t}{suffix}" for t in topo_order for suffix in kind_cols.values()
+                   if f"{t}{suffix}" not in quartet_counts_df.columns]
+        if missing:
+            print(f"Quartet counts file '{quartet_counts_path}' is missing expected column(s) {missing}; skipping quartet counts plot.")
+            return None
+        return quartet_counts_df
+
+    def plot_quartet_counts(self):
+        """
+        Per-window line plot of quartet_counts.tsv (see
+        _load_quartet_counts_df): one subplot per topology, each with the
+        zero/negative/positive count columns plotted against genomic
+        position, shaded with the same ground-truth Alt regions as the
+        other window-position plots in this file. Skips gracefully when
+        quartet_counts.tsv is missing/malformed (_load_quartet_counts_df
+        prints why).
+        """
+        quartet_counts_df = self._load_quartet_counts_df()
+        if quartet_counts_df is None:
             return
 
         topo_order = ['ABBA', 'BABA', 'AABB']
         kind_colors = {'zero': '#7F7F7F', 'negative': self.topo_colors['BABA'], 'positive': self.topo_colors['ABBA']}
         kind_cols = {'zero': '_zero', 'negative': '_neg', 'positive': '_pos'}
-
-        missing = [f"{t}{suffix}" for t in topo_order for suffix in kind_cols.values()
-                   if f"{t}{suffix}" not in quartet_counts_df.columns]
-        if missing:
-            print(f"Quartet counts file '{quartet_counts_path}' is missing expected column(s) {missing}; skipping quartet counts plot.")
-            return
 
         fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
 
@@ -1252,6 +1305,78 @@ class CasterPlotter:
         save_path = os.path.join(output_dir, 'quartet_counts.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Saved quartet counts plot to: {save_path}")
+        plt.close()
+
+    def plot_quartet_dists(self):
+        """
+        Distributional companion to plot_quartet_counts (see
+        _load_quartet_counts_df): 3 (topology) x 2 (Null row / Alt row)
+        grid, each subplot a KDE of the zero/negative/positive count
+        columns for that topology's windows in that ground-truth class --
+        shows how each count's distribution shifts between Null and Alt,
+        rather than plot_quartet_counts' per-window line-over-position
+        view. Additionally skips (prints why) when no ground-truth locus
+        pattern is resolvable, since the Null/Alt split needs one.
+        """
+        quartet_counts_df = self._load_quartet_counts_df()
+        if quartet_counts_df is None:
+            return
+
+        topo_order = ['ABBA', 'BABA', 'AABB']
+        kind_colors = {'zero': '#7F7F7F', 'negative': self.topo_colors['BABA'], 'positive': self.topo_colors['ABBA']}
+        kind_cols = {'zero': '_zero', 'negative': '_neg', 'positive': '_pos'}
+
+        labels = self._compute_null_alt_labels(quartet_counts_df)
+        if labels is None:
+            print("No resolvable ground-truth locus pattern; skipping quartet counts distribution plot.")
+            return
+
+        row_order = ['Null', 'Alt']
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10), sharex='col')
+
+        for col_idx, topo in enumerate(topo_order):
+            col_vals = []
+            for row_idx, row_label in enumerate(row_order):
+                ax = axes[row_idx][col_idx]
+                row_mask = labels == row_label
+                for kind, suffix in kind_cols.items():
+                    vals = quartet_counts_df.loc[row_mask, f"{topo}{suffix}"].to_numpy(dtype=float)
+                    col_vals.append(vals)
+                    if len(vals) > 1 and np.ptp(vals) > 0:
+                        sns.kdeplot(vals, ax=ax, color=kind_colors[kind], label=kind, linewidth=1.4)
+                    elif len(vals) > 0:
+                        # kdeplot needs variance to fit a bandwidth -- a
+                        # constant (or single-row) column still gets a
+                        # visible marker instead of silently disappearing.
+                        ax.axvline(vals[0], color=kind_colors[kind], label=kind, linewidth=1.4)
+                ax.set_title(f'{topo} ({row_label})', fontsize=11, fontweight='bold')
+                ax.set_xlabel('Site count')
+                ax.set_ylabel('Density')
+                ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+                ax.grid(True, linestyle=':', alpha=0.5)
+
+            # Auto-detected (see _needs_log_scale) per column, off both rows'
+            # zero/negative/positive counts together -- a near-flat 'zero'
+            # count sitting two-plus orders of magnitude above the sparse
+            # 'negative'/'positive' spikes (as in the real data, ~1000 vs
+            # ~10) otherwise squashes the latter into a sliver near 0 on a
+            # linear x-axis. Decided once per column (sharex='col' ties both
+            # rows' scale together anyway) rather than per subplot.
+            if self._needs_log_scale(np.concatenate(col_vals)):
+                axes[0][col_idx].set_xscale('log')
+                axes[1][col_idx].set_xscale('log')
+
+        title = f'Per-Site Quartet Count Distributions: {self.gene_name}'
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+        output_dir = self.data_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, 'quartet_dists.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved quartet counts distribution plot to: {save_path}")
         plt.close()
 
     def _stacked_sum_hist(self, ax, col_for_topo, title):
@@ -1369,7 +1494,9 @@ class CasterPlotter:
 def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None, dist_type="gaussian"):
     """
     Writes gt_stats.txt (Null/Alt/Overall mean+covariance across the 3
-    topology dimensions, ABBA/BABA/AABB order) next to scores_file, so
+    topology dimensions, ABBA/BABA/AABB order, plus each label's per-topology
+    Fisher-Pearson skewness -- scipy.stats.skew, bias=True, i.e. g1 =
+    m3/m2^1.5 -- as "<label>Skewness") next to scores_file, so
     downstream ground-truth-divergence consumers (phlag.py's em_gt_hd) can
     read the joint mean/covariance directly instead of re-loading and
     re-splitting scores_file themselves every time.
@@ -1427,6 +1554,45 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
         Y = np.clip(Y - np.percentile(Y, 1, axis=0), 0, None)
 
     stats = {"Overall": (Y.mean(axis=0), np.cov(Y, rowvar=False).reshape(3, 3))}
+    stats["OverallSkewness"] = skew(Y, axis=0, bias=True).tolist()
+
+    # Within-window variance/mean: how much the raw per-site topology
+    # scores vary WITHIN a single window (what a coarser window's own
+    # averaging step is smoothing over), as opposed to the mean/covariance
+    # above (spread BETWEEN whole-window values across the file). Needs
+    # the sibling non-overlapping w1_s1 (per-site) scores.tsv for this same
+    # node/pattern -- only meaningful for non-overlapping dstar windows
+    # (step == window), since bucketing raw sites by pos // window
+    # reconstructs the real window boundaries only then. Degrades
+    # gracefully (adds nothing) if the sibling file, mode, or window size
+    # don't support it. Buckets with <2 sites are dropped (variance
+    # undefined) -- same convention as bench/caster.ipynb's
+    # topology_variance_within_window, which this mirrors.
+    site_df = bucket_means = bucket_vars = None
+    ws = parse_ws_from_path(pathlib.Path(scores_file))
+    if ws is not None:
+        ws_mode, ws_window, ws_step = ws[0], ws[1], ws[2]
+        if ws_mode == 'w' and ws_window > 1 and ws_window == ws_step:
+            site_path = substitute_ws_in_path(pathlib.Path(scores_file), 1, 1)
+            if site_path is not None and site_path != pathlib.Path(scores_file) and site_path.exists():
+                try:
+                    site_df = pd.read_csv(site_path, sep='\t', usecols=['pos', 'c*ABBA', 'c*BABA', 'c*AABB'])
+                except Exception:
+                    site_df = None
+                if site_df is not None and len(site_df) >= 2:
+                    site_df['_bucket'] = site_df['pos'] // ws_window
+                    grouped = site_df.groupby('_bucket')[['c*ABBA', 'c*BABA', 'c*AABB']]
+                    keep = grouped.size()
+                    keep = keep[keep >= 2].index
+                    if len(keep):
+                        bucket_means = grouped.mean().loc[keep]
+                        bucket_vars = grouped.var().loc[keep]
+                    else:
+                        site_df = None
+
+    if bucket_means is not None:
+        stats["OverallWithinMean"] = bucket_means.mean(axis=0).to_numpy().tolist()
+        stats["OverallWithinVariance"] = bucket_vars.mean(axis=0).to_numpy().tolist()
 
     pattern_str = locus_pattern
     if not pattern_str:
@@ -1459,8 +1625,30 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
             alt_vals = Y[y_true == 1]
             if len(null_vals) > 1:
                 stats["Null"] = (null_vals.mean(axis=0), np.cov(null_vals, rowvar=False).reshape(3, 3))
+                stats["NullSkewness"] = skew(null_vals, axis=0, bias=True).tolist()
             if len(alt_vals) > 1:
                 stats["Alt"] = (alt_vals.mean(axis=0), np.cov(alt_vals, rowvar=False).reshape(3, 3))
+                stats["AltSkewness"] = skew(alt_vals, axis=0, bias=True).tolist()
+
+            if bucket_means is not None:
+                # Each bucket (window) is labeled Null/Alt by its MAJORITY
+                # site, same convention as the window-level y_true above --
+                # a window straddling the Null/Alt boundary still gets one
+                # label rather than being dropped.
+                site_pos = site_df['pos'].to_numpy()
+                site_is_alt = np.zeros(len(site_df), dtype=bool)
+                for start_bp, end_bp in anomaly_intervals:
+                    site_is_alt |= (site_pos >= start_bp) & (site_pos <= end_bp)
+                site_df['_is_alt'] = site_is_alt
+                region = site_df.groupby('_bucket')['_is_alt'].mean().reindex(bucket_means.index).ge(0.5)
+                null_idx, alt_idx = region[~region].index, region[region].index
+                if len(null_idx):
+                    stats["NullWithinMean"] = bucket_means.loc[null_idx].mean(axis=0).to_numpy().tolist()
+                    stats["NullWithinVariance"] = bucket_vars.loc[null_idx].mean(axis=0).to_numpy().tolist()
+                if len(alt_idx):
+                    stats["AltWithinMean"] = bucket_means.loc[alt_idx].mean(axis=0).to_numpy().tolist()
+                    stats["AltWithinVariance"] = bucket_vars.loc[alt_idx].mean(axis=0).to_numpy().tolist()
+
             if "Null" in stats and "Alt" in stats:
                 if dist_type == "exp":
                     stats["Hellinger2"] = exponential_hellinger2_nd(
@@ -1591,8 +1779,13 @@ def build_parser():
              "columns (split into Null/Alt side-by-side heatmaps when a "
              "ground-truth pattern is resolvable); quartet_counts, per-topology "
              "raw per-site score quartet counts (zero/negative/positive) from "
-             "the optional quartet_counts.tsv companion file, one PNG with 3 "
-             "stacked subplots (requires quartet_counts.tsv, else skipped); "
+             "the optional quartet_counts.tsv companion file -- two PNGs: "
+             "quartet_counts.png (1x3 per-topology line plot over genomic "
+             "position, ground-truth shaded) and quartet_dists.png (3x2 "
+             "topology x Null/Alt grid of KDEs, requires a resolvable "
+             "ground-truth locus pattern, else that second PNG alone is "
+             "skipped); both require quartet_counts.tsv, else skipped "
+             "entirely; "
              "sums, histogram of the summed ABBA+BABA+AABB topology score per "
              "row (bins=auto), each bar split into 3 stacked colors by that "
              "bin's average per-topology score. scatter/dist/sums/quartet_counts "
@@ -2106,6 +2299,13 @@ def main(argv=None):
         if recent_fasta is None or not recent_fasta.exists():
             sys.exit("Error: No input file found in store/msa/concat or candidate MSA directories.")
         args.fasta_file = recent_fasta
+
+    if not args.fasta_file.exists():
+        from .utils import resolve_locus_spec
+        spec_fasta = resolve_locus_spec(args.fasta_file)
+        if spec_fasta is not None:
+            print(f"[caster] Resolved locus spec '{args.fasta_file}' -> '{spec_fasta}'")
+            args.fasta_file = spec_fasta
 
     # Regenerate mode: a scores.tsv (or chunk_scores.tsv) path was passed
     # instead of a FASTA. Recover the source FASTA from its 'file' column

@@ -2,17 +2,20 @@ import sys
 import pathlib
 import argparse
 
-from phlag.caster import int_or_abbrev
+from phlag.caster import int_or_abbrev, step_size_or_fraction
 
 
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Phlagster: Run caster then phlag end-to-end from a single FASTA input."
+        description="Phlagster: Run caster then phlag end-to-end from a FASTA or an existing caster scores.tsv."
     )
     parser.add_argument(
         "input_file",
         type=pathlib.Path,
-        help="Input FASTA file path"
+        help="Input FASTA, or an existing caster scores.tsv (its source FASTA is recovered "
+             "from the 'file' column). With a scores.tsv and no -w/-s, caster is skipped "
+             "and phlag runs on that file as-is; with -w/-s, caster recomputes from the "
+             "source FASTA at each new window/step."
     )
     parser.add_argument(
         "-d",
@@ -26,17 +29,23 @@ def parse_arguments(argv=None):
         "-w",
         dest="window_size",
         type=int_or_abbrev,
+        nargs="+",
         default=None,
-        help="Forwarded to caster's -w (default: whatever caster's own default is).",
+        help="Forwarded to caster's -w (default: whatever caster's own default is). "
+             "Multiple values run caster then phlag once per (-w, -s) combination "
+             "(cartesian product). Must come after the input file.",
     )
     parser.add_argument(
         "-s",
         "--step-size",
         dest="step_size",
-        type=int_or_abbrev,
+        type=step_size_or_fraction,
+        nargs="+",
         default=None,
-        help="Forwarded to both caster's -s and phlag's -s/--step-size (default: "
-             "whatever caster's own default is).",
+        help="Forwarded to caster's -s (default: whatever caster's own default is). "
+             "A value with a decimal point is a ratio of -w (1.0 = non-overlapping); "
+             "a whole value is a literal step. Multiple values combine with -w as "
+             "a cartesian product.",
     )
     parser.add_argument(
         "-n",
@@ -120,11 +129,11 @@ def parse_arguments(argv=None):
         "--caster-plot",
         dest="caster_plot",
         nargs="*",
-        choices=["scores", "scatter", "dist", "correlation", "topology_pairs"],
+        choices=["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums"],
         default=None,
         help="Explicit list of caster --plot names to generate, independent of "
              "--no-plots (default: None, meaning use the existing --no-plots-derived "
-             "behavior unchanged -- 'scores' unless --no-plots is set, nothing if it "
+             "behavior unchanged -- 'scatter' unless --no-plots is set, nothing if it "
              "is). When given, used verbatim as caster's --plot argument, bypassing "
              "the --no-plots-derived default entirely; does not affect phlag's own "
              "plots or --no-plots' effect on them.",
@@ -247,9 +256,9 @@ def main(argv=None):
 
     caster_extra_args = []
     if args.window_size is not None:
-        caster_extra_args += ["-w", str(args.window_size)]
+        caster_extra_args += ["-w"] + [str(w) for w in args.window_size]
     if args.step_size is not None:
-        caster_extra_args += ["-s", str(args.step_size)]
+        caster_extra_args += ["-s"] + [str(s) for s in args.step_size]
     if args.normalize:
         caster_extra_args += ["-n"]
     if args.shift_caster:
@@ -270,14 +279,21 @@ def main(argv=None):
     if args.caster_plot is not None:
         caster_plot_args = ["--plot"] + list(args.caster_plot)
     else:
-        caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scores"]
-    print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
-    scores_path = caster.main(
-        [str(args.input_file), "-d", args.dist_type]
-        + caster_extra_args + output_base_args + bench_args + caster_plot_args
-    )
-    if scores_path is None:
-        sys.exit("Error: caster did not produce a scores file.")
+        caster_plot_args = ["--plot"] if args.no_plots else ["--plot", "scatter"]
+    from_scores = args.input_file.suffix == ".tsv"
+    if from_scores and args.window_size is None and args.step_size is None:
+        if not args.input_file.exists():
+            sys.exit(f"Error: scores file '{args.input_file}' does not exist.")
+        scores_paths = [args.input_file]
+    else:
+        print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
+        result = caster.main(
+            [str(args.input_file), "-d", args.dist_type]
+            + caster_extra_args + output_base_args + bench_args + caster_plot_args
+        )
+        scores_paths = result if isinstance(result, list) else [result]
+        if not scores_paths or any(p is None for p in scores_paths):
+            sys.exit("Error: caster did not produce a scores file.")
 
     phlag_plot_args = ["--plot"] if args.no_plots else []
     phlag_extra_args = []
@@ -310,11 +326,12 @@ def main(argv=None):
     if args.beta is not None:
         phlag_extra_args += ["--beta", str(args.beta)]
     phlag_extra_args += ["-d", args.dist_type]
-    print(f"[phlagster] Running phlag on '{scores_path}'...")
-    phlag_main.main(
-        [str(scores_path)] + output_base_args + bench_args
-        + phlag_extra_args + phlag_plot_args
-    )
+    for scores_path in scores_paths:
+        print(f"[phlagster] Running phlag on '{scores_path}'...")
+        phlag_main.main(
+            [str(scores_path)] + output_base_args + bench_args
+            + phlag_extra_args + phlag_plot_args
+        )
 
 
 if __name__ == "__main__":

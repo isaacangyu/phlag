@@ -20,7 +20,7 @@ from sklearn.metrics import silhouette_score
 
 from . import hmm
 from . import utils
-from .caster import step_size_or_fraction
+from .caster import step_size_or_fraction, CasterPlotter
 
 E_STEP_EPS = 0.0001
 PSI_EPS = 0.001
@@ -691,6 +691,34 @@ class Phlag:
             path_likelihoods.append(likelihoods)
         return paths, path_likelihoods
 
+    @staticmethod
+    def _predicted_alt_intervals(positions, predicted_labels):
+        """
+        Merges contiguous Alt-predicted windows into (start_bp, end_bp) spans
+        for CasterPlotter._shade_predicted_intervals. Window width isn't
+        stored on Phlag (only baked into caster_scores' own row spacing), so
+        it's recovered from the first step between sorted positions rather
+        than re-parsed from args/path.
+        """
+        positions = np.asarray(positions, dtype=float)
+        predicted_labels = np.asarray(predicted_labels)
+        if len(positions) == 0:
+            return []
+        step = float(positions[1] - positions[0]) if len(positions) > 1 else 1.0
+        intervals = []
+        run_start = run_end = None
+        for pos, label in zip(positions, predicted_labels):
+            if label == 1:
+                if run_start is None:
+                    run_start = pos
+                run_end = pos + step
+            elif run_start is not None:
+                intervals.append((run_start, run_end))
+                run_start = run_end = None
+        if run_start is not None:
+            intervals.append((run_start, run_end))
+        return intervals
+
     def compute_output(self):
         divergence = self.hmm.state_emission_divergence(self.params)
         try:
@@ -764,6 +792,8 @@ class Phlag:
         # runs on non-simulation data or flat-output paths legitimately have
         # no ground truth to compare against.
         self.has_ground_truth = False
+        self.flipped_for_eval = False
+        self.anomaly_intervals = None
         if not pattern_str:
             print(f"Warning: No ground truth locus pattern found for '{input_path_obj}' (and no --locus-pattern given) -- skipping evaluation metrics and ground-truth plots.")
         else:
@@ -774,6 +804,7 @@ class Phlag:
                 print(f"Warning: Could not parse ground truth locus pattern '{pattern_str}' from '{input_path_obj}' -- skipping evaluation metrics and ground-truth plots.")
             else:
                 self.has_ground_truth = True
+                self.anomaly_intervals = anomaly_intervals
                 for idx, pos in enumerate(sorted_positions):
                     for start_bp, end_bp in anomaly_intervals:
                         if start_bp <= pos <= end_bp:
@@ -882,6 +913,7 @@ class Phlag:
             if hamming_dist_flipped < hamming_dist:
                 y_pred = 1 - y_pred
                 flipped_for_eval = True
+            self.flipped_for_eval = flipped_for_eval
 
             # Per-window posterior P(Alt) from the same forward-backward smoother
             # fit_em's E-step already runs -- reused here (one extra pass on the
@@ -1010,8 +1042,8 @@ class Phlag:
             return [[1.0 - p_null_alt, p_null_alt], [p_alt_null, 1.0 - p_alt_null]]
 
         def _append_transition_rows(label, matrix):
-            for state, row in zip(("Null", "Alt"), matrix):
-                headers.append(f"{label} ({state} row): [{', '.join(f'{float(x):.5g}' for x in row)}]")
+            rows = ", ".join(f"[{', '.join(f'{float(x):.5g}' for x in row)}]" for row in matrix)
+            headers.append(f"{label}: [{rows}]")
 
         if self.has_ground_truth:
             _append_transition_rows("Ground truth transition matrix", _empirical_transition_matrix(y_true, 0, 1))
@@ -1110,6 +1142,38 @@ class Phlag:
             gt_stats_path = pathlib.Path(self.args.caster_scores).parent / "gt_stats.txt"
             gt_stats = read_gt_stats_file(gt_stats_path)
 
+            # Ground-truth per-topology (ABBA/BABA/AABB) Fisher-Pearson
+            # skewness (g1 = m3/m2^1.5), read straight from gt_stats.txt
+            # (see caster.py's write_ground_truth_stats) rather than
+            # recomputed here -- same "prefer caster's own file" convention
+            # as the joint Hellinger2/mean/covariance above.
+            for skew_label in ("Null", "Alt", "Overall"):
+                skew_key = f"{skew_label}Skewness"
+                if skew_key in gt_stats:
+                    skew_vals = [format_number(v) for v in gt_stats[skew_key]]
+                    headers.append(f"{skew_label} skewness (ABBA, BABA, AABB): {skew_vals}")
+
+            # Within-window mean/variance (raw per-site scores WITHIN each
+            # window, averaged across windows), read straight from
+            # gt_stats.txt same as skewness above. The "Overall" row is the
+            # total stats computed by AVERAGING each window's own mean/
+            # variance, distinct from the "Overall mean"/"Overall
+            # covariance" lines elsewhere in this report, which POOL every
+            # window's raw score into one mean/covariance directly -- the
+            # two agree for the mean (averaging per-window means equals
+            # pooling all sites and averaging, when windows are equal-
+            # sized), but not for variance/covariance, whose pooled version
+            # also includes the between-window spread (law of total
+            # variance) that this within-window figure excludes by design.
+            for within_label in ("Null", "Alt", "Overall"):
+                within_mean_key, within_var_key = f"{within_label}WithinMean", f"{within_label}WithinVariance"
+                if within_mean_key in gt_stats:
+                    mean_vals = [format_number(v) for v in gt_stats[within_mean_key]]
+                    headers.append(f"{within_label} within-window mean (ABBA, BABA, AABB): {mean_vals}")
+                if within_var_key in gt_stats:
+                    var_vals = [format_number(v) for v in gt_stats[within_var_key]]
+                    headers.append(f"{within_label} within-window variance (ABBA, BABA, AABB): {var_vals}")
+
             if "Hellinger2" in gt_stats:
                 gt_hellinger2_joint = gt_stats["Hellinger2"]
                 headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
@@ -1175,10 +1239,11 @@ class Phlag:
                     plot_path_data = (1 - path) if flipped_for_eval else path
                     color = colors[idx]
                     line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
-                    ax1.step(positions_kb, plot_path_data, where="mid", color=color, linestyle=line_style, linewidth=1.5, label=f"Path {idx+1}")
+                    ax1.plot(positions_kb, plot_path_data, linestyle="none", marker="o", markersize=3, color=color, zorder=3)
                 
-                if self.has_ground_truth:
-                    ax1.step(positions_kb, y_true, where="mid", color='black', linestyle='--', linewidth=2.0, label="Ground Truth", alpha=0.8)
+                if self.has_ground_truth and self.anomaly_intervals:
+                    for start_bp, end_bp in self.anomaly_intervals:
+                        ax1.axvspan(start_bp / 1000.0, end_bp / 1000.0, color='#E05638', alpha=0.12, zorder=1)
 
                 if ax_hist is not None:
                     edges = list(range(0, len(positions_kb), agg))
@@ -1208,14 +1273,12 @@ class Phlag:
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
                 ax1.set_ylim(-0.05, 1.05)
                 ax1.set_yticks([0, 1])
+                ax1.set_yticklabels(["Null", "Alternative"])
                 locus_desc = get_title_locus(input_path, self.output_file)
                 if locus_desc:
                     ax1.set_title(f"Genomic Profile: {locus_desc}\nTop {len(paths)} Viterbi Paths", fontsize=12, fontweight="bold", pad=12)
                 else:
                     ax1.set_title(f"Genomic Profile: Top {len(paths)} Viterbi Paths", fontsize=14, fontweight="bold", pad=15)
-                
-                lines1, labels1 = ax1.get_legend_handles_labels()
-                ax1.legend(lines1, labels1, loc="upper left", framealpha=0.9)
                 
                 fig.tight_layout()
                 
@@ -1227,6 +1290,30 @@ class Phlag:
             except Exception as e:
                 print(f"Warning: Could not generate visual states plot: {e}")
 
+        # Overlay this run's own Viterbi predictions onto caster's scatter.png
+        # in yellow, the same axvspan style _shade_locus_pattern already uses
+        # for ground truth -- so overlap reads as blended red+yellow, a
+        # missed/false-positive region as pure red/yellow. Only when
+        # scatter.png already exists next to this run's own scores.tsv (it's
+        # only reliably produced in ad-hoc, non-`--bench` runs -- see
+        # caster.py's --plot default) and independent of this run's own
+        # --plot choice, since it doesn't touch this run's own report/pngs.
+        if not getattr(self.args, "bench", False) and paths:
+            scatter_path = pathlib.Path(self.args.caster_scores).parent / "scatter.png"
+            if scatter_path.exists():
+                try:
+                    primary_path = np.asarray((1 - paths[0]) if flipped_for_eval else paths[0])
+                    predicted_intervals = self._predicted_alt_intervals(sorted_positions, primary_path)
+                    CasterPlotter(
+                        str(self.args.caster_scores),
+                        distribution=getattr(self.args, "model_design", "gaussian"),
+                        locus_pattern=getattr(self.args, "locus_pattern", None),
+                        plot_dist=False, plot_correlation=False, plot_topology_pairs=False,
+                        plot_quartet_counts=False, plot_sums=False,
+                        predicted_intervals=predicted_intervals,
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not overlay predictions onto scatter.png: {e}")
 
         # Generate the visual plot if configured: relerr
         if self.args.plot and "relerr" in self.args.plot:
@@ -1425,9 +1512,9 @@ class PhlagPlotter:
     of standard multi-species coalescent (MSC) background (State 0, Null) vs.
     alternative/anomalous (State 1, Alternative) states.
 
-    Row 0 shows the ground-truth-split empirical histogram and independent Null/Alt
-    gaussian fits (or a single ungrounded distribution when no ground truth is available).
-    Row 1 shows the empirical HMM-assigned histogram and EM-fitted emission curves.
+    Row 0 shows empirical KDEs: ground-truth split (dashed, light) and HMM-assigned
+    split (solid, dark). Row 1 shows fitted curves: ground-truth Null/Alt gaussian fits
+    (or the GMM seed) dashed/light, and EM-fitted emission curves solid/dark.
     """
     def __init__(self, phlag):
         self.phlag = phlag
@@ -1451,11 +1538,13 @@ class PhlagPlotter:
             0: {
                 'line': '#2B4C7E',    # Deep Steel Blue
                 'fill': '#2B4C7E',
+                'kde': '#7CC4F2',     # Light Blue
                 'label': 'Null'
             },
             1: {
                 'line': '#E05A47',    # Warm Coral
                 'fill': '#E05A47',
+                'kde': '#FF9F1C',     # Orange
                 'label': 'Alt'
             }
         }
@@ -1483,23 +1572,14 @@ class PhlagPlotter:
             ypad = (ymax - ymin) * 0.20 or 0.1
             ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
 
-        bin_edges = self._compute_bin_edges(ranges)
+        # Row 0: KDEs (ground truth vs HMM-assigned); Row 1: fitted curves (ground truth/GMM seed vs EM)
+        self._plot_kde_row(axes[0], ranges)
+        self._plot_fit_row(axes[1], ranges)
+        self._apply_log_scales(axes)
+        for ax in np.array(axes).flat:
+            self._separate_overlapping_lines(ax)
 
-        # Row 0: GMM initialization seed (gmm) or ground-truth-split empirical distribution (gaussian)
-        if self.phlag.args.model_design == "gmm":
-            self._plot_gmm_init_row(axes[0], ranges)
-        elif self.phlag.ground_truth_fits:
-            self._plot_ground_truth_row(axes[0], ranges, bin_edges)
-        else:
-            for d in range(self.emission_dim):
-                axes[0][d].text(0.5, 0.5, "No ground truth available", ha="center", va="center", transform=axes[0][d].transAxes, fontsize=10, color="gray")
-                axes[0][d].set_xticks([])
-                axes[0][d].set_yticks([])
-
-        # Row 1: After EM (fitted emission curves and HMM-assigned empirical data)
-        self._plot_em_row(axes[1], ranges, bin_edges)
-
-        self._finalize_legend(fig, axes)
+        legend = self._finalize_legend(fig, axes, ncol=2)
 
         locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
         if locus_desc:
@@ -1507,11 +1587,28 @@ class PhlagPlotter:
             plt.tight_layout(rect=[0, 0, 1, 0.93])
         else:
             plt.tight_layout(rect=[0, 0, 1, 0.95])
+        self._annotate_state_counts(fig, legend)
         self.save_plot()
 
-    def _finalize_legend(self, fig, axes):
+    def _annotate_state_counts(self, fig, legend):
+        """Writes the Alt ($N_a$) and Null ($N_b$) window counts in the blank space
+        left of the legend: ground-truth split (if available) and HMM-assigned split."""
+        if legend is None:
+            return
+        param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
+        assigned = np.array(self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y))
+        lines = []
+        if self.phlag.ground_truth_fits:
+            y_true = np.array(self.phlag.y_true)
+            lines.append(f"Ground truth: $N_a$ (Alt) = {int((y_true == 1).sum())}, $N_b$ (Null) = {int((y_true == 0).sum())}")
+        lines.append(f"After EM: $N_a$ (Alt) = {int((assigned == param_states[1]).sum())}, $N_b$ (Null) = {int((assigned == param_states[0]).sum())}")
+        fig.canvas.draw()
+        box = legend.get_window_extent().transformed(fig.transFigure.inverted())
+        fig.text(box.x0 - 0.01, box.y1, "\n".join(lines), ha="right", va="top", fontsize=9, linespacing=1.5)
+
+    def _finalize_legend(self, fig, axes, ncol=1):
         """Collects de-duplicated handles/labels across every axis in the figure (both
-        rows share the same Null/Alt Fit/Histogram labeling) and places a single legend
+        rows share the same Null/Alt Fit/KDE labeling) and places a single legend
         in the figure's upper-right corner."""
         unique = {}
         for ax in np.array(axes).flat:
@@ -1520,195 +1617,186 @@ class PhlagPlotter:
                 if label and label not in unique:
                     unique[label] = handle
         if unique:
-            fig.legend(
+            return fig.legend(
                 unique.values(), unique.keys(),
                 loc='upper right', bbox_to_anchor=(0.995, 0.97),
-                fontsize=7.5, framealpha=0.9
+                fontsize=7.5, framealpha=0.9, ncol=ncol
             )
+        return None
 
-    def _compute_bin_edges(self, ranges):
-        """Computes per-dimension equal-width bin edges spanning the full plotted x-range, sized
-        off the largest std among the ground-truth-split and EM-fitted state Gaussians, so the
-        ground-truth and after-EM histograms (and Null/Alt within each) share identical bins --
-        avoiding the ragged/gapped look from each subset picking its own bin count and range."""
-        params = self.phlag.params
-        model_design = self.phlag.args.model_design
-        bin_edges = {}
-        for d in range(self.emission_dim):
-            stds = []
-            if self.phlag.ground_truth_fits:
-                _, std_null, _, std_alt = self.phlag.ground_truth_fits[d]
-                stds += [std_null, std_alt]
-            for state in [0, 1]:
-                _, sigma, _ = get_state_mu_sigma_pdf(params, model_design, state, d, ranges[d])
-                stds.append(sigma)
-            max_std = max(stds)
+    def _plot_kde(self, ax, vals, state, x_range, ground_truth):
+        if len(vals) < 2 or np.ptp(vals) == 0:
+            return
+        cfg = self.colors[state]
+        sns.kdeplot(
+            vals, ax=ax, color=cfg['kde'] if ground_truth else cfg['line'], fill=True, alpha=0.2,
+            linewidth=1.8, linestyle='--' if ground_truth else '-', clip=(x_range[0], x_range[-1]),
+            label=f"{cfg['label']} {'GT' if ground_truth else 'EM'} KDE"
+        )
 
-            x_min, x_max = ranges[d][0], ranges[d][-1]
-            bin_width = max(max_std / 4, 1e-6)
-            n_bins = int(np.clip(np.ceil((x_max - x_min) / bin_width), 15, 60))
-            bin_edges[d] = np.linspace(x_min, x_max, n_bins + 1)
-        return bin_edges
+    def _style_axis(self, ax, title, d, ylabel):
+        ax.set_title(f"{title} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
+        ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
+        ax.set_ylabel(ylabel if d == 0 else "", fontsize=9, labelpad=4)
+        ax.tick_params(axis='both', which='major', labelsize=8)
 
-    def _plot_ground_truth_row(self, row_axes, ranges, bin_edges):
-        """Plots the ground-truth-split empirical histogram and independent Null/Alt gaussian fits."""
-        y_true = self.phlag.y_true
-        ground_truth_fits = self.phlag.ground_truth_fits
-        title_prefix = "Ground Truth Split"
+    def _plot_kde_row(self, row_axes, ranges):
+        """Plots empirical KDEs: ground-truth split (dashed, light) and HMM-assigned split (solid, dark)."""
         Y_np = np.array(self.phlag.Y)
+        most_likely_states = np.array(self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y))
+        param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
 
         for d in range(self.emission_dim):
             ax = row_axes[d]
-            x_vals = ranges[d]
-            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
             vals = Y_np[:, d]
-
-            mu_null, std_null, mu_alt, std_alt = ground_truth_fits[d]
-            null_vals = vals[y_true == 0]
-            alt_vals = vals[y_true == 1]
-
-            if len(null_vals) > 0:
-                sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[0]['fill'], label='Null Histogram', bins=bin_edges[d])
-            if len(alt_vals) > 0:
-                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=self.colors[1]['fill'], label='Alt Histogram', bins=bin_edges[d])
-
-            pdf_null = stats.norm.pdf(x_vals, mu_null, std_null)
-            ax.plot(x_vals, pdf_null, color=self.colors[0]['line'], linewidth=2.2, label='Null Fit')
-            ax.axvline(mu_null, color=self.colors[0]['line'], linestyle='--', linewidth=1.5)
-            ax.text(mu_null, 0.90, f"$\\mu_{{null}}={mu_null:.4f}$", transform=trans, color=self.colors[0]['line'], fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-            ax.text(mu_null + std_null, 0.82, f"$\\sigma_{{null}}={std_null:.4f}$", transform=trans, color=self.colors[0]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-
-            pdf_alt = stats.norm.pdf(x_vals, mu_alt, std_alt)
-            ax.plot(x_vals, pdf_alt, color=self.colors[1]['line'], linewidth=2.2, label='Alt Fit')
-            ax.axvline(mu_alt, color=self.colors[1]['line'], linestyle=':', linewidth=1.5)
-            ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={mu_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-            ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={std_alt:.4f}$", transform=trans, color=self.colors[1]['line'], fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-
-            ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
-            ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
-            ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
-            ax.tick_params(axis='both', which='major', labelsize=8)
-
-    def _plot_gmm_init_row(self, row_axes, ranges):
-        """Plots the pre-EM GMM initialization seed: weighted-sum-of-Gaussians curves per
-        state, derived from the k-means-based mixture seed (self.phlag.gmm_init_params)."""
-        init_weights, init_means, init_covariances = self.phlag.gmm_init_params
-        title_prefix = "GMM Initialization"
-
-        for d in range(self.emission_dim):
-            ax = row_axes[d]
-            x_vals = ranges[d]
-            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
-
+            if self.phlag.has_ground_truth:
+                y_true = np.array(self.phlag.y_true)
+                for state in [0, 1]:
+                    self._plot_kde(ax, vals[y_true == state], state, ranges[d], True)
             for state in [0, 1]:
-                color_config = self.colors[state]
-                w = np.array(init_weights[state])
-                m_means = np.array(init_means[state, :, d])
-                m_vars = np.array(init_covariances[state, :, d, d])
-                m_stds = np.sqrt(np.clip(m_vars, 1e-6, None))
-                pdf_vals = np.zeros_like(x_vals)
-                for m in range(len(w)):
-                    pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
-                mu = float(np.sum(w * m_means))
-                var = float(np.sum(w * (m_stds ** 2 + m_means ** 2)) - mu ** 2)
-                sigma = np.sqrt(max(1e-6, var))
+                self._plot_kde(ax, vals[most_likely_states == param_states[state]], state, ranges[d], False)
+            self._style_axis(ax, "KDE", d, "Density")
 
-                ax.plot(x_vals, pdf_vals, color=color_config['line'], linewidth=2.2, label=f"{color_config['label']} Fit")
-                ax.fill_between(x_vals, pdf_vals, alpha=0.05, color=color_config['fill'])
-                ax.axvline(x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8)
-                ax.axvline(x=mu - sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6)
-                ax.axvline(x=mu + sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6)
+    def _draw_fit(self, ax, x_vals, state, pdf_vals, tag, ground_truth):
+        cfg = self.colors[state]
+        ax.plot(
+            x_vals, pdf_vals, color=cfg['kde'] if ground_truth else cfg['line'], linewidth=2.2,
+            linestyle='--' if ground_truth else '-', label=f"{cfg['label']} {tag} Fit"
+        )
+        ax.fill_between(x_vals, pdf_vals, alpha=0.05, color=cfg['fill'])
 
-                y_pos_mean = 0.90 if state == 0 else 0.75
-                y_pos_std = 0.83 if state == 0 else 0.68
-                ax.text(mu, y_pos_mean, f"$\\mu_{state} = {mu:.4f}$", transform=trans, color=color_config['line'], fontsize=8.0, ha='center', va='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
-                ax.text(mu + sigma, y_pos_std, f"$\\sigma_{state} = {sigma:.4f}$", transform=trans, color=color_config['line'], fontsize=7.0, ha='center', va='center', bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1))
-
-            ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
-            ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
-            ax.set_ylabel("Density" if d == 0 else "", fontsize=9, labelpad=4)
-            ax.tick_params(axis='both', which='major', labelsize=8)
-
-    def _plot_em_row(self, row_axes, ranges, bin_edges):
-        """Plots the empirical HMM-assigned histogram and EM-fitted emission curves."""
+    def _plot_fit_row(self, row_axes, ranges):
+        """Plots fitted curves: ground-truth (or GMM seed) fit dashed/light, EM fit solid/dark."""
         params = self.phlag.params
-        title_prefix = "After EM"
-        most_likely_states = self.phlag.hmm.most_likely_states(params, self.phlag.Y)
+        param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
+        is_gmm = self.phlag.args.model_design == "gmm"
 
         for d in range(self.emission_dim):
             ax = row_axes[d]
             x_vals = ranges[d]
-            trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
 
-            # 1. Plot empirical step-histograms for Assigned State Data points
-            y_state0 = np.array(self.phlag.Y[most_likely_states == 0, d])
-            y_state1 = np.array(self.phlag.Y[most_likely_states == 1, d])
+            if is_gmm:
+                init_weights, init_means, init_covariances = self.phlag.gmm_init_params
+                for state in [0, 1]:
+                    w = np.array(init_weights[state])
+                    m_means = np.array(init_means[state, :, d])
+                    m_stds = np.sqrt(np.clip(np.array(init_covariances[state, :, d, d]), 1e-6, None))
+                    pdf_vals = np.zeros_like(x_vals)
+                    for m in range(len(w)):
+                        pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
+                    self._draw_fit(ax, x_vals, state, pdf_vals, "Init", True)
+            elif self.phlag.ground_truth_fits:
+                mu_null, std_null, mu_alt, std_alt = self.phlag.ground_truth_fits[d]
+                for state, (mu, sigma) in enumerate([(mu_null, std_null), (mu_alt, std_alt)]):
+                    self._draw_fit(ax, x_vals, state, stats.norm.pdf(x_vals, mu, sigma), "GT", True)
 
-            if len(y_state0) > 0:
-                sns.histplot(
-                    y_state0, ax=ax, color=self.colors[0]['fill'],
-                    stat="density", kde=False, alpha=0.12, bins=bin_edges[d],
-                    element="step", label=f"{self.colors[0]['label']} Histogram"
-                )
-            if len(y_state1) > 0:
-                sns.histplot(
-                    y_state1, ax=ax, color=self.colors[1]['fill'],
-                    stat="density", kde=False, alpha=0.12, bins=bin_edges[d],
-                    element="step", label=f"{self.colors[1]['label']} Histogram"
-                )
-
-            # 2. Plot PDF curves and Vertical Guideline Markers (Mean and +/- 1 Std)
             for state in [0, 1]:
-                color_config = self.colors[state]
-                mu, sigma, pdf_vals = get_state_mu_sigma_pdf(params, self.phlag.args.model_design, state, d, x_vals)
+                _, _, pdf_vals = get_state_mu_sigma_pdf(params, self.phlag.args.model_design, param_states[state], d, x_vals)
+                self._draw_fit(ax, x_vals, state, pdf_vals, "EM", False)
 
-                # Plot theoretical curve
-                ax.plot(
-                    x_vals, pdf_vals, color=color_config['line'],
-                    linewidth=2.2, label=f"{color_config['label']} Fit"
-                )
+            self._style_axis(ax, "Fit", d, "Probability Density")
 
-                # Shading under curve
-                ax.fill_between(
-                    x_vals, pdf_vals, alpha=0.05,
-                    color=color_config['fill']
-                )
+    # 10x CasterPlotter._needs_log_scale's own 100x default -- em.png's axes
+    # (topology scores clustered tight around a window-size-dependent mean,
+    # densities that taper over many decades at the KDE/fit tails) tripped
+    # the 100x default on nearly every column, and the resulting log/symlog
+    # ticks over a 1e-9 linthresh were too cluttered to read; a plain linear
+    # axis is fine until the spread is genuinely extreme.
+    LOG_SCALE_RATIO_THRESHOLD = 1000.0
 
-                # Plot Central Tendency Guideline: Mean
-                ax.axvline(
-                    x=mu, color=color_config['line'], linestyle='--', linewidth=1.5, alpha=0.8,
-                    label=None
-                )
+    def _apply_log_scales(self, axes):
+        """Auto-detects log/symlog scaling per topology column, reusing
+        CasterPlotter._needs_log_scale (same percentile-ratio heuristic as
+        scatter.png/dist plots, just a higher threshold -- see
+        LOG_SCALE_RATIO_THRESHOLD) independently on each axis: x off the raw
+        topology scores shared by both rows in that column, y off the
+        density/PDF curve heights the two rows actually drew. Symlog (not
+        plain log) whenever negatives are present -- topology scores can be
+        genuinely negative (raw c*ABBA/c*BABA sums, ILR coords), and density
+        values can dip slightly negative from KDE boundary artifacts -- with
+        the same 1e-9 linthresh used in plot_topology_scatter.
+        """
+        Y_np = np.array(self.phlag.Y)
+        for d in range(self.emission_dim):
+            col_axes = [axes[0][d], axes[1][d]]
 
-                # Plot Dispersion Guidelines: +/- 1 Std bounds
-                ax.axvline(
-                    x=mu - sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6,
-                    label=None
-                )
-                ax.axvline(
-                    x=mu + sigma, color=color_config['line'], linestyle=':', linewidth=1.0, alpha=0.6,
-                    label=None
-                )
+            x_vals = Y_np[:, d]
+            x_vals = x_vals[np.isfinite(x_vals)]
+            if CasterPlotter._needs_log_scale(np.abs(x_vals), ratio_threshold=self.LOG_SCALE_RATIO_THRESHOLD):
+                scale, kwargs = ('symlog', {'linthresh': 1e-9}) if (x_vals < 0).any() else ('log', {})
+                for ax in col_axes:
+                    ax.set_xscale(scale, **kwargs)
 
-                # Label with symbols mu and sigma next to the lines
-                y_pos_mean = 0.90 if state == 0 else 0.75
-                y_pos_std = 0.83 if state == 0 else 0.68
+            y_vals = np.concatenate([line.get_ydata() for ax in col_axes for line in ax.get_lines()]) \
+                if any(ax.get_lines() for ax in col_axes) else np.array([])
+            y_vals = y_vals[np.isfinite(y_vals)]
+            if CasterPlotter._needs_log_scale(np.abs(y_vals), ratio_threshold=self.LOG_SCALE_RATIO_THRESHOLD):
+                scale, kwargs = ('symlog', {'linthresh': 1e-9}) if (y_vals < 0).any() else ('log', {})
+                for ax in col_axes:
+                    ax.set_yscale(scale, **kwargs)
 
-                ax.text(
-                    mu, y_pos_mean, f"$\\mu_{state} = {mu:.4f}$", transform=trans, color=color_config['line'],
-                    fontsize=8.0, ha='center', va='center', fontweight='bold',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                )
-                ax.text(
-                    mu + sigma, y_pos_std, f"$\\sigma_{state} = {sigma:.4f}$", transform=trans, color=color_config['line'],
-                    fontsize=7.0, ha='center', va='center',
-                    bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1)
-                )
+    def _separate_overlapping_lines(self, ax, decade_tol=1.0, rel_tol=1e-2, offset_frac=0.02):
+        """When two curves on the same axis coincide almost exactly, the
+        later-drawn one fully occludes the earlier one except at dash gaps,
+        hiding its distinct color -- not just dashed-under-solid (GT hidden
+        under an EM fit that converged right onto it), but also
+        dashed-under-dashed (e.g. Null and Alt ground-truth fits landing on
+        near-identical mu/sigma for a given topology, so Alt GT, drawn
+        second, buries Null GT). Compares every pair of lines regardless of
+        style and nudges the earlier (lower-zorder, hidden) one's y-data so
+        both remain visible; only a cosmetic shift, the later line still
+        carries the real values.
 
-            ax.set_title(f"{title_prefix} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
-            ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
-            ax.set_ylabel("Probability Density" if d == 0 else "", fontsize=9, labelpad=4)
-            ax.tick_params(axis='both', which='major', labelsize=8)
+        Must run after the axis' final scale is set (_apply_log_scales).
+        "Coincide" is judged in the axis' own displayed units: on a log/
+        symlog axis that means the two curves stay within `decade_tol`
+        decades of each other everywhere, NOT within `rel_tol` in linear
+        value -- two fitted Gaussians whose peaks differ by a couple percent
+        in linear terms (way outside any sane rel_tol) can still render as
+        one indistinguishable line once compressed onto 50+ decades of
+        vertical range, which is exactly the case this was missing. The
+        offset itself is likewise sized as a fraction of the axis' own
+        visible y-span (decades for log/symlog, linear units otherwise), not
+        of each line's own value, so a fixed percent-of-value shift doesn't
+        end up sub-pixel on a wide-range panel or overshoot on a narrow one.
+        """
+        lines = [ln for ln in ax.get_lines() if len(ln.get_xdata()) > 1]
+        if not lines:
+            return
+        is_log = ax.get_yscale() in ('log', 'symlog')
+        all_y = np.concatenate([ln.get_ydata() for ln in lines])
+        all_y = all_y[np.isfinite(all_y)]
+        if is_log:
+            pos = all_y[all_y > 0]
+            lo, hi = (pos.min(), pos.max()) if len(pos) >= 2 else (1.0, 10.0)
+            span_mult = 10 ** (offset_frac * (np.log10(hi) - np.log10(lo) if hi > lo else 1.0))
+        else:
+            lo, hi = (all_y.min(), all_y.max()) if len(all_y) >= 2 else (0.0, 1.0)
+            span_add = offset_frac * ((hi - lo) or abs(hi) or 1.0)
+
+        offset_applied = set()
+        for i in range(len(lines)):
+            if i in offset_applied:
+                continue
+            xi, yi = lines[i].get_xdata(), lines[i].get_ydata()
+            for j in range(i + 1, len(lines)):
+                if j in offset_applied:
+                    continue
+                xj, yj = lines[j].get_xdata(), lines[j].get_ydata()
+                if len(xi) != len(xj) or not np.allclose(xi, xj):
+                    continue
+                if is_log:
+                    posmask = (yi > 0) & (yj > 0)
+                    if not posmask.any():
+                        continue
+                    coincide = np.max(np.abs(np.log10(yi[posmask]) - np.log10(yj[posmask]))) < decade_tol
+                else:
+                    scale = max(np.max(np.abs(yi)), np.max(np.abs(yj)), 1e-300)
+                    coincide = np.max(np.abs(yi - yj)) / scale < rel_tol
+                if coincide:
+                    lines[i].set_ydata(yi * span_mult if is_log else yi + span_add)
+                    offset_applied.add(i)
+                    break
 
     def _covariance_ellipse(self, mean_xy, cov2x2, n_std=1.0, **kwargs):
         """Builds an n_std confidence-region Ellipse patch for a 2D Gaussian, via
@@ -2185,6 +2273,30 @@ def parse_arguments(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    report_arg = args.caster_scores
+    if (report_arg is not None and not report_arg.is_absolute()
+            and report_arg.name == "report.tsv" and report_arg.exists()):
+        # A relative path to an existing report.tsv, not a scores file --
+        # report.tsv's own first line (see initialize_output) records the
+        # exact `sys.argv` that produced it, so replay that run instead of
+        # trying to read report.tsv itself as scores. This run's own flags
+        # still win: recovered tokens go first and this invocation's own
+        # tokens (with the report.tsv positional stripped out) go after,
+        # relying on argparse's left-to-right store semantics -- a flag
+        # repeated later in the stream overwrites the earlier occurrence.
+        import shlex
+        recovered_tokens = shlex.split(report_arg.read_text().splitlines()[0])[1:]
+        raw_argv = list(argv) if argv is not None else sys.argv[1:]
+        override_tokens = list(raw_argv)
+        try:
+            override_tokens.remove(str(report_arg))
+        except ValueError:
+            pass
+        print(f"'{report_arg}' is a report.tsv -- replaying its recorded "
+              f"invocation ({' '.join(recovered_tokens)}) with this run's own "
+              f"flags taking precedence.")
+        return parse_arguments(recovered_tokens + override_tokens)
+
     if args.plot == []:
         # Bare "--plot" (no choices given): plot everything, same as
         # caster.py's own --plot (see phlag/caster.py's main()).
@@ -2332,6 +2444,11 @@ def parse_arguments(argv=None):
         print(f"Using most recent score file: {recent_file}")
         args.caster_scores = recent_file
     else:
+        from .utils import resolve_locus_spec
+        spec_fasta = resolve_locus_spec(args.caster_scores) if not pathlib.Path(args.caster_scores).exists() else None
+        if spec_fasta is not None:
+            print(f"Resolved locus spec '{args.caster_scores}' -> '{spec_fasta}'")
+            args.caster_scores = spec_fasta
         resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
         if resolved.exists() and resolved.is_file() and resolved.suffix.lower() in (".fa", ".fasta", ".fna"):
             # A raw source FASTA (what caster.py itself takes) rather than

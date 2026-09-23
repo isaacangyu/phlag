@@ -69,6 +69,13 @@ TOPO_VAR_COV_COLUMNS = [
     "cov_ABBA_BABA", "cov_ABBA_AABB", "cov_BABA_AABB",
 ]
 
+# Within-window mean/variance: spread of the raw per-site topology scores
+# WITHIN a single window, averaged across windows -- distinct from
+# TOPO_VAR_COV_COLUMNS above, which is the BETWEEN-window covariance
+# (spread of whole-window values across the file). Only populated for
+# non-overlapping dstar windows (see write_ground_truth_stats).
+TOPO_WITHIN_COLUMNS = [f"within_mean_{t}" for t in TOPOLOGY_NAMES] + [f"within_var_{t}" for t in TOPOLOGY_NAMES]
+
 DEFAULT_CONCAT_PATTERNS = ["37-62", "40-60", "42-57", "45-55", "47-52", "49-51"]
 
 
@@ -178,8 +185,8 @@ _RE_GT_EM_DIVERGENCE_LEGACY = re.compile(
     r'^Ground truth EM divergence \(Bhattacharyya\):\s*([-\d.eE+]+)\s*$'
 )
 _RE_TRANSITION_MATRIX = re.compile(
-    r'^Final transition matrix \(after EM\):\s*'
-    r'\[\[([-\d.eE+]+),\s*([-\d.eE+]+)\],\s*\[([-\d.eE+]+),\s*([-\d.eE+]+)\]\]\s*$'
+    r'^(Ground truth|Viterbi path|Final) transition matrix(?: \(pooled\))?(?: \(after EM\))?:\s*'
+    r'\[\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\],\s*\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\]\]\s*$'
 )
 _RE_TRANSITION_ROW = re.compile(
     r'^(Ground truth|Viterbi path|Final) transition matrix(?: \(after EM\))? \((Null|Alt) row\):\s*'
@@ -460,10 +467,11 @@ def parse_report(report_path):
 
             m = _RE_TRANSITION_MATRIX.match(line)
             if m:
-                parsed["transition_null_to_null"] = float(m.group(1))
-                parsed["transition_null_to_alt"] = float(m.group(2))
-                parsed["transition_alt_to_null"] = float(m.group(3))
-                parsed["transition_alt_to_alt"] = float(m.group(4))
+                prefix = _TRANSITION_ROW_PREFIX[m.group(1)]
+                parsed[f"{prefix}_null_to_null"] = float(m.group(2))
+                parsed[f"{prefix}_null_to_alt"] = float(m.group(3))
+                parsed[f"{prefix}_alt_to_null"] = float(m.group(4))
+                parsed[f"{prefix}_alt_to_alt"] = float(m.group(5))
                 continue
 
             m = _RE_CASTER_MTIME.match(line)
@@ -647,6 +655,12 @@ class RunRecord:
     null_cov_ABBA_BABA: Optional[float] = None
     null_cov_ABBA_AABB: Optional[float] = None
     null_cov_BABA_AABB: Optional[float] = None
+    null_within_mean_ABBA: Optional[float] = None
+    null_within_mean_BABA: Optional[float] = None
+    null_within_mean_AABB: Optional[float] = None
+    null_within_var_ABBA: Optional[float] = None
+    null_within_var_BABA: Optional[float] = None
+    null_within_var_AABB: Optional[float] = None
     alt_mean_norm: Optional[float] = None
     alt_cov_norm: Optional[float] = None
     alt_mean_ABBA: Optional[float] = None
@@ -658,6 +672,12 @@ class RunRecord:
     alt_cov_ABBA_BABA: Optional[float] = None
     alt_cov_ABBA_AABB: Optional[float] = None
     alt_cov_BABA_AABB: Optional[float] = None
+    alt_within_mean_ABBA: Optional[float] = None
+    alt_within_mean_BABA: Optional[float] = None
+    alt_within_mean_AABB: Optional[float] = None
+    alt_within_var_ABBA: Optional[float] = None
+    alt_within_var_BABA: Optional[float] = None
+    alt_within_var_AABB: Optional[float] = None
     pooled_mean_norm: Optional[float] = None
     pooled_cov_norm: Optional[float] = None
     pooled_mean_ABBA: Optional[float] = None
@@ -669,6 +689,12 @@ class RunRecord:
     pooled_cov_ABBA_BABA: Optional[float] = None
     pooled_cov_ABBA_AABB: Optional[float] = None
     pooled_cov_BABA_AABB: Optional[float] = None
+    pooled_within_mean_ABBA: Optional[float] = None
+    pooled_within_mean_BABA: Optional[float] = None
+    pooled_within_mean_AABB: Optional[float] = None
+    pooled_within_var_ABBA: Optional[float] = None
+    pooled_within_var_BABA: Optional[float] = None
+    pooled_within_var_AABB: Optional[float] = None
     transition_null_to_null: Optional[float] = None
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
@@ -1086,6 +1112,13 @@ class BenchmarkStats:
                         continue
                     attr = f"var_{ti}" if i == j else f"cov_{ti}_{tj}"
                     setattr(record, f"{prefix}_{attr}", float(cov_arr[i, j]))
+            within_mean, within_var = gt_stats.get(f"{label}WithinMean"), gt_stats.get(f"{label}WithinVariance")
+            if within_mean is not None:
+                for topo, val in zip(TOPOLOGY_NAMES, within_mean):
+                    setattr(record, f"{prefix}_within_mean_{topo}", float(val))
+            if within_var is not None:
+                for topo, val in zip(TOPOLOGY_NAMES, within_var):
+                    setattr(record, f"{prefix}_within_var_{topo}", float(val))
 
         record.bic = parsed["bic"]
         record.log_likelihood = parsed["log_likelihood"]
@@ -1377,13 +1410,13 @@ class BenchmarkStats:
         "em_hd", "em_gt_hd",
         "null_mean_norm", "null_cov_norm",
         "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
-    ] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+    ] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"null_{c}" for c in TOPO_WITHIN_COLUMNS] + [
         "alt_mean_norm", "alt_cov_norm",
         "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
-    ] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+    ] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"alt_{c}" for c in TOPO_WITHIN_COLUMNS] + [
         "pooled_mean_norm", "pooled_cov_norm",
         "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
-    ] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+    ] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"pooled_{c}" for c in TOPO_WITHIN_COLUMNS] + [
         "transition_null_to_null", "transition_null_to_alt",
         "transition_alt_to_null", "transition_alt_to_alt",
         "bic", "log_likelihood", "n_trainable_params",
@@ -1479,18 +1512,21 @@ class BenchmarkStats:
                     "null_mean_BABA": record.null_mean_BABA,
                     "null_mean_AABB": record.null_mean_AABB,
                     **{f"null_{c}": getattr(record, f"null_{c}") for c in TOPO_VAR_COV_COLUMNS},
+                    **{f"null_{c}": getattr(record, f"null_{c}") for c in TOPO_WITHIN_COLUMNS},
                     "alt_mean_norm": record.alt_mean_norm,
                     "alt_cov_norm": record.alt_cov_norm,
                     "alt_mean_ABBA": record.alt_mean_ABBA,
                     "alt_mean_BABA": record.alt_mean_BABA,
                     "alt_mean_AABB": record.alt_mean_AABB,
                     **{f"alt_{c}": getattr(record, f"alt_{c}") for c in TOPO_VAR_COV_COLUMNS},
+                    **{f"alt_{c}": getattr(record, f"alt_{c}") for c in TOPO_WITHIN_COLUMNS},
                     "pooled_mean_norm": record.pooled_mean_norm,
                     "pooled_cov_norm": record.pooled_cov_norm,
                     "pooled_mean_ABBA": record.pooled_mean_ABBA,
                     "pooled_mean_BABA": record.pooled_mean_BABA,
                     "pooled_mean_AABB": record.pooled_mean_AABB,
                     **{f"pooled_{c}": getattr(record, f"pooled_{c}") for c in TOPO_VAR_COV_COLUMNS},
+                    **{f"pooled_{c}": getattr(record, f"pooled_{c}") for c in TOPO_WITHIN_COLUMNS},
                     "transition_null_to_null": record.transition_null_to_null,
                     "transition_null_to_alt": record.transition_null_to_alt,
                     "transition_alt_to_null": record.transition_alt_to_null,
@@ -2976,13 +3012,13 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["
 ] + ["em_hd", "em_gt_hd"] + [
     "null_mean_norm", "null_cov_norm",
     "null_mean_ABBA", "null_mean_BABA", "null_mean_AABB",
-] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+] + [f"null_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"null_{c}" for c in TOPO_WITHIN_COLUMNS] + [
     "alt_mean_norm", "alt_cov_norm",
     "alt_mean_ABBA", "alt_mean_BABA", "alt_mean_AABB",
-] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+] + [f"alt_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"alt_{c}" for c in TOPO_WITHIN_COLUMNS] + [
     "pooled_mean_norm", "pooled_cov_norm",
     "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
-] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [
+] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"pooled_{c}" for c in TOPO_WITHIN_COLUMNS] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
 ] + ["bic"] + ["clip_activation_count", "clip_activation_rate"]
