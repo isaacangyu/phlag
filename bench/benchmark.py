@@ -916,7 +916,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                 norm_eps=False, errorbar="sd"):
+                 norm_eps=False, exp_minus=False, errorbar="sd"):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -938,6 +938,7 @@ class BenchmarkStats:
         self.zscale = zscale
         self.ilr = ilr
         self.norm_eps = norm_eps
+        self.exp_minus = exp_minus
         self.errorbar = errorbar
 
         self.runs = []
@@ -1095,6 +1096,7 @@ class BenchmarkStats:
             leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
             pair=self.pair, site=self.site, chunk_size=self.chunk_size,
             normalize=self.normalize, zscale=self.zscale, ilr=self.ilr, norm_eps=self.norm_eps,
+            exp_minus=self.exp_minus,
         )
         gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
         for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
@@ -2253,6 +2255,7 @@ CASTER_ARG_SPECS = [
     ("dist_type", "-d", False),
     ("normalize", "-n", True),
     ("norm_eps", "--norm-eps", True),
+    ("exp_minus", "--exp-minus", True),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
     ("site", "--site", True),
@@ -2277,6 +2280,7 @@ PHLAG_ARG_SPECS = [
     ("correct_transition", "--correct-transition", False),
     ("rho", "--rho", False),
     ("beta", "--beta", False),
+    ("beta_prime", "--beta-prime", False),
 ]
 MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, _ in PHLAG_ARG_SPECS]
 
@@ -2291,9 +2295,17 @@ SEGMENT_CONVENTIONS = [
     dict(
         name="rho_beta",
         regex=re.compile(r"^rho([\d.]+)_beta([\d.]+)$"),
-        is_set=lambda d: d.get("rho") is not None or d.get("beta") is not None,
+        is_set=lambda d: (d.get("rho") is not None or d.get("beta") is not None)
+            and not (d.get("beta") is None and d.get("beta_prime") is not None),
         matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta") == float(m.group(2)),
         expected=lambda d: f"rho{d.get('rho')}_beta{d.get('beta')}",
+    ),
+    dict(
+        name="rho_betaprime",
+        regex=re.compile(r"^rho([\d.]+)_betaprime([\d.]+)$"),
+        is_set=lambda d: d.get("beta") is None and d.get("beta_prime") is not None,
+        matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta_prime") == float(m.group(2)),
+        expected=lambda d: f"rho{d.get('rho')}_betaprime{d.get('beta_prime')}",
     ),
     dict(
         name="lam",
@@ -2452,6 +2464,11 @@ def _build_parser():
              "existing 'normalize' one.",
     )
     caster_group.add_argument(
+        "--exp-minus", dest="exp_minus", action="store_true",
+        help="Forwarded to caster's --exp-minus: topology columns x -> exp(-x), "
+             "cached under its own nested 'exp-minus' entry.",
+    )
+    caster_group.add_argument(
         "--shift-caster", dest="shift_caster", action="store_true",
         help="Forwarded to caster's --shift-caster.",
     )
@@ -2541,6 +2558,11 @@ def _build_parser():
         "--beta", dest="beta", type=float, default=None,
         help="Forwarded to phlag's --beta. Must be set together with --rho; "
              "omitting both disables the transition prior (default: unset, no prior).",
+    )
+    phlag_group.add_argument(
+        "--beta-prime", dest="beta_prime", type=float, default=None,
+        help="Forwarded to phlag's --beta-prime (beta = beta_prime * window count; "
+             "ignored if --beta is set).",
     )
 
     parser.add_argument(
@@ -2637,7 +2659,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                                 pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                                norm_eps=False):
+                                norm_eps=False, exp_minus=False):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2690,6 +2712,8 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
         base = base / "normalize"
         if norm_eps:
             base = base / "norm-eps"
+    if exp_minus:
+        base = base / "exp-minus"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
@@ -2698,14 +2722,14 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                              pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                             norm_eps=False):
+                             norm_eps=False, exp_minus=False):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
         pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale, ilr=ilr,
-        norm_eps=norm_eps,
+        norm_eps=norm_eps, exp_minus=exp_minus,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2896,6 +2920,7 @@ def run_all(args, sim_root, out_dir):
             fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
             pair=args.pair, site=args.site, chunk_size=args.chunk_size,
             normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
+            exp_minus=args.exp_minus,
         )
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
@@ -3290,6 +3315,7 @@ def main(argv=None):
             zscale=for_args.zscale,
             ilr=for_args.ilr,
             norm_eps=for_args.norm_eps,
+            exp_minus=for_args.exp_minus,
             errorbar=for_args.errorbar,
         )
 

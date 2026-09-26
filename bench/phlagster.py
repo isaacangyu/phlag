@@ -12,7 +12,10 @@ def parse_arguments(argv=None):
     parser.add_argument(
         "input_file",
         type=pathlib.Path,
-        help="Input FASTA, or an existing caster scores.tsv (its source FASTA is recovered "
+        nargs="+",
+        help="Input FASTA(s), locus spec(s) (e.g. 10X/down/N109/37-62), or existing caster "
+             "scores.tsv(s); multiple values run phlagster once per value with the same flags. "
+             "For a scores.tsv, its source FASTA is recovered "
              "from the 'file' column). With a scores.tsv and no -w/-s, caster is skipped "
              "and phlag runs on that file as-is; with -w/-s, caster recomputes from the "
              "source FASTA at each new window/step."
@@ -53,6 +56,12 @@ def parse_arguments(argv=None):
         dest="normalize",
         action="store_true",
         help="Forwarded to caster's -n.",
+    )
+    parser.add_argument(
+        "--exp-minus",
+        dest="exp_minus",
+        action="store_true",
+        help="Forwarded to caster's --exp-minus.",
     )
     parser.add_argument(
         "--shift-caster",
@@ -242,11 +251,27 @@ def parse_arguments(argv=None):
         default=None,
         help="Forwarded to phlag's --beta (default: whatever phlag's own default is).",
     )
+    parser.add_argument(
+        "--beta-prime",
+        dest="beta_prime",
+        type=float,
+        default=None,
+        help="Forwarded to phlag's --beta-prime (default: whatever phlag's own default is).",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
-    args = parse_arguments(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parse_arguments(raw_argv)
+    if len(args.input_file) > 1:
+        input_tokens = {str(p) for p in args.input_file}
+        rest = [t for t in raw_argv if t not in input_tokens]
+        for input_file in args.input_file:
+            print(f"[phlagster] multi-input -- running {input_file}...")
+            main([str(input_file)] + rest)
+        return
+    args.input_file = args.input_file[0]
 
     from phlag import caster
     from phlag import phlag as phlag_main
@@ -271,6 +296,8 @@ def main(argv=None):
         caster_extra_args += ["-z"]
     if args.ilr:
         caster_extra_args += ["-i"]
+    if args.exp_minus:
+        caster_extra_args += ["--exp-minus"]
     if args.chunk_size is not None:
         caster_extra_args += ["--chunk", str(args.chunk_size)]
     if args.chunk_scores is not None:
@@ -325,6 +352,8 @@ def main(argv=None):
         phlag_extra_args += ["--rho", str(args.rho)]
     if args.beta is not None:
         phlag_extra_args += ["--beta", str(args.beta)]
+    if args.beta_prime is not None:
+        phlag_extra_args += ["--beta-prime", str(args.beta_prime)]
     phlag_extra_args += ["-d", args.dist_type]
     for scores_path in scores_paths:
         print(f"[phlagster] Running phlag on '{scores_path}'...")

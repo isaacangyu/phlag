@@ -4,6 +4,99 @@ Shared status board for concurrent Claude sessions working in this repo. Each se
 
 ---
 
+## session-20260926-rho-beta-multi
+
+**Status:** done
+**Task:** `--rho`/`--beta`/`--beta-prime` accept multiple values, cartesian product with each other and `-w`/`-s` (phlag/phlag.py `main()`).
+**Change:** nargs="+"; `--beta` set drops `--beta-prime` from product (would duplicate). Batch + `-o` → `<o.parent>/[w.._s..]/[rho.._beta[prime]..]/<o.name>`. bench/benchmark.py, phlagster.py untouched (still scalar).
+**Also:** FASTA/locus-spec sibling resolution picked `quartet_counts.tsv` (not excluded by `is_score_candidate`); fixed. Still picks newest variant (e.g. exp-minus) -- pass explicit scores path to choose.
+
+---
+
+## session-20260926-transition-prior-low-rho
+
+**Status:** done
+**Task:** extend transition-prior sweep with low rho {0.001,0.01,0.1} x beta-prime {1e-6..1e-2}; artifact 7BULTFo9cDHw1bVHuJQrwC v2.
+**Change:** none to repo; 480 scratchpad runs.
+**Finding:** low rho beats best high-rho in 0/40 cells; fits don't mirror, prior forces ~50/50 occupancy (N113: p01~p10~1e-4); hurts weak-emission cells (Accipitriformes w10k 0.43->0). 184/480 NaN (n*rho-beta<1).
+
+---
+
+## session-20260926-gtrees-perf-check
+
+**Status:** done
+**Task:** Why are gtrees (phlag_orig) F1s ~0 on the 5 KDE branches (45-55)?
+**Finding:** No bug in the report wrapper; the truth labels line up (the recombination Alt region's QQS is exactly [1,0,0]). Viterbi is all-Null on all 5 branches. Focal-edge QQS by region: recomb Alt is *less* discordant than Null (Null already covers it; AUC 0.03-0.24 = inverted); N109 is [1,0,0] everywhere (no signal); Accipitriformes differs only weakly (AUC 0.50); admixture has real signal (0.66 -> 0.45, AUC 0.75) but the posterior of Alt stays ≤0.001.
+**Change:** none.
+**Follow-up:** gene-tree provenance: concat/*.gtrees = pre-made Dryad trees, 125 per 500 kb chunk (1 per 4 kb); admixture N340 used genetrees/ (IQ-TREE, 500 bp every 8.5 kb, 706 trees). Only those 5 sims have trees. Picked high-signal replacements (pop-info CU): 10X/up N281 (2.62), 10X/down N473 (0.281), recomb/up N282 (3.17), recomb/down N682 (3.16). They need `estimate_gene_trees.py <exp> 45-55`, which the user runs.
+
+---
+
+## session-20260926-transition-prior-sweep
+
+**Status:** done
+**Task:** sweep --rho/--beta-prime on 5 KDE branches (45-55) across w10..w50k, oracle-tune per branch, artifact https://claude.ai/artifact/7BULTFo9cDHw1bVHuJQrwC
+**Change:** none to repo; 2151 phlag runs via -o into scratchpad.
+**Finding:** prior useless at w<=1k (emission AUC~0.5; even --correct-transition F1<=0.21); helps w5k-w10k on 10X (N109 w10k 0.51->0.88). Any psi entry <1 makes Dirichlet mode's -1 a negative pseudo-count -> NaN EM (0/878 NaN with all psi>=1, 496/1092 with beta<1); true beta=1 sits on that edge. Admixture F1=0 at >=1k under every config.
+
+---
+
+## session-20260925-phlag-multi-input
+
+**Status:** done
+**Task:** phlag.py and bench/phlagster.py take multiple input/locus-spec positionals.
+**Change:** positional `nargs="*"`; `main()` re-invokes itself once per spec with the other argv tokens (composes with -w/-s batch); `parse_arguments` unwraps to a single path. phlagster: `input_file` `nargs="+"`, same per-input re-invoke in `main()`.
+**Verified:** dry-run (stubbed `_run_single`) on N113/N115/N340 45-55, with and without `-w 1k 10k`.
+**Follow-up:** standalone caster/phlag/phlagster root is now `out/msa` (`phlag.utils.get_out_root`, `get_out_relative_parts` strips `out[/msa]` for titles). Moved the 5 45-55 w10k trees out/ -> out/msa. `PHLAG_SOURCE_ROOTS`: gtrees -> `out/gtrees`, msa -> absolute `get_out_root()` (was cwd-relative, broke from bench/). Verified `_collect_run_df` returns both sources for all 5 branches.
+
+---
+
+## session-20260925-branches-all-rho-beta
+
+**Status:** done (awaiting reports)
+**Task:** caster.ipynb: cra.plot over the 5 KDE branches with every rho/beta config (BASELINE deepcopy minus --rho/--beta).
+**Change:** new markdown+code cell after the gtrees-vs-msa branch cell: `config = deepcopy(BASELINE)`, del rho/beta, `phlag: [gtrees, msa]`, F1 + tpr_fpr.
+**Verified:** same config on out/msa N281 45-55 and N276 37-62: all rho_beta/betaprime dirs come through as separate configs. The 5 branches still have no reports in either root.
+
+---
+
+## session-20260925-phlag-source-branches
+
+**Status:** done (awaiting reports)
+**Task:** cra.plot run-mode `"phlag"` axis: gtrees -> `out/phlag_orig`, msa -> `out/msa` (`PHLAG_SOURCE_ROOTS`); F1 + TPR/FPR for the 5 KDE-grid branches at w10k, branch length in titles.
+**Change:** bench/utils.py: `_collect_run_df` (pops "phlag", reads `run` under each root, config prefixed by source), `run` may be `{label: path}` -> `_plot_branches` (cols=branches, rows=metrics, "tpr_fpr" = FPR/TPR scatter), `_branch_length_label` (report header, else population-info; admixture shows divergence time), `branch_length` column in collect_out_runs. caster.ipynb: new cell after KDE grid.
+gtrees is in `WINDOWLESS_PHLAG_SOURCES`: reports have no w<W>_s<S> dir, so `collect_out_runs(windowless=True)` keeps them (window None, no gt_stats), axes don't filter them, and `_plot_branches` draws them at every window slot.
+**Verified:** scratchpad copies of out/msa w10k reports as both sources. The 5 branches (45-55) have no reports in either root yet.
+
+---
+
+## session-20260925-exp-minus
+
+**Status:** done
+**Task:** `--exp-minus`: topology cols x -> exp(-x), to test whether windows look more Gaussian.
+**Change:** caster.py (flag, `apply_exp_minus_to_scores_file`, `strip_exp_minus`; applied last after -n/-i/-z by recursing main() without the flag then transforming; nested `exp-minus` segment in adhoc + --bench paths; regen recognizes it), phlag.py/phlag utils.py/bench utils.py (strip `exp-minus` variant segment), bench/benchmark.py (CASTER_ARG_SPECS, flag, get_expected_caster_sim_dir/scores_path, BenchmarkStats), bench/phlagster.py (forward).
+**Verified:** N281 45-55 w500 with -o scratchpad. Raw dstar is ~1e-2 scale, so exp(-x)≈1-x: skew just flips sign (2.42 -> -2.34), kurtosis unchanged.
+
+---
+
+## session-20260925-beta-prime
+
+**Status:** done
+**Task:** `--beta-prime X`: beta = X * n_windows, only when `--beta` omitted (still needs `--rho`); default unset.
+**Change:** phlag.py (flag, psi, report.tsv path recovery), phlag/utils.py (`rho<X>_betaprime<Y>` segment + node-name regex), bench/benchmark.py (PHLAG_ARG_SPECS, flag, `rho_betaprime` SEGMENT_CONVENTION), bench/phlagster.py (forward), bench/utils.py (`_OUT_PARAM_SEGMENT`/recorded `beta_prime`).
+**Verified:** N281 w500 (12000 windows): `--beta-prime 0.01` → beta 120; with `--beta 4` → 4.
+
+---
+
+## session-20260925-category-kde-grid
+
+**Status:** done
+**Task:** caster.ipynb: one branch per merged_category, 2 rows (w500_s500, w5k_s5k), each panel 6 ECDFs (3 topologies x Null/Alt) + per-topology Null/Alt means box (lower-right). Switched KDE->ECDF 2026-09-25; x-range now 0.5pct..max so ECDF tails reach 1.
+**Change:** new markdown+code cells after the aggregate within-window-variance cells (before "# One Run"). `pick_branch` = first sorted sim under `store/caster/<w>/<cat>` with `37-62` scores.tsv in both windows (admixture uses `admixture/low`); `load_labeled_scores` reuses `CasterPlotter.resolve_topology_columns` + the notebook's existing parse_pattern_string Null/Alt split. Topology colors = CasterPlotter.topo_colors, Null dashed / Alt solid (em.png's convention), x clipped to 0.5-99.5 pct.
+**Verified:** ran the cell headless against the real store; 2x5 grid renders.
+
+---
+
 ## session-20260923-scatter-prediction-overlay
 
 **Status:** done
@@ -319,3 +412,30 @@ Could not render-test locally (no matplotlib in this shell, same limitation as t
 **Verified:** N564 w1k_s1k (linear x now, threshold fix confirmed) and N635 10X/up w5k_s5k (ROC-AUC=1, near-perfect GT/EM overlap) -- cropped AABB Fit panel shows light-blue/orange dashed GT lines as distinct thin traces beside the solid EM fits instead of fully hidden.
 **Bugfix (user report: "blue dashed line not showing up" on real out/10X/down/N276/37-62/w1k_s1k/gaussian/em.png):** two bugs. (1) `_separate_overlapping_lines` only compared dashed-vs-solid pairs -- missed Null GT Fit (light blue dashed) fully hidden under Alt GT Fit (orange dashed, drawn second) when both ground-truth fits land on near-identical mu/sigma for a topology; now compares every line pair and nudges whichever was drawn earlier (lower zorder). (2) coincidence was judged by linear relative difference (`rel_tol=1e-3` of peak) and the offset was `value * (1+0.02)` -- both wrong for a 50+-decade log axis: debug-verified real reldiff for the hidden pair was 1-3% (10-30x over tol, so it never even triggered), and even forcing it, a 2% *value*-relative shift is ~0.01 decades, sub-pixel against a ~56-decade span. Fixed: coincidence on a log/symlog axis is now judged by max decade gap (`decade_tol=1.0`, i.e. curves within 1 order of magnitude everywhere -- linear rel_tol kept only for non-log axes), and the offset is sized as `offset_frac` (2%) of the axis' own visible decade span (or linear span), so it's the same few-pixel gap regardless of how many decades the panel covers. Order fixed too: `_separate_overlapping_lines` must run after `_apply_log_scales` now (needs the final scale to size the offset).
 **Verified:** debug-printed real reldiff/decdiff for all 6 line pairs across N276 w1k_s1k's 3 Fit panels before fixing (confirmed the miss: ABBA/BABA Null-vs-Alt GT pairs at decdiff 0.2-0.4 decades, everything else 2.9-55 decades); after the fix, re-ran against the same real input (`-o` scratchpad) -- Null GT Fit now visibly separated from Alt GT Fit in all 3 Fit panels, and the N635 AABB re-check still shows clean separation (no regression).
+
+---
+
+## session-20260924-report-tsv-path-config
+
+**Status:** done
+**Task:** User: phlag given a report.tsv should take its config from the path, not the recorded first line.
+**Change:** `phlag.py` `parse_arguments`'s relative-report.tsv branch (supersedes session-20260923-report-tsv-replay's first-line replay): walks back to the last `gaussian`/`gmm` segment → positional `<prefix>/scores.tsv` + `-d <dist>`, then maps trailing segments `rho<X>_beta<Y>`/`var2x`/`repulsion`/`annealing`/`lam<X>` → `--rho/--beta`/`--double-variance-init`/`--ap repulsion`/`--annealing`/`--lam`; unknown segment → `parser.error`. This run's own flags still appended last and win.
+**Verified:** parse-only on `out/10X/up/N281/45-55/w500_s500/gaussian/rho0.75_beta0.01/report.tsv` — resolves to that dir's scores.tsv, rho 0.75/beta 0.01, `get_default_out_dir` lands back on the same report dir; with `--rho 0.9 --beta 4.0` override lands on `rho0.9_beta4.0`. No full phlag run.
+
+---
+
+## session-20260924-em-symlog-linthresh
+
+**Status:** done
+**Task:** User: em.png ABBA/BABA x-axis wastes width on the flat central density plateau; make the tails (Alt signal) visible.
+**Change:** `phlag.py` `_apply_log_scales`: x-axis symlog `linthresh` now data-driven — 90th percentile of |x| (`X_LINTHRESH_PERCENTILE`), rounded up to a power of 10, floor 1e-9 — instead of fixed 1e-9 (~56% of ABBA/BABA values were within 1e-6 of 0, so ~14 decades showed a flat KDE). Y-axis unchanged.
+**Verified:** N281 45-55 w500_s500 scores.tsv copied to scratchpad and rendered with `--plot em`; center collapsed to one linear band (linthresh 1e-3), tails fill most of the width, and the ticks are clean.
+
+---
+
+## session-20260926-cra-plot-run-list
+
+**Status:** done
+**Task:** `cra.plot(run=[...])` accepts a list of run dirs (label = dir minus trailing node/pattern); aggregate.ipynb Transition Prior cell uses a hardcoded list of the 5 KDE branches (was referencing caster.ipynb's undefined `kde_branches`).
+**Verified:** headless render of that cell's config over the 5 branches.
+**Follow-up:** relative run paths that do not exist under the repo root now resolve under `out/msa` (`_resolve_run_path`). The 5 branches only have 45-55 w10k reports in out/msa; N109 37-62 only has old c25k dirs.

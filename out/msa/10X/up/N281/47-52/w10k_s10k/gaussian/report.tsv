@@ -1,0 +1,41 @@
+/home/iang/.local/share/mamba/envs/phlag/bin/phlagster 10X/up/N281/47-52 -w 10k 1k 500 5k
+Clade: N281
+Branch length (CU, node 'N281'): 2.621
+Height (Ngen): 1699571
+Clade size: 2
+Anomaly fraction: 0.05 (30/600 windows)
+Label polarity flipped for evaluation: False
+Caster source mtime: 1790188676.464686
+Phlag source mtime: 1790188678.208686
+Window averaging: per-site (divided by informative-site count)
+State divergence: 0.009631979279220104
+em_hd: 0.363
+Outer EM iterations: 10
+Inner EM iterations: 5
+Ground truth transition matrix: [[0.99824, 0.0017575], [0.033333, 0.96667]]
+Viterbi path transition matrix (pooled): [[0.99824, 0.0017575], [0.033333, 0.96667]]
+Viterbi path transition matrix (Null region): [[1, 0], [nan, nan]]
+Viterbi path transition matrix (Alt region): [[nan, nan], [0, 1]]
+Initial transition matrix (before EM): [[0.99, 0.01], [0.01, 0.99]]
+Final transition matrix (after EM): [[0.99815, 0.0018544], [0.036275, 0.96373]]
+EM final joint log-likelihood: 8037
+BIC: -15883 (log-likelihood=8037, k=30 trainable params, n=600 windows)
+TPR: 1, FPR: 0, Precision: 1, F1: 1, Accuracy: 1, ROC-AUC: 1
+Topology	State	FittedMean	FittedStd	GTMean	GTStd	KL
+ABBA	Null	4.663e-05	0.003	4.572e-05	2.732e-04	64.525
+ABBA	Alt	0.001	0.003	0.001	0.001	9.629
+BABA	Null	4.258e-05	0.003	4.117e-05	3.011e-04	52.801
+BABA	Alt	0.001	0.003	0.001	0.001	5.995
+AABB	Null	0.017	0.006	0.017	0.005	0.03
+AABB	Alt	0.008	0.004	0.008	0.003	0.247
+Null skewness (ABBA, BABA, AABB): ['0.388', '0.278', '0.064']
+Null Mardia skewness: 0.757
+Alt skewness (ABBA, BABA, AABB): ['0.274', '0.095', '0.146']
+Alt Mardia skewness: 1.101
+Overall skewness (ABBA, BABA, AABB): ['1.268', '1.675', '-0.024']
+Overall Mardia skewness: 5.047
+em_gt_hd: 0.5619971180996961
+Path 1 final joint log-likelihood: 8036
+--- Bookkeeping ---
+Confusion: TP=30 FP=0 FN=0 TN=570
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0

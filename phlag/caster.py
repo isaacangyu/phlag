@@ -148,7 +148,8 @@ def adhoc_scores_path(repo_root, args, cats, node_rel, normalize_flag, ilr_flag)
         size_dir = f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
     else:
         size_dir = f"w{format_val(args.window_size)}_s{step_str}{zscale_suffix}"
-    path = repo_root / "out"
+    from .utils import get_out_root
+    path = get_out_root()
     if cats:
         path = path / cats[0] / cats[1]
     path = path / node_rel / size_dir
@@ -160,6 +161,8 @@ def adhoc_scores_path(repo_root, args, cats, node_rel, normalize_flag, ilr_flag)
         path = path / "normalize"
         if args.norm_eps:
             path = path / "norm-eps"
+    if args.exp_minus:
+        path = path / "exp-minus"
     return path / "scores.tsv"
 
 
@@ -417,6 +420,35 @@ def apply_ilr_to_scores_file(src_path, dst_path, has_q123):
         raise
 
 
+def strip_exp_minus(path):
+    return pathlib.Path(*[p for p in pathlib.Path(path).parts if p != "exp-minus"])
+
+
+def apply_exp_minus_to_scores_file(src_path, dst_path):
+    """
+    Replaces each topology column (c*ABBA/c*BABA/c*AABB, or c*ILR1/c*ILR2
+    under --ilr) of an already-written scores TSV with exp(-score), writing
+    the result to `dst_path` atomically. Applied last, after any
+    -n/-i/-z transform already baked into `src_path`. q1/q2/q3 (--pair) are
+    left untouched since phlag never reads them when the c* columns exist.
+    """
+    df = pd.read_csv(src_path, sep="\t")
+    cols = [c for c in df.columns if re.fullmatch(r"c\*(ABBA|BABA|AABB|ILR\d+)", c)]
+    df[cols] = np.exp(-df[cols].astype(np.float64))
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(dst_path.parent), prefix=".scores_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            df.to_csv(f, sep="\t", index=False)
+        os.replace(tmp_path, dst_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def is_plot_only_argv(raw_argv):
     """
     True if raw_argv's only flag is --plot (plus its own choice values) --
@@ -504,7 +536,7 @@ class CasterPlotter:
         if ws:
             mode, _, _, is_site, is_zscale, is_ilr, is_normalize, _ = ws
             source = "site" if (mode == "c" and is_site) else ("pair" if mode == "c" else "dstar")
-            transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize)) if on]
+            transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize), ("exp-minus", "exp-minus" in pathlib.Path(scores_file).parts)) if on]
             tag_parts = [source] + (transform_bits or ["raw"])
         else:
             # Path doesn't encode a recognizable size-dir segment (e.g. a
@@ -1529,7 +1561,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     per topology via laplace.fit on the raw Null/Alt values and computes
     Hellinger2 via laplace_hellinger2_nd.
     """
-    from .utils import parse_pattern_string, write_gt_stats_file, gaussian_hellinger2_nd, exponential_hellinger2_nd, laplace_hellinger2_nd, GT_STATS_FILENAME
+    from .utils import parse_pattern_string, write_gt_stats_file, mardia_skewness, gaussian_hellinger2_nd, exponential_hellinger2_nd, laplace_hellinger2_nd, GT_STATS_FILENAME
 
     try:
         df = pd.read_csv(scores_file, sep='\t')
@@ -1555,6 +1587,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
 
     stats = {"Overall": (Y.mean(axis=0), np.cov(Y, rowvar=False).reshape(3, 3))}
     stats["OverallSkewness"] = skew(Y, axis=0, bias=True).tolist()
+    stats["OverallMardiaSkewness"] = mardia_skewness(Y)
 
     # Within-window variance/mean: how much the raw per-site topology
     # scores vary WITHIN a single window (what a coarser window's own
@@ -1626,9 +1659,11 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
             if len(null_vals) > 1:
                 stats["Null"] = (null_vals.mean(axis=0), np.cov(null_vals, rowvar=False).reshape(3, 3))
                 stats["NullSkewness"] = skew(null_vals, axis=0, bias=True).tolist()
+                stats["NullMardiaSkewness"] = mardia_skewness(null_vals)
             if len(alt_vals) > 1:
                 stats["Alt"] = (alt_vals.mean(axis=0), np.cov(alt_vals, rowvar=False).reshape(3, 3))
                 stats["AltSkewness"] = skew(alt_vals, axis=0, bias=True).tolist()
+                stats["AltMardiaSkewness"] = mardia_skewness(alt_vals)
 
             if bucket_means is not None:
                 # Each bucket (window) is labeled Null/Alt by its MAJORITY
@@ -1732,6 +1767,14 @@ def build_parser():
              f"{DEFAULT_NORM_EPS} otherwise. Off by default to keep existing "
              f"normalize output bit-for-bit reproducible; on writes to its own "
              f"'normalize/norm-eps' cache entry instead of overwriting it."
+    )
+    parser.add_argument(
+        "--exp-minus",
+        dest="exp_minus",
+        action="store_true",
+        help="Replace each output topology column x with exp(-x), applied last "
+             "(after -n/-i/-z). Reuses the untransformed sibling scores.tsv if "
+             "present; writes to its own nested 'exp-minus' cache entry."
     )
     parser.add_argument(
         "-s",
@@ -1847,7 +1890,7 @@ def build_parser():
              "phlag/phlagster; has no effect on scores.tsv's location when set "
              "(stays in the canonical shared tree, same as always: "
              "store/caster/w<W>_s<S>/...). When NOT set (standalone use, the "
-             "default), scores go to <repo_root>/out/<category>/<subcategory>/"
+             "default), scores go to <repo_root>/out/msa/<category>/<subcategory>/"
              "w<W>_s<S>[/variant]/<node_name>/<pattern>/scores.tsv instead of the "
              "shared canonical tree."
     )
@@ -2317,6 +2360,7 @@ def main(argv=None):
     # flag passed, skip the recompute and just redraw the plots from what's
     # already at that path (see regen_plot_only / is_plot_only_argv below).
     regen_plot_only = False
+    regen_output_path = None
     if args.fasta_file.suffix == ".tsv" and args.fasta_file.exists():
         regen_output_path = args.fasta_file.resolve()
         regen_plot_only = is_plot_only_argv(raw_argv)
@@ -2351,6 +2395,7 @@ def main(argv=None):
             args.ilr = is_ilr
             args.normalize = is_normalize
             args.norm_eps = norm_eps
+            args.exp_minus = "exp-minus" in regen_output_path.parts
             if mode == "c" and is_site:
                 args.site = True
                 args.pair = False
@@ -2453,6 +2498,8 @@ def main(argv=None):
                 caster_root = caster_root / "normalize"
                 if args.norm_eps:
                     caster_root = caster_root / "norm-eps"
+            if args.exp_minus:
+                caster_root = caster_root / "exp-minus"
             if parsed:
                 rel_dir = parsed["relative_dir_no_window"]
                 return caster_root / rel_dir / "scores.tsv"
@@ -2496,9 +2543,9 @@ def main(argv=None):
     # with --plot as the only other flag) also takes this path: final_output_path
     # IS the passed-in file here, so no ilr/normalize is needed to justify
     # skipping recompute -- just redraw the plots from what's already there.
-    if (args.ilr or args.normalize or regen_plot_only) and final_output_path.exists():
+    if (args.ilr or args.normalize or args.exp_minus or regen_plot_only) and final_output_path.exists():
         print(f"Found existing scores at '{final_output_path}' -- skipping regeneration.")
-        copy_quartet_counts_if_missing(_derive_output_path(False, False).parent, plot_data_dir)
+        copy_quartet_counts_if_missing(strip_exp_minus(_derive_output_path(False, False)).parent, plot_data_dir)
         write_ground_truth_stats(
             scores_file=str(final_output_path.resolve()),
             output_dir=str(plot_data_dir.resolve()),
@@ -2515,6 +2562,41 @@ def main(argv=None):
                 plot_scores=("scatter" in args.plot),
                 plot_dist=("dist" in args.plot),
                     plot_correlation=("correlation" in args.plot),
+                plot_topology_pairs=("topology_pairs" in args.plot),
+                plot_quartet_counts=("quartet_counts" in args.plot),
+                plot_sums=("sums" in args.plot),
+                locus_pattern=locus_pattern,
+            )
+        return final_output_path
+
+    if args.exp_minus:
+        base_argv = [t for t in raw_argv if t != "--exp-minus"]
+        if regen_output_path is not None:
+            base_regen = strip_exp_minus(regen_output_path)
+            if not base_regen.exists():
+                sys.exit(f"Error: --exp-minus regen needs its untransformed sibling '{base_regen}'.")
+            base_argv = [str(base_regen) if (t.endswith(".tsv") and pathlib.Path(t).resolve() == regen_output_path) else t for t in base_argv]
+        base_path = main(base_argv)
+        print(f"Applying exp(-x) to '{base_path}'...")
+        apply_exp_minus_to_scores_file(base_path, final_output_path)
+        print(f"Success: TSV output file generated at: {final_output_path}")
+        copy_quartet_counts_if_missing(base_path.parent, plot_data_dir)
+        write_ground_truth_stats(
+            scores_file=str(final_output_path.resolve()),
+            output_dir=str(plot_data_dir.resolve()),
+            locus_pattern=locus_pattern,
+            topologies=args.topologies,
+            dist_type=args.dist_type,
+        )
+        if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
+            CasterPlotter(
+                scores_file=str(final_output_path.resolve()),
+                distribution=args.dist_type,
+                data_dir=str(plot_data_dir.resolve()),
+                topologies=args.topologies,
+                plot_scores=("scatter" in args.plot),
+                plot_dist=("dist" in args.plot),
+                plot_correlation=("correlation" in args.plot),
                 plot_topology_pairs=("topology_pairs" in args.plot),
                 plot_quartet_counts=("quartet_counts" in args.plot),
                 plot_sums=("sums" in args.plot),

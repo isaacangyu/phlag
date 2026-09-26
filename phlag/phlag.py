@@ -108,9 +108,10 @@ def _cluster_mean_cov(pts, D, eps=1e-4):
 def get_title_locus(caster_scores, output_file):
     from .utils import get_locus_description
     if output_file:
-        parts = pathlib.Path(output_file).resolve().parent.parts
-        if "out" in parts:
-            return "/".join(parts[len(parts) - parts[::-1].index("out"):])
+        from .utils import get_out_relative_parts
+        rel = get_out_relative_parts(pathlib.Path(output_file).resolve().parent.parts)
+        if rel is not None:
+            return "/".join(rel)
     return get_locus_description(caster_scores)
 
 
@@ -482,7 +483,7 @@ class Phlag:
         import re
         input_path = pathlib.Path(self.args.caster_scores)
         dist_type = getattr(self.args, "model_design", "gaussian")
-        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base, get_short_sim_name
+        from .utils import parse_filename_to_dir_structure, get_repo_root, get_data_dir, get_phlag_output_base, get_short_sim_name, get_out_root
         parsed = parse_filename_to_dir_structure(input_path.stem)
 
         if not getattr(self.args, "bench", False):
@@ -496,16 +497,18 @@ class Phlag:
                     break
             if size_dir_idx is not None and "caster" not in parts:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
                     variant_end += 1
                 if "out" in parts[:size_dir_idx]:
                     prefix_start = len(parts[:size_dir_idx]) - parts[:size_dir_idx][::-1].index("out")
+                    if parts[prefix_start] == "msa":
+                        prefix_start += 1
                 elif size_dir_idx >= 4 and tuple(parts[size_dir_idx - 4:size_dir_idx - 2]) in SIM_CATEGORY_PAIRS:
                     prefix_start = size_dir_idx - 4
                 else:
                     prefix_start = size_dir_idx - 1
                 return (
-                    get_repo_root() / "out" / pathlib.Path(*parts[prefix_start:variant_end])
+                    get_out_root() / pathlib.Path(*parts[prefix_start:variant_end])
                     / segments
                 )
             if parsed:
@@ -515,7 +518,7 @@ class Phlag:
                 node_name = get_simulation_node_name(input_path) or input_path.parent.name
             else:
                 node_name = input_path.parent.name
-            return get_repo_root() / "out" / segments / node_name
+            return get_out_root() / segments / node_name
 
         # --bench (set only by benchmark's own subprocess invocations) keeps
         # output in the shared canonical tree.
@@ -573,7 +576,7 @@ class Phlag:
                 # too, or it leaks into out_dir the same way 'norm-eps'
                 # would have (see phlag/caster.py's own naming-convention
                 # note in _derive_output_path).
-                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps"):
+                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -731,6 +734,8 @@ class Phlag:
         em_hellinger2_distance = None
         if getattr(self.args, "model_design", "gaussian") == "gaussian":
             em_hellinger2_distance = float(self.hmm.em_divergence(self.params))
+        self.em_hellinger2 = em_hellinger2_distance
+        self.gt_hellinger2 = None
 
 
         log_likelihoods = []
@@ -1152,6 +1157,9 @@ class Phlag:
                 if skew_key in gt_stats:
                     skew_vals = [format_number(v) for v in gt_stats[skew_key]]
                     headers.append(f"{skew_label} skewness (ABBA, BABA, AABB): {skew_vals}")
+                mardia_key = f"{skew_label}MardiaSkewness"
+                if mardia_key in gt_stats:
+                    headers.append(f"{skew_label} Mardia skewness: {format_number(gt_stats[mardia_key])}")
 
             # Within-window mean/variance (raw per-site scores WITHIN each
             # window, averaged across windows), read straight from
@@ -1177,6 +1185,7 @@ class Phlag:
             if "Hellinger2" in gt_stats:
                 gt_hellinger2_joint = gt_stats["Hellinger2"]
                 headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
+                self.gt_hellinger2 = float(gt_hellinger2_joint)
             else:
                 if "Null" in gt_stats and "Alt" in gt_stats:
                     mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
@@ -1199,6 +1208,7 @@ class Phlag:
                         jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
                     )
                     headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
+                    self.gt_hellinger2 = float(gt_hellinger2_joint)
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
@@ -1380,6 +1390,8 @@ class Phlag:
         self.n_windows = self.Y.shape[0]
         self.rho = self.args.rho
         self.beta = self.args.beta
+        if self.beta is None and getattr(self.args, "beta_prime", None) is not None:
+            self.beta = self.args.beta_prime * self.n_windows
         if self.rho is None and self.beta is None:
             # neutral for Dirichlet mode, would be zeros for mean
             self.psi = jnp.ones((2, 2)) + PSI_EPS
@@ -1695,6 +1707,12 @@ class PhlagPlotter:
                 self._draw_fit(ax, x_vals, state, pdf_vals, "EM", False)
 
             self._style_axis(ax, "Fit", d, "Probability Density")
+            em_hd = getattr(self.phlag, "em_hellinger2", None)
+            if em_hd is not None and d == 0:
+                gt_hd = getattr(self.phlag, "gt_hellinger2", None)
+                hd_str = f"{gt_hd:.3f} → {em_hd:.3f}" if gt_hd is not None else f"{em_hd:.3f}"
+                ax.text(0.02, 0.98, f"$H_d^2$ = {hd_str}", transform=ax.transAxes, ha="left", va="top", fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#cccccc", alpha=0.9))
 
     # 10x CasterPlotter._needs_log_scale's own 100x default -- em.png's axes
     # (topology scores clustered tight around a window-size-dependent mean,
@@ -1703,6 +1721,7 @@ class PhlagPlotter:
     # ticks over a 1e-9 linthresh were too cluttered to read; a plain linear
     # axis is fine until the spread is genuinely extreme.
     LOG_SCALE_RATIO_THRESHOLD = 1000.0
+    X_LINTHRESH_PERCENTILE = 90
 
     def _apply_log_scales(self, axes):
         """Auto-detects log/symlog scaling per topology column, reusing
@@ -1723,7 +1742,8 @@ class PhlagPlotter:
             x_vals = Y_np[:, d]
             x_vals = x_vals[np.isfinite(x_vals)]
             if CasterPlotter._needs_log_scale(np.abs(x_vals), ratio_threshold=self.LOG_SCALE_RATIO_THRESHOLD):
-                scale, kwargs = ('symlog', {'linthresh': 1e-9}) if (x_vals < 0).any() else ('log', {})
+                linthresh = 10 ** np.ceil(np.log10(max(float(np.percentile(np.abs(x_vals), self.X_LINTHRESH_PERCENTILE)), 1e-9)))
+                scale, kwargs = ('symlog', {'linthresh': linthresh}) if (x_vals < 0).any() else ('log', {})
                 for ax in col_axes:
                     ax.set_xscale(scale, **kwargs)
 
@@ -1783,16 +1803,27 @@ class PhlagPlotter:
                 if j in offset_applied:
                     continue
                 xj, yj = lines[j].get_xdata(), lines[j].get_ydata()
-                if len(xi) != len(xj) or not np.allclose(xi, xj):
-                    continue
+                if len(xi) == len(xj) and np.allclose(xi, xj):
+                    yi_cmp, yj_cmp = yi, yj
+                else:
+                    # KDE curves each carry their own evaluation grid (sns.kdeplot
+                    # fits per-subset), so exact-grid lines (the Fit row) compare
+                    # directly above, but here two lines must be resampled onto
+                    # their shared x-overlap before their heights are comparable.
+                    x_lo, x_hi = max(xi.min(), xj.min()), min(xi.max(), xj.max())
+                    if x_hi <= x_lo:
+                        continue
+                    common_x = np.linspace(x_lo, x_hi, min(len(xi), len(xj)))
+                    yi_cmp = np.interp(common_x, xi, yi)
+                    yj_cmp = np.interp(common_x, xj, yj)
                 if is_log:
-                    posmask = (yi > 0) & (yj > 0)
+                    posmask = (yi_cmp > 0) & (yj_cmp > 0)
                     if not posmask.any():
                         continue
-                    coincide = np.max(np.abs(np.log10(yi[posmask]) - np.log10(yj[posmask]))) < decade_tol
+                    coincide = np.max(np.abs(np.log10(yi_cmp[posmask]) - np.log10(yj_cmp[posmask]))) < decade_tol
                 else:
-                    scale = max(np.max(np.abs(yi)), np.max(np.abs(yj)), 1e-300)
-                    coincide = np.max(np.abs(yi - yj)) / scale < rel_tol
+                    scale = max(np.max(np.abs(yi_cmp)), np.max(np.abs(yj_cmp)), 1e-300)
+                    coincide = np.max(np.abs(yi_cmp - yj_cmp)) / scale < rel_tol
                 if coincide:
                     lines[i].set_ydata(yi * span_mult if is_log else yi + span_add)
                     offset_applied.add(i)
@@ -2019,10 +2050,12 @@ def build_parser():
 
     parser.add_argument(
         "caster_scores",
-        nargs="?",
+        nargs="*",
         type=pathlib.Path,
         default=None,
-        help="Path to the CASTER scores TSV"
+        help="Path(s) to CASTER scores TSV(s) or locus specs (e.g. "
+             "10X/down/N109/37-62). Multiple values run phlag once per value "
+             "with the same flags."
     )
     parser.add_argument(
         "-r",
@@ -2202,7 +2235,7 @@ def build_parser():
              "not meant to be passed by hand. When set, report.tsv is written as a "
              "flat '<output-base>/<pattern>.tsv' file instead of the default "
              "'<pattern>/report.tsv', and the output root is the shared canonical "
-             "tree (default: off, writes report.tsv + plots to <repo_root>/out/"
+             "tree (default: off, writes report.tsv + plots to <repo_root>/out/msa/"
              "<category>/<subcategory>/<node_name>/<pattern>/w<W>_s<S>[/variant]/<dist_type>"
              "[/rho..._beta.../var2x/repulsion/annealing/lam...]/ instead of the "
              "shared tree, for standalone use).",
@@ -2238,25 +2271,40 @@ def build_parser():
         "--rho",
         dest="rho",
         type=float,
+        nargs="+",
         default=None,
         help="""Expected fraction of windows that are null, for the transition
                     matrix's sticky Dirichlet prior -- scaled by the run's window
                     count and combined with --beta into per-row pseudocounts added
                     to the EM M-step's expected transition counts. Must be set
                     together with --beta; omitting both disables the transition
-                    prior entirely (default: unset, no prior).""",
+                    prior entirely (default: unset, no prior). Multiple
+                    space-separated values run one phlag run per value
+                    (cartesian product with --beta/--beta-prime and -w/-s).""",
     )
     hmm_group.add_argument(
         "--beta",
         dest="beta",
         type=float,
+        nargs="+",
         default=None,
         help="""Expected number of state-to-state transitions each way (e.g.
                     null->alt, alt->null) -- used directly as the off-diagonal
                     pseudocounts of the transition matrix's sticky Dirichlet prior,
                     see --rho. Must be set together with --rho; omitting both
                     disables the transition prior entirely (default: unset,
-                    no prior).""",
+                    no prior). Accepts multiple values, see --rho.""",
+    )
+    hmm_group.add_argument(
+        "--beta-prime",
+        dest="beta_prime",
+        type=float,
+        nargs="+",
+        default=None,
+        help="""Per-window rate for --beta: sets beta to beta_prime * the run's
+                    window count. Ignored if --beta is passed; otherwise needs
+                    --rho like --beta does (default: unset). Accepts multiple
+                    values, see --rho.""",
     )
     hmm_group.add_argument(
         "--correct-transition",
@@ -2272,28 +2320,55 @@ def build_parser():
 def parse_arguments(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if isinstance(args.caster_scores, list):
+        if len(args.caster_scores) > 1:
+            parser.error("parse_arguments takes a single caster_scores; use main() for multiple")
+        args.caster_scores = args.caster_scores[0] if args.caster_scores else None
 
     report_arg = args.caster_scores
     if (report_arg is not None and not report_arg.is_absolute()
             and report_arg.name == "report.tsv" and report_arg.exists()):
         # A relative path to an existing report.tsv, not a scores file --
-        # report.tsv's own first line (see initialize_output) records the
-        # exact `sys.argv` that produced it, so replay that run instead of
-        # trying to read report.tsv itself as scores. This run's own flags
-        # still win: recovered tokens go first and this invocation's own
-        # tokens (with the report.tsv positional stripped out) go after,
-        # relying on argparse's left-to-right store semantics -- a flag
-        # repeated later in the stream overwrites the earlier occurrence.
-        import shlex
-        recovered_tokens = shlex.split(report_arg.read_text().splitlines()[0])[1:]
+        # its out/ path already encodes the run's config: the sibling
+        # scores.tsv sits right above the <dist> segment, and the segments
+        # after it are get_phlag_param_segments' own
+        # [/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>], so
+        # rebuild the invocation from those. This run's own flags still win:
+        # recovered tokens go first and this invocation's own tokens (with
+        # the report.tsv positional stripped out) go after, relying on
+        # argparse's left-to-right store semantics.
+        import re
+        parts = report_arg.parts[:-1]
+        dist_idx = next((i for i in range(len(parts) - 1, -1, -1) if parts[i] in ("gaussian", "gmm")), None)
+        if dist_idx is None:
+            parser.error(f"'{report_arg}' has no gaussian/gmm segment to recover its config from")
+        recovered_tokens = [str(pathlib.Path(*parts[:dist_idx]) / "scores.tsv"), "-d", parts[dist_idx]]
+        for seg in parts[dist_idx + 1:]:
+            m_rb = re.fullmatch(r"rho([\d.]+)_beta([\d.]+)", seg)
+            m_rbp = re.fullmatch(r"rho([\d.]+)_betaprime([\d.]+)", seg)
+            m_lam = re.fullmatch(r"lam([\d.]+)", seg)
+            if m_rb:
+                recovered_tokens += ["--rho", m_rb.group(1), "--beta", m_rb.group(2)]
+            elif m_rbp:
+                recovered_tokens += ["--rho", m_rbp.group(1), "--beta-prime", m_rbp.group(2)]
+            elif m_lam:
+                recovered_tokens += ["--lam", m_lam.group(1)]
+            elif seg == "var2x":
+                recovered_tokens.append("--double-variance-init")
+            elif seg == "repulsion":
+                recovered_tokens += ["--ap", "repulsion"]
+            elif seg == "annealing":
+                recovered_tokens.append("--annealing")
+            else:
+                parser.error(f"'{report_arg}': unrecognized config segment '{seg}'")
         raw_argv = list(argv) if argv is not None else sys.argv[1:]
         override_tokens = list(raw_argv)
         try:
             override_tokens.remove(str(report_arg))
         except ValueError:
             pass
-        print(f"'{report_arg}' is a report.tsv -- replaying its recorded "
-              f"invocation ({' '.join(recovered_tokens)}) with this run's own "
+        print(f"'{report_arg}' is a report.tsv -- rerunning with config from "
+              f"its path ({' '.join(recovered_tokens)}) with this run's own "
               f"flags taking precedence.")
         return parse_arguments(recovered_tokens + override_tokens)
 
@@ -2321,7 +2396,8 @@ def parse_arguments(argv=None):
             data_dir / "caster",
             repo_root / "store" / "caster",
         ]
-        flat_bases = [repo_root / "out"]
+        from .utils import get_out_root
+        flat_bases = [get_out_root()]
 
         # flat_candidates (out/) and canonical_candidates are kept in
         # separate pools rather than merged-then-sorted-by-mtime: out/ is the
@@ -2341,7 +2417,7 @@ def parse_arguments(argv=None):
                 pool.append(sfile)
 
         def is_score_candidate(sfile):
-            return sfile.name != "report.tsv" and not any(
+            return sfile.name not in ("report.tsv", "quartet_counts.tsv") and not any(
                 sfile.name.startswith(p) for p in ["report_", "em_", "states_"]
             )
 
@@ -2359,7 +2435,7 @@ def parse_arguments(argv=None):
                         if "caster" in sfile.parts:
                             add(canonical_candidates, sfile)
                     for sfile in td.rglob("*.tsv"):
-                        if "caster" in sfile.parts and not any(sfile.name.startswith(p) for p in ["report_", "em_", "states_"]):
+                        if "caster" in sfile.parts and is_score_candidate(sfile):
                             add(canonical_candidates, sfile)
             else:
                 for sfile in b.rglob("scores.tsv"):
@@ -2420,8 +2496,20 @@ def parse_arguments(argv=None):
         else:
             node_name = get_simulation_node_name(fasta_path) or fasta_path.stem
 
+        from .caster import parse_ws_from_path
+
+        # Variant flags (--pair/--site/-z/--ilr/--normalize/--exp-minus) are
+        # caster's, not phlag's, so a bare FASTA means caster's plain dstar
+        # output -- prefer that over a newer variant sibling (stable sort
+        # keeps newest-first within each group).
+        def is_variant(sfile):
+            ws = parse_ws_from_path(sfile)
+            return (ws is None or ws[0] != "w" or any(ws[3:])
+                    or bool({"site", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
+
         fasta_resolved = fasta_path.resolve()
-        for candidate in resolve_model_scores(target_name=node_name, return_all=True):
+        candidates = sorted(resolve_model_scores(target_name=node_name, return_all=True), key=is_variant)
+        for candidate in candidates:
             try:
                 src = recover_source_fasta(candidate)
             except (OSError, UnicodeDecodeError):
@@ -2498,16 +2586,29 @@ def _run_single(args):
 
 
 def main(argv=None):
-    args = parse_arguments(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    specs = build_parser().parse_args(raw_argv).caster_scores or []
+    if len(specs) > 1:
+        spec_tokens = {str(spec) for spec in specs}
+        rest = [t for t in raw_argv if t not in spec_tokens]
+        results = []
+        for spec in specs:
+            print(f"[phlag] multi-input -- running {spec}...")
+            results.append(main([str(spec)] + rest))
+        return results
+
+    args = parse_arguments(raw_argv)
+
+    import copy
+    import itertools
 
     window_sizes = args.window_size
     step_sizes = args.step_size
     batch_w = window_sizes is not None
     batch_s = isinstance(step_sizes, list)
 
+    ws_combos = [None]
     if batch_w or batch_s:
-        import copy
-        import itertools
         from .caster import parse_ws_from_path, substitute_ws_in_path
 
         base_path = pathlib.Path(args.caster_scores)
@@ -2524,21 +2625,44 @@ def main(argv=None):
         # step with window per size, not one fixed absolute step across sizes.
         s_list = step_sizes if batch_s else [1.0]
 
-        results = []
+        ws_combos = []
         for w, s in itertools.product(w_list, s_list):
             step = s if isinstance(s, int) else max(1, round(s * w))
             new_path = substitute_ws_in_path(base_path, w, step)
             if not new_path.exists():
                 sys.exit(f"Error: no scores file found at '{new_path}' for -w {w} -s {s} (step={step}).")
-            print(f"[phlag] -w/-s batch -- running w={w} s={step} ({new_path})...")
-            run_args = copy.copy(args)
+            ws_combos.append((w, step, new_path))
+
+    # --beta overrides --beta-prime, so crossing both would just repeat runs.
+    beta_primes = [None] if args.beta else (args.beta_prime or [None])
+    prior_combos = list(itertools.product(args.rho or [None], args.beta or [None], beta_primes))
+
+    if ws_combos == [None] and len(prior_combos) == 1:
+        args.rho, args.beta, args.beta_prime = prior_combos[0]
+        return _run_single(args)
+
+    from .utils import get_phlag_param_segments
+
+    results = []
+    for ws_combo, (rho, beta, beta_prime) in itertools.product(ws_combos, prior_combos):
+        run_args = copy.copy(args)
+        run_args.rho, run_args.beta, run_args.beta_prime = rho, beta, beta_prime
+        label = f"rho={rho} beta={beta} beta_prime={beta_prime}"
+        out_segments = [seg for seg in get_phlag_param_segments(run_args) if seg.startswith("rho")]
+        if ws_combo is not None:
+            w, step, new_path = ws_combo
             run_args.caster_scores = new_path
             run_args.window_size = w
             run_args.step_size = step
-            results.append(_run_single(run_args))
-        return results
-
-    return _run_single(args)
+            label = f"w={w} s={step} {label} ({new_path})"
+            out_segments.insert(0, next(p for p in new_path.parts if parse_ws_from_path(pathlib.Path(p))))
+        # -o names a single output file, so each batch combo gets its own
+        # subdirectory next to it rather than overwriting the same path.
+        if args.output_file and out_segments:
+            run_args.output_file = args.output_file.parent.joinpath(*out_segments, args.output_file.name)
+        print(f"[phlag] batch -- running {label}...")
+        results.append(_run_single(run_args))
+    return results
 
 
 if __name__ == "__main__":

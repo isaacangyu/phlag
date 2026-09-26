@@ -26,9 +26,20 @@ from bench.benchmark import (
     parse_report,
 )
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path
-from phlag.utils import ADMIXTURE_DIVERGENCE_THRESHOLD_MYR, read_gt_stats_file
+from phlag.utils import (
+    ADMIXTURE_DIVERGENCE_THRESHOLD_MYR,
+    get_admixture_divergence_time,
+    get_cu_branch_length_from_population_info,
+    get_out_root,
+    get_repo_root,
+    get_simulation_clade,
+    read_gt_stats_file,
+)
 
 STORE_ROOT = "store/phlag"
+
+PHLAG_SOURCE_ROOTS = {"gtrees": str(get_repo_root() / "out" / "gtrees"), "msa": str(get_out_root())}
+WINDOWLESS_PHLAG_SOURCES = {"gtrees"}
 
 SWEEP_METRICS = ["em_hd", "roc_auc", "f1"]
 
@@ -916,12 +927,7 @@ class CrossRunAnalysis:
         return fig
 
     def _plot_run(self, axes, path, metrics, exclude_keywords=(), logy=False, title=""):
-        df = collect_out_runs(path, exclude_keywords)
-        if df.empty:
-            raise FileNotFoundError(f"No report.tsv found under {path}")
-        df, _ = _filter_out_runs(df, axes)
-        if df.empty:
-            raise ValueError(f"No report under {path} matches {axes}")
+        df = _collect_run_df(axes, path, exclude_keywords)
         panels = [(m,) if isinstance(m, str) else tuple(m) for m in metrics]
         missing = sorted({m for panel in panels for m in panel} - set(df.columns))
         if missing:
@@ -973,6 +979,62 @@ class CrossRunAnalysis:
         plt.show()
         return fig
 
+    def _plot_branches(self, axes, runs, metrics, exclude_keywords=(), title=""):
+        dfs = {label: _collect_run_df(axes, path, exclude_keywords) for label, path in runs.items()}
+        configs = sorted({c for df in dfs.values() for c in df["config"]})
+        palette = dict(zip(configs, sns.color_palette("tab10", max(len(configs), 1))))
+        markers = ["o", "s", "^", "D", "v", "P"]
+        fig, axs = plt.subplots(len(metrics), len(runs), figsize=(3.4 * len(runs), 3.2 * len(metrics)),
+                                squeeze=False)
+        for ci, (label, path) in enumerate(runs.items()):
+            df = dfs[label]
+            sized = df.dropna(subset=["window"])
+            sizes = sorted({(int(w), int(s)) for w, s in zip(sized["window"], sized["step"])}) or [(None, None)]
+            size_labels = ["" if w is None else format_val(w) if w == s else f"{format_val(w)}/{format_val(s)}"
+                           for w, s in sizes]
+
+            def rows_at(config, w, s):
+                sub = df[df["config"] == config]
+                return sub[sub["window"].isna() | ((sub["window"] == w) & (sub["step"] == s))]
+
+            node_pattern = "/".join(Path(path).parts[-2:])
+            axs[0][ci].set_title(f"{label}\n{node_pattern}\n{_branch_length_label(df, path)}", fontsize=9)
+            for ri, metric in enumerate(metrics):
+                ax = axs[ri][ci]
+                ax.grid(alpha=0.25)
+                if metric == "tpr_fpr":
+                    ax.plot([0, 1], [0, 1], color="0.7", linestyle="--", linewidth=0.8)
+                    for k, config in enumerate(configs):
+                        for si, (w, s) in enumerate(sizes):
+                            sub = rows_at(config, w, s)
+                            if sub.empty:
+                                continue
+                            ax.scatter(sub["fpr"].mean(), sub["tpr"].mean(), color=palette[config],
+                                       marker=markers[si % len(markers)], s=70 / (k + 1), zorder=3)
+                    ax.set_xlim(-0.02, 1.02)
+                    ax.set_ylim(-0.02, 1.02)
+                    ax.set_xlabel("FPR")
+                    ax.set_ylabel("TPR" if ci == 0 else "")
+                    continue
+                width = 0.8 / max(len(configs), 1)
+                for k, config in enumerate(configs):
+                    for si, (w, s) in enumerate(sizes):
+                        sub = rows_at(config, w, s)
+                        if sub.empty:
+                            continue
+                        ax.bar(si + (k - (len(configs) - 1) / 2) * width, sub[metric].mean(), width,
+                               color=palette[config])
+                ax.set_xticks(range(len(sizes)))
+                ax.set_xticklabels(size_labels, fontsize=8)
+                ax.set_ylabel(metric if ci == 0 else "")
+                _apply_bounded_yaxis(ax, metric)
+        handles = [plt.Rectangle((0, 0), 1, 1, facecolor=palette[c]) for c in configs]
+        fig.legend(handles, configs, loc="lower center", ncol=min(len(configs), 6), fontsize=8, frameon=False)
+        fig.suptitle(title or ", ".join(f"{k}={v}" for k, v in axes.items()), fontsize=10)
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        plt.show()
+        return fig
+
     def plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
              title="", options=None, show_config_suffix=True, logy=False):
         """`run` (a directory, e.g. "out/10X/down/N276/37-62") makes this a
@@ -984,7 +1046,9 @@ class CrossRunAnalysis:
         tuple overlays its members, e.g. ("gt_transition_null_to_alt",
         "fitted_transition_null_to_alt")). An axes value may be a list (any
         of); flags the out/ path doesn't encode (--np, ...) are skipped.
-        Pass {} to keep every report.
+        Pass {} to keep every report. A dict {label: dir} or a list of dirs
+        (label = the dir minus its trailing <node>/<pattern>) plots one
+        column per run instead.
         `exclude_keywords` drops report paths containing any keyword; `logy`
         log-scales y; agg/grid_by/plot_type don't apply. Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
         (see its docstring, including its "" placeholder and tuple-axis
@@ -1124,7 +1188,9 @@ class CrossRunAnalysis:
         scaled multiplicatively (proportional to that position's value)
         instead of the usual fixed-width additive offsets around an integer
         index -- categorical (non-numeric) axes ignore "logx" and render as
-        before. "logy" sets a log y-scale and skips _apply_bounded_yaxis's
+        before. "logy" sets a log y-scale (True) or picks one per subplot
+        ("auto": log only when that subplot's pooled values are all > 0 and
+        span >= 2 decades, see _resolve_logy) and skips _apply_bounded_yaxis's
         [0, 1] pin (log and a hard 0 floor don't mix). "interp" overlays one
         line per hue/sub-metric connecting that series' mean across bar
         positions, sorted by position -- a visual trend guide alongside the
@@ -1139,12 +1205,21 @@ class CrossRunAnalysis:
         by caster/benchmark before phlag's EM ever runs) so the title
         doesn't imply a dependency that isn't there."""
         assert metrics is not None, "metrics is required"
+        if isinstance(run, (list, tuple)):
+            run = {"/".join(Path(p).parts[:-2]) or str(p): p for p in run}
+        if isinstance(run, dict):
+            run = {label: _resolve_run_path(p) for label, p in run.items()}
+        elif run is not None:
+            run = _resolve_run_path(run)
+        if isinstance(run, dict):
+            return self._plot_branches(axes, run, metrics, exclude_keywords=exclude_keywords, title=title)
         if run is not None:
             return self._plot_run(axes, run, metrics, exclude_keywords=exclude_keywords, logy=logy, title=title)
         assert plot_type in ("bar", "violin", "heatmap")
         assert grid_by in (None, "hd_bin") or plot_type == "heatmap"
         options = options or {}
-        logx, logy, interp = bool(options.get("logx")), bool(options.get("logy")), bool(options.get("interp"))
+        logx, interp = bool(options.get("logx")), bool(options.get("interp"))
+        logy = options.get("logy", logy)
         configs = self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords, agg=agg)
         self._last_configs = configs
         suffix = self._title_suffix(configs) if show_config_suffix else ""
@@ -1278,7 +1353,7 @@ class CrossRunAnalysis:
             if isinstance(panel, tuple):
                 ax.set_title(" / ".join(panel), fontsize=9.5)
                 bounded = False
-                if logy:
+                if _resolve_logy(logy, dfs, panel):
                     ax.set_yscale("log")
                 else:
                     bounded = _apply_bounded_yaxis(ax, panel)
@@ -1318,7 +1393,7 @@ class CrossRunAnalysis:
                 panel_col = _METRIC_PANEL_COLUMN.get(metric)
                 ax.set_title(metric, fontsize=9.5)
                 bounded = False
-                if logy:
+                if _resolve_logy(logy, dfs, metric):
                     ax.set_yscale("log")
                 else:
                     bounded = _apply_bounded_yaxis(ax, metric)
@@ -1632,7 +1707,7 @@ class CrossRunAnalysis:
                     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
                     ax.set_axisbelow(True)
                     bounded = False
-                    if logy:
+                    if _resolve_logy(logy, dfs, this_metric):
                         ax.set_yscale("log")
                     else:
                         bounded = _apply_bounded_yaxis(ax, this_metric)
@@ -1701,7 +1776,7 @@ class CrossRunAnalysis:
                     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
                     ax.set_axisbelow(True)
                     bounded = False
-                    if logy:
+                    if _resolve_logy(logy, dfs, metric):
                         ax.set_yscale("log")
                     else:
                         bounded = _apply_bounded_yaxis(ax, metric)
@@ -2132,7 +2207,7 @@ OUT_RUN_ID_COLUMNS = ["report_path", "config", "mode", "window", "step"]
 _OUT_RUN_METRIC_KEYS = {
     "tpr": "tpr", "fpr": "fpr", "precision": "precision", "f1": "f1", "accuracy": "accuracy",
     "roc_auc": "auc", "em_hd": "em_hd", "em_gt_hd": "em_gt_hd", "bic": "bic",
-    "log_likelihood": "log_likelihood", "n_windows": "n_windows",
+    "log_likelihood": "log_likelihood", "n_windows": "n_windows", "branch_length": "branch_length",
     **{f"{prefix}_transition_{move}": f"{key}_{move}"
        for prefix, key in (("fitted", "transition"), ("gt", "gt_transition"), ("viterbi", "viterbi_transition"))
        for move in ("null_to_null", "null_to_alt", "alt_to_null", "alt_to_alt")},
@@ -2156,12 +2231,13 @@ _OUT_SIZE_SEGMENT = re.compile(r"^([wc])\d+[km]?_s\d+[km]?(.*)$", re.IGNORECASE)
 _DEST_TO_FLAG = {}
 for _flag, _dest in _FLAG_TO_DEST.items():
     _DEST_TO_FLAG.setdefault(_dest, _flag)
-_OUT_PARAM_SEGMENT = re.compile(r"^(?:rho(?P<rho>[-\d.eE+]+)_beta(?P<beta>[-\d.eE+]+)|var2x|repulsion|annealing|lam(?P<lam>[-\d.eE+]+))$")
+_OUT_PARAM_SEGMENT = re.compile(r"^(?:rho(?P<rho>[-\d.eE+]+)_beta(?P<bp>prime)?(?P<beta>[-\d.eE+]+)|var2x|repulsion|annealing|lam(?P<lam>[-\d.eE+]+))$")
 
 
 def _path_after_out(path):
-    parts = Path(path).parts
-    return "/".join(parts[len(parts) - parts[::-1].index("out"):]) if "out" in parts else str(path)
+    from phlag.utils import get_out_relative_parts
+    rel = get_out_relative_parts(Path(path).parts)
+    return "/".join(rel) if rel is not None else str(path)
 
 
 def _recorded_from_report_path(report):
@@ -2174,11 +2250,11 @@ def _recorded_from_report_path(report):
     mode, window, step, is_site, is_z, is_ilr, is_norm, norm_eps = parse_ws_from_path(report)
     parts = report.parent.parts
     size_idx = next(i for i, part in enumerate(parts) if _OUT_SIZE_SEGMENT.match(part))
-    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "ilr", "normalize", "norm-eps")]
+    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "ilr", "normalize", "norm-eps", "exp-minus")]
     recorded = {
         "window_size": window, "step_size": step, "site": is_site, "zscale": is_z, "ilr": is_ilr,
-        "normalize": is_norm, "norm_eps": norm_eps, "pair": mode == "c" and not is_site,
-        "rho": None, "beta": None, "double_variance_init": False, "alt_emission_parameterization": "free",
+        "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "pair": mode == "c" and not is_site,
+        "rho": None, "beta": None, "beta_prime": None, "double_variance_init": False, "alt_emission_parameterization": "free",
         "annealing": False, "emission_lambda": None,
     }
     if rest:
@@ -2188,7 +2264,8 @@ def _recorded_from_report_path(report):
         if not m:
             continue
         if m.group("rho"):
-            recorded["rho"], recorded["beta"] = float(m.group("rho")), float(m.group("beta"))
+            recorded["rho"] = float(m.group("rho"))
+            recorded["beta_prime" if m.group("bp") else "beta"] = float(m.group("beta"))
         elif m.group("lam"):
             recorded["emission_lambda"] = float(m.group("lam"))
         elif seg == "var2x":
@@ -2270,7 +2347,7 @@ def _out_gt_stats_columns(report):
     return out
 
 
-def collect_out_runs(path, exclude_keywords=()):
+def collect_out_runs(path, exclude_keywords=(), windowless=False):
     """One row per report.tsv under `path` (a runs.tsv-shaped table for the
     ad-hoc out/ tree, which has no runs.tsv of its own), columns: OUT_RUN_ID_COLUMNS
     plus every _OUT_RUN_METRIC_KEYS name (runs.tsv's f1/roc_auc/em_hd/... and
@@ -2278,16 +2355,17 @@ def collect_out_runs(path, exclude_keywords=()):
     benchmark.parse_report). also the null_/alt_/pooled_ gt_stats columns (`_out_gt_stats_columns`). `config` is the report's directory relative to
     `path` minus its w<W>_s<S> size segment (a pair-mode 'c' size or flat
     '_site'-style suffix is kept, as it changes what's being compared),
-    with leading segments shared by every report dropped."""
+    with leading segments shared by every report dropped. windowless=True
+    keeps reports with no size segment (window/step/mode None, no gt_stats)."""
     path = Path(path)
     records = []
     for report in sorted(path.rglob("report.tsv")):
         if any(k in str(report) for k in exclude_keywords):
             continue
-        ws = parse_ws_from_path(report)
-        if ws is None:
+        ws = None if windowless else parse_ws_from_path(report)
+        if ws is None and not windowless:
             continue
-        mode, window, step = ws[0], ws[1], ws[2]
+        mode, window, step = ws[:3] if ws else (None, None, None)
         parts = list(report.relative_to(path).parent.parts)
         tokens = []
         for part in parts:
@@ -2299,7 +2377,8 @@ def collect_out_runs(path, exclude_keywords=()):
         parsed = parse_report(report)
         row = {"report_path": str(report), "mode": mode, "window": window, "step": step, "_tokens": [t for t in tokens if t]}
         row.update({col: parsed[key] for col, key in _OUT_RUN_METRIC_KEYS.items()})
-        row.update(_out_gt_stats_columns(report))
+        if not windowless:
+            row.update(_out_gt_stats_columns(report))
         records.append(row)
     if not records:
         return pd.DataFrame(columns=OUT_RUN_ID_COLUMNS)
@@ -2311,6 +2390,69 @@ def collect_out_runs(path, exclude_keywords=()):
         r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(run)"
     df = pd.DataFrame(records)
     return df.reindex(columns=OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS)
+
+
+def _path_below_source_root(path):
+    path = Path(path)
+    parts = (path if path.is_absolute() else get_repo_root() / path).parts
+    for root in PHLAG_SOURCE_ROOTS.values():
+        root_parts = Path(root).parts
+        if parts[:len(root_parts)] == root_parts:
+            return Path(*parts[len(root_parts):])
+    return path
+
+
+def _resolve_run_path(path):
+    path = Path(path)
+    if path.is_absolute() or (get_repo_root() / path).exists():
+        return str(path)
+    return str(Path(get_out_root()) / path)
+
+
+def _collect_run_df(axes, path, exclude_keywords=()):
+    """collect_out_runs + _filter_out_runs for one run dir. An axes "phlag"
+    entry (a PHLAG_SOURCE_ROOTS key, or a list of them) instead reads `path`
+    (relative to a source root, or with one as prefix) under each named root,
+    prefixing every row's config with its source name. A
+    WINDOWLESS_PHLAG_SOURCES source has no w<W>_s<S> dirs, so its reports
+    are kept unfiltered by `axes`, with window/step None."""
+    axes = dict(axes)
+    sources = axes.pop("phlag", None)
+    if sources is None:
+        df = collect_out_runs(path, exclude_keywords)
+        if df.empty:
+            raise FileNotFoundError(f"No report.tsv found under {path}")
+        df, _ = _filter_out_runs(df, axes)
+    else:
+        rel = _path_below_source_root(path)
+        frames = []
+        for source in [sources] if isinstance(sources, str) else sources:
+            windowless = source in WINDOWLESS_PHLAG_SOURCES
+            d = collect_out_runs(Path(PHLAG_SOURCE_ROOTS[source]) / rel, exclude_keywords, windowless=windowless)
+            if d.empty:
+                continue
+            if not windowless:
+                d, _ = _filter_out_runs(d, axes)
+            d = d.assign(config=[source if c == "(run)" else f"{source}/{c}" for c in d["config"]])
+            frames.append(d.dropna(axis=1, how="all"))
+        columns = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS
+        df = pd.concat(frames, ignore_index=True).reindex(columns=columns) if frames else pd.DataFrame()
+    if df.empty:
+        raise ValueError(f"No report under {path} matches {axes} (phlag={sources})")
+    return df
+
+
+def _branch_length_label(df, path):
+    if "admixture" in Path(path).parts:
+        t = get_admixture_divergence_time(path)
+        return "admixture" if t is None else f"admixture t={t:.2f} Myr"
+    lengths = df["branch_length"].dropna()
+    if lengths.empty:
+        _, clade, _ = get_simulation_clade(Path(path) / "scores.tsv")
+        bl = get_cu_branch_length_from_population_info(clade) if clade else None
+    else:
+        bl = lengths.iloc[0]
+    return "BL N/A" if bl is None else f"BL {bl:.3g} CU"
 
 
 def _typed_value(flag, raw_value):
@@ -2585,6 +2727,30 @@ def _draw_stat(ax, pos, vals, color, width, plot_type):
         return (v, v)
 
 
+_AUTOLOG_MIN_DECADES = 2.0
+
+
+def _resolve_logy(logy, dfs, metrics):
+    """logy=True -> True. logy="auto" -> True when the pooled values of
+    `metrics` (one name or an iterable, as in _apply_bounded_yaxis) across
+    every config in `dfs` are all strictly positive and their 1st-99th
+    percentile range spans >= _AUTOLOG_MIN_DECADES decades -- e.g. variances
+    across window sizes. Anything else (incl. any value <= 0, which a log
+    axis can't show) stays linear."""
+    if logy != "auto":
+        return bool(logy)
+    names = (metrics,) if isinstance(metrics, str) else tuple(metrics)
+    chunks = [d[m].to_numpy(dtype=float) for d in dfs.values() for m in names if m in d.columns]
+    if not chunks:
+        return False
+    vals = np.concatenate(chunks)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0 or vals.min() <= 0:
+        return False
+    lo, hi = np.percentile(vals, [1, 99])
+    return math.log10(hi / lo) >= _AUTOLOG_MIN_DECADES
+
+
 def _apply_bounded_yaxis(ax, metrics):
     """Pins `ax`'s y-axis to [0, 1] with 0.2-step ticks when `metrics` (a
     single metric name, or an iterable of them sharing one combined subplot
@@ -2616,7 +2782,7 @@ def _clip_axis_to_whiskers(ax, bounds, pad=1.2):
     visible_top = hi * pad if hi > 0 else (hi + 1.0)
     _, cur_top = ax.get_ylim()
     if cur_top > visible_top * 1.05:
-        ax.set_ylim(min(0.0, lo), visible_top)
+        ax.set_ylim(lo / pad if ax.get_yscale() == "log" else min(0.0, lo), visible_top)
         _draw_break_marker(ax)
 
 

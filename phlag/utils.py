@@ -188,6 +188,20 @@ def gaussian_hellinger2_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
     bc = np.exp(log_coef - 0.125 * quad)
     return float(max(1.0 - bc, 0.0))
 
+def mardia_skewness(X):
+    import numpy as np
+    X = np.asarray(X, dtype=float)
+    n = X.shape[0]
+    Xc = X - X.mean(axis=0)
+    S = (Xc.T @ Xc) / n
+    w, V = np.linalg.eigh(S)
+    keep = w > 1e-12 * max(w.max(), 1e-300)
+    if not keep.any():
+        return float("nan")
+    Z = Xc @ (V[:, keep] / np.sqrt(w[keep]))
+    M3 = np.einsum("ia,ib,ic->abc", Z, Z, Z, optimize=True) / n
+    return float(np.sum(M3 ** 2))
+
 def exponential_hellinger2_nd(rates1, rates2, eps=1e-12):
     """
     Squared Hellinger distance between two independent-per-dimension
@@ -308,6 +322,8 @@ def write_gt_stats_file(path, stats):
         if skew_key in stats:
             skew_vals = [float(x) for x in stats[skew_key]]
             lines.append(f"{label} skewness: {skew_vals}")
+        if f"{label}MardiaSkewness" in stats:
+            lines.append(f"{label} Mardia skewness: {float(stats[f'{label}MardiaSkewness'])}")
         within_mean_key, within_var_key = f"{label}WithinMean", f"{label}WithinVariance"
         if within_mean_key in stats:
             lines.append(f"{label} within mean: {[float(x) for x in stats[within_mean_key]]}")
@@ -334,7 +350,7 @@ def read_gt_stats_file(path):
     p = _pathlib.Path(path)
     if not p.exists():
         return {}
-    means, covs, skews = {}, {}, {}
+    means, covs, skews, mardias = {}, {}, {}, {}
     within_means, within_vars = {}, {}
     hellinger2 = None
     transition_matrix = None
@@ -387,6 +403,13 @@ def read_gt_stats_file(path):
             except (ValueError, SyntaxError):
                 pass
             continue
+        m = re.match(r'^(Null|Alt|Overall) Mardia skewness:\s*(\S+)\s*$', line)
+        if m:
+            try:
+                mardias[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+            continue
         m = re.match(r'^Hellinger2:\s*([-\d.eE+]+)\s*$', line)
         if m:
             try:
@@ -397,6 +420,8 @@ def read_gt_stats_file(path):
     for label in ("Null", "Alt", "Overall"):
         if label in skews:
             result[f"{label}Skewness"] = skews[label]
+        if label in mardias:
+            result[f"{label}MardiaSkewness"] = mardias[label]
         if label in within_means:
             result[f"{label}WithinMean"] = within_means[label]
         if label in within_vars:
@@ -457,6 +482,8 @@ def collect_gt_stats(root_dir, variant_markers=("site", "ilr", "normalize")):
             if f"{region}Skewness" in stats:
                 for topo, s in zip(("ABBA", "BABA", "AABB"), stats[f"{region}Skewness"]):
                     row[f"{region.lower()}_skew_{topo}"] = s
+            if f"{region}MardiaSkewness" in stats:
+                row[f"{region.lower()}_mardia_skew"] = stats[f"{region}MardiaSkewness"]
             if f"{region}WithinMean" in stats:
                 for topo, m in zip(("ABBA", "BABA", "AABB"), stats[f"{region}WithinMean"]):
                     row[f"{region.lower()}_within_mean_{topo}"] = m
@@ -500,11 +527,11 @@ def get_short_sim_name(sim_name):
 
 
 _NODE_NAME_PATH_MODIFIERS = {
-    "site", "ilr", "normalize", "norm-eps", "gaussian", "gmm",
+    "site", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
     "var2x", "repulsion", "annealing",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
-_NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[\d.]+_beta[\d.]+$')
+_NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[\d.]+_beta(prime)?[\d.]+$')
 _NODE_NAME_LAM_RE = re.compile(r'^lam[\d.]+$')
 
 
@@ -705,12 +732,15 @@ SIM_CATEGORY_PAIRS = {
 def get_phlag_param_segments(args):
     """
     Phlag-param directory segments, in store/phlag's order:
-    <dist_type>[/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>].
+    <dist_type>[/rho<X>_beta[prime]<Y>][/var2x][/repulsion][/annealing][/lam<X>].
     """
     segments = [getattr(args, "model_design", None) or "gaussian"]
     rho, beta = getattr(args, "rho", None), getattr(args, "beta", None)
+    beta_prime = getattr(args, "beta_prime", None)
     if rho is not None and beta is not None:
         segments.append(f"rho{float(rho)}_beta{float(beta)}")
+    elif rho is not None and beta_prime is not None:
+        segments.append(f"rho{float(rho)}_betaprime{float(beta_prime)}")
     if getattr(args, "double_variance_init", False):
         segments.append("var2x")
     if getattr(args, "alt_emission_parameterization", None) == "repulsion":
@@ -994,6 +1024,18 @@ def get_repo_root():
     if override:
         return pathlib.Path(override)
     return pathlib.Path(__file__).resolve().parent.parent
+
+
+def get_out_root():
+    return get_repo_root() / "out" / "msa"
+
+
+def get_out_relative_parts(parts):
+    parts = tuple(parts)
+    if "out" not in parts:
+        return None
+    rel = parts[len(parts) - parts[::-1].index("out"):]
+    return rel[1:] if rel[:1] == ("msa",) else rel
 
 
 def get_data_dir():
