@@ -4,12 +4,226 @@ Shared status board for concurrent Claude sessions working in this repo. Each se
 
 ---
 
+## session-20261002-cra-implicit-flags
+
+**Status:** done
+**Change:** bench/utils.py: unlisted on/off flags varying on disk auto-split configs (hue suffix); `"..."` in tuple agg; missing args.json value = `PHLAG_SEGMENT_DEFAULTS` default (`_recorded_value`); tpr shades by value index (was by position among existing points); palette 19 colors; `_suptitle` wraps + grows fig; `_below_title_top` (mpl 3.9 tight_layout already reserves suptitle); heatmap top below title.
+**Notebook:** zero-alt-anchor cell uses `--emission-param` with rho/beta None.
+
+---
+
+## session-20261002-batch-summary
+
+**Status:** done
+**Task:** `00-summary.txt` at the top of each batch log dir.
+**Change:** bench/cli/run_batch.py rewrites it atomically on every run start/finish: counts + running cmds + failures while live; on finish, status and full cmd of every run. Verified with `phlag -h`/`caster -h` in scratchpad.
+
+---
+
+## session-20261002-paper-overlay
+
+**Status:** done
+**Task:** overlay the Phlag paper's F1 bars (green, values estimated from the figure, ±~0.02) on the "Best config vs. Phlag" gtrees/msa plot.
+**Change:** aggregate.ipynb cells `739449ea` (f1: gtrees bars recolored green, height = `phlag_paper_f1`, errorbars dropped; admixture low=[0,3.5], high=(3.5,6.5]) and `e3f09f57` (tpr_fpr: gtrees artists removed, one green star per panel from `phlag_paper_fpr_tpr`, filled-green point of the paper's per-category plot).
+**Finding:** gtrees matches the paper at branch lengths (0,0.1] and (0.1,1]. At (1,5], recombination gtrees is ~0 where the paper has .53-.90. Admixture high/low don't match the paper.
+
+---
+
+## session-20261002-zero-alt-anchor
+
+**Status:** done (sweep in bench/script.sh, not launched)
+**Task:** `--emission-param zero-alt-anchor` (default free): both states' ABBA/BABA mean, variance and covariances fixed at 0 (1e-6 jitter) -> ABBA/BABA LL identical across states, effectively AABB-only.
+**Change:** hmm.py `PhlagHMMEmissions(anchor_dims=)` in FREE M-step; phlag.py flag, init, BIC k minus anchored entries, errors unless gaussian/3 cols/no repulsion; `PHLAG_SEGMENT_DEFAULTS` + named segment `zero-alt-anchor`; mirrored benchmark/phlagster.
+**Data:** within-state corr(ABBA,BABA,AABB) ~0 at w<=1k, +.1-.26 at w>=10k; ABBA/BABA mean ~.005-.02 (up to .57 on high-ILS 10X/up/N118); 10X Alt shifts it ~+50%.
+**Verified (12 branches, 45-55):** v1 (variances free) ~no-op. v2 (all 0): w100 F1 +.041 mean (8 up/3 down); w1k +.072 mean but bimodal (admix-high Cariamiformes .31->.98, recomb N125 .05->.83; all 4 10X drop, N109 .295->.059); w10k -.034. Free test runs backfilled 9 store reports (fit.pkl + header lines).
+
+---
+
+## session-20261002-store-phlag-axis
+
+**Status:** done
+**Task:** store-mode `cra.plot`/`resolve_configs_cartesian` support for the `"phlag"` source axis (gtrees vs msa), previously run-mode only.
+**Change:** benchmark.py: `BenchmarkStats.run_row(record)` extracted from `write_tables`. bench/utils.py: `_windowless_runs_df(source)` (cached) builds runs.tsv-shaped rows from `out/gtrees` reports via `_build_record`/`run_row`, gt_stats cols blanked; `axes["phlag"]` popped (default `["msa"]`, all sources if in agg); gtrees config's dir = `PHLAG_SOURCE_ROOTS["gtrees"]` sentinel, loaded by `_load_raw_config_df`; flag axes don't filter it.
+**Verified:** 672 gtrees rows; agg=["phlag"]+aggB at w25k rho0.9 beta4 → 56 configs, F1 + TPR/FPR render; no-phlag configs unchanged.
+
+---
+
+## session-20261002-dirichlet-mean
+
+**Status:** done
+**Task:** `--dirichlet-mean` (default off): transition M-step uses the Dirichlet posterior mean instead of the mode (mode NaNs whenever beta+counts<1, e.g. every rho0.1_beta0.0001 store run).
+**Change:** hmm.py `PhlagHMMTransitions(dirichlet_mean=)`/`PhlagHMM(transition_dirichlet_mean=)`; phlag.py flag + no-prior psi = zeros (not ones) under mean; `PHLAG_SEGMENT_DEFAULTS["dirichlet_mean"]` → `/dirichlet-mean` segment; mirrored in benchmark `PHLAG_ARG_SPECS`/parser and phlagster.
+**Verified:** N109 45-55 w1k (scratchpad -o), rho0.1 beta1e-4: mode NaN → mean F1 .317 AUC .703; no prior + mean F1 .295 AUC .675.
+**Update:** initial transition matrix = prior psi's mode (default) / mean (`--dirichlet-mean`), replacing `1 - beta/n`; mode undefined (beta<=1) → mean + warning; no prior keeps 0.99. Checked rho0.1 beta4 init matches closed forms.
+**Finding:** start probs = (rho, 1-rho) instead of [1,0] (monkeypatched in scratchpad, no code change): no prior → EM frozen at init (em_hd 0, F1 0) since stationary start + identical emissions never breaks symmetry; beta4 → ±.007 F1. Keep [1,0]. With a prior only (no-prior keeps [1,0]), 6 branches × w1k/w10k × rho .1/.9 × {β4 mode, β'2e-4 mean}: F1 diff mean 0.000 (9 up, 3 down, 36 same); rho .1 ~identical, rho .9 swings ±.1 both ways; prior start makes rho .1/.9 give mirrored identical fits. Added as opt-in `--prior-init-probs` (phlag/benchmark/phlagster, `/prior-init-probs` segment; no-op without --rho); verified N109 w10k rho.9 β4 F1 .602 off/.702 on, no-prior unchanged .506. "Run rho and 1-rho, keep best" evaluated offline on those 24 pairs: picking by marginal LL picks the better F1 in 4/10 pairs where rho matters; mean F1 .5473 = always-rho.9, oracle .5558. Not implemented. Same 24 with --double-variance-init: GT-polarity flips 15/48→4/48; mean F1 rho.1 .5568, rho.9 .5498, oracle .5598; selection by window counts (Null frac≈rho .5473; 2x-var state minority .551) or LL (.5486) all lose to always rho .1. Repulsion (--ap repulsion, lam 1) on N109 w1k × {no prior, β4, β1e-4/1e-8/β'2e-4 mean}: F1 0 in every case (em_hd .88-.93 vs GT .056, Alt std ~20x GT), free F1 .295-.317. Also: a test run backfilled store `w1k_s1k/reports/10X/down/N109/45-55.fit.pkl` via find_store_report.
+
+---
+
+## session-20261001-batch-concurrent
+
+**Status:** done
+**Task:** let `batch` run while another batch is live.
+**Change:** bench/cli/batch.sh: without `BATCH_SESSION`, picks first free tmux session `batch`, `batch2`, ...; log dir defaults to `logs/<session>` (resolved outside tmux, passed via `-e`). Inner run gated on `BATCH_INNER=1` instead of `$TMUX`, so calling from a tmux pane also launches a new session (switch-client) instead of running inline and wiping `logs/batch`. Inner path has no log-dir default.
+**Verified:** stubbed-tmux copy in scratchpad: picks batch2/logs/batch2 with live `batch`; explicit `BATCH_SESSION` collision still errors.
+
+---
+
+## session-20261001-correct-transition-align
+
+**Status:** done
+**Task:** `--correct-transition` also overrides initial probs and aligns states to ground truth.
+**Change:** phlag.py: initial probs = ground-truth Null/Alt occupancy (auto) or the stationary distribution (explicit p0,p1). States are aligned by emission-argmax occupancy vs `y_true`; if mismatches outnumber matches, `gt_tm`/`gt_init` are reversed before being written into params.
+**Verified:** N109 45-55 (-o scratchpad): w10k F1 .506->.654, AUC .841->.892 (no swap); w1k F1 .295->.356, AUC .675->.721 (swapped).
+**Also:** the phlag scatter.png prediction overlay now honors `-o` (`data_dir` = the report's parent). Before, it overwrote the caster's scatter.png next to scores.tsv. Verified that prod mtime is unchanged.
+
+---
+
+## session-20261001-check-alias
+
+**Status:** done
+**Task:** `check` (~/.bash_aliases) failed when no batch running; widen to all phlag/caster/phlagster/benchmark.
+**Change:** pgrep on `/bin/<tool>`, `-m phlag.|bench.`, `<tool>.py` args, python procs only; prints pid, etime, command; "no ... processes" when none.
+
+---
+
+## session-20261001-benchmark-create-derive
+
+**Status:** done
+**Task:** benchmark without `--create`/`-s`.
+**Change:** bench/benchmark.py: `--create` optional → `default_create_path` builds `store/phlag/<dist>[/k<N>]/w<W>_s<S>[_z]/[pair][site][ilr|normalize[/norm-eps]][/exp-minus]/<phlag segs>`; `-s` default None → `-w` (also per-leaf in `--sweep -w`). bench/split_script.py: template-path step falls back to window.
+**Verified:** derived paths for 8 flag sets pass check_segment_conventions; splitter dry runs.
+**Also:** `finished_with_same_args` — report.txt + matching args.json → `[skip]` print, no writes (also per `--sweep` leaf); `--resummarize` bypasses. Verified on gaussian/w1k_s1k (untouched).
+**Also:** `delete` (~/.local/bin/delete → bench/delete_script.py): splits script.sh like batch, removes each benchmark/phlag run's own files (benchmark: + reports/, source/; nested runs & caster scores kept); `-n` dry run, `-y` no prompt, refuses while jobs run. Ran once 2026-10-01: 328 items/84 dirs.
+**Also:** CLI files moved to `bench/cli/` (benchmark, phlagster, phlagster_parallel, split_script, delete_script, batch.sh); imports/pyproject/env bin wrappers/~/.local/bin/{batch,delete}/audit_args updated. `TOTAL_CORE_BUDGET` 50→80.
+**Also:** `delete` prints one line (file count + log path); per-file list in `logs/delete/<ts>[-dry].log`.
+**Also:** `batch` runs in tmux session `batch` (attach if tty; refuses if exists; env passed via -e); new bench/cli/run_batch.py replaces xargs: one tqdm bar per script.sh line (running/failed postfix), all run output → logs/batch/<run>.log, failures listed at end. split_script `plan()` shared. Test mishap wiped prior logs/batch.
+
+## session-20260930-batch-split
+
+**Status:** done
+**Task:** `batch` expands bench/script.sh into separate runs, each ≤ TOTAL_CORE_BUDGET/N cores.
+**Change:** new bench/split_script.py (reads benchmark/phlag/caster/phlagster argparse parsers; scalar flags or -w/-s/--rho/--beta/--beta-prime with >1 value, and >1 positional → cartesian product; -s ratio resolved; --create/-o gets w<W>_s<S>/rho.._beta../<flag>=<v> segments). bench/batch.sh rewritten: xargs -P min(N,budget), logs in logs/batch/. `~/.local/bin/batch` is a dispatcher: CONDA_DEFAULT_ENV=phlag_orig or cwd under phlag_orig/ → phlag_orig/script.sh; cwd under phlag/ → bench/batch.sh.
+**Verified:** splitter output on mixed script; batch end-to-end with `-h` runs.
+
+---
+
+## session-20260930-branches-palette
+
+**Status:** done
+**Task:** `_plot_branches` (cra.plot run=[...]) drop all-NaN configs; color by rho hue, beta shade.
+**Change:** bench/utils.py: configs kept only if a requested metric (tpr/fpr for tpr_fpr) is non-NaN; new `_rho_beta_palette` (tab10 hue per rho, light→dark by beta, others black/grey, legend padded so one rho per column).
+**Finding:** rho/β′ NaN reports at w5k/10k are β′<1/n (Dirichlet mode), not the init — forcing 0.99 init still NaNs (tested N109 45-55 w5k in scratchpad).
+
+---
+
+## session-20260930-correct-transition-em
+
+**Status:** done
+**Task:** `--correct-transition` must never skip EM.
+**Change:** phlag.py `_run_single`: `reuse_fit = correct_transition is None` gates both `--skip-existing` own-fit reuse and `find_store_report` fit reuse.
+**Verified:** two back-to-back `--skip-existing --correct-transition` runs (-o scratchpad), both ran EM.
+**Also:** `phlag/utils.py` `PHLAG_SEGMENT_DEFAULTS` registry: non-default flags get `<flag>[=<v>]` segments (legacy var2x/repulsion/annealing/lam kept; `correct-transition`), `parse_phlag_param_segment` inverse. Drives `EM_ARG_DESTS`, parser defaults, report.tsv flag recovery, bench/utils `_recorded_from_report_path`, benchmark `check_segment_conventions`. Verified round-trip, audit of 333 args.json adds no new problems, default paths unchanged.
+**Migrated:** 21 untracked `--correct-transition` (auto) outputs in out/msa (20 from 09-30 20:45-50 at `45-55/w{50,200,500,1k}`, 1 N276 `rho0.5_beta1e-12` from 09-28) moved into `<dir>/correct-transition/`; `rho*` subdirs left in place.
+
+---
+
+## session-20260930-phlagster-plot
+
+**Status:** done
+**Task:** phlagster `--plot` takes caster + phlag plot names.
+**Change:** phlagster `--caster-plot` → `--plot`, split by `CASTER_PLOTS`/`PHLAG_PLOTS`; stage with no names gets `--plot none`. caster/phlag gained `none` choice (filtered out → []). Fixes `--no-plots`, which passed bare `--plot` (= all plots).
+**Verified:** stubbed-stage argv routing for 6 cases.
+**Also:** caster/phlag `--skip-existing` (phlagster passes it unless `--bench`/`--recompute`): existing scores.tsv / report.tsv+matching `.fit.pkl` (`em_args` now pickled in fit) → no recompute, only missing PNGs drawn. Verified in scratchpad incl. -L change forcing rerun.
+
+---
+
+## session-20260929-ecdf-outlier-delta
+
+**Status:** done
+**Task:** ECDF normalize [-1,1], Outlier naming, w500 labels, Δ(O−N) box + per-merged_category sums; QQ dexp fit check.
+**Change:** bench/caster.ipynb cells 14/15 (`window_label`, Δ box, `delta_summary` table); caster.py `_topology_series` Outlier label, `_save_topology_grid` strips `_s<X>` when equal.
+**Finding:** QQ fits each (topology, region) series separately; black line is just y=x.
+**Also (09-30):** Δ box now normalized units `2Δ/span` (span = panel min–max).
+**Also:** cell a3342d5e: (1) data ECDF + per-series Gaussian/Laplace MLE CDFs, (2) QQ vs Laplace(0,1): data Laplace-standardized (Laplace=y=x), Gaussian fit as curve; legends per series in topology color ("observed" = actual scores); `_SHOW_ALT_TOPOLOGIES=False`. User edited cell 14 (N228 branches, span-normalized Δ) — keep. N228 sims share identical Null region.
+
+---
+
+## session-20260928-qq-dist
+
+**Status:** done
+**Task:** caster `--plot qq-{gaussian,exp,dexp}`.
+**Change:** caster.py `qq_dists()` maps plot names to dists (bare `qq`=dexp); `CasterPlotter(plot_qq=[...])`, `plot_qq(dist)` fits via `rv.fit`, KS D, writes `qq-<dist>.png`.
+**Verified:** all 3 rendered on N276 37-62 w1k_s1k to scratchpad.
+**Also:** `plot_ecdf` log x-axis when all values >0 and `_needs_log_scale` (fixes blank exp-minus ECDFs).
+
+---
+
+## session-20260928-phlagster-parallel
+
+**Status:** done (not launched)
+**Task:** parallelize remainder of live phlagster sweep (PID 3668779) one config per core.
+**Change:** new `bench/phlagster_parallel.py`: expands specs, stage 1 caster per missing (pattern, window) scores.tsv, stage 2 one `phlagster <scores.tsv> --rho R --beta-prime B` subprocess per config (BLAS threads=1), skips reports with mtime >= `--since`; `--dry-run`, `-j` (default 64), logs under `logs/phlagster_parallel/`.
+**Verified:** dry-run → 1151/4340 pending (N109 45-55 tail, 47-52, 49-51; all N340).
+
+---
+
+## session-20260928-cra-plot-dir
+
+**Status:** done
+**Task:** `cra.plot(..., run=..., dir="out"|"store")` (default out).
+**Change:** bench/utils.py `collect_store_runs(rel, root)`: leaf dirs (args.json+analysis.tsv) with `reports/<rel>.tsv`; window/step from args.json, gt_stats from runs.tsv row, config = leaf path minus size segment. `_filter_out_runs(..., recorded=)` filters on args.json. `_collect_run_df`/`_plot_run`/`_plot_branches` take `dir`.
+**Verified:** N276 37-62 store → 139 rows, plot renders; out mode unchanged.
+
+---
+
+## session-20260928-store-reuse
+
+**Status:** done
+**Task:** ad-hoc caster/phlag reuse store/ results when args match; backfill missing gt_stats/report lines; plot.
+**Change:** caster: `canonical_scores_path()` (store path, shared with `--bench`); non-bench run with default -l/-R/-m/--shift-caster copies existing store scores.tsv, merges missing keys into store gt_stats.txt (`write_ground_truth_stats(merge=True)`, not for exp). phlag: every run saves `<report>.fit.pkl` (EM params); `find_store_report` matches store/phlag/**/reports by byte-identical scores + EM flags parsed from report's argv line; with fit → skip EM; legacy → rerun, only trust if numerically reproduced, then save fit + add missing lines. phlag `--plot`: correlations/topologies_3d now opt-in.
+**Verified:** N276 37-62 w10k (scratch -o); store gt_stats + one report backfilled.
+**Also:** phlagster `--rho/--beta/--beta-prime` multi-valued (forwarded). `utils.expand_node_spec`: `<cat>/<sub>/<node>` (no pattern) expands to every concat FASTA pattern in caster/phlag/phlagster `main()`.
+
+---
+
+## session-20260928-caster-ecdf-qq
+
+**Status:** done
+**Task:** caster `--plot ecdf|qq` (ported from bench/caster.ipynb ECDF + QQ cells).
+**Change:** CasterPlotter `plot_ecdf`/`plot_qq` kwargs → `ecdf.png`/`qq.png` (1x3 per-topology, Null dashed/Alt solid, else overall). `ALL_PLOTS` default: +ecdf, -dist (qq opt-in). Wired in `_write_stats_and_plots`, `run_caster_pair`, `run_caster_site`.
+
+---
+
+## session-20260927-laplace-qq
+
+**Status:** done
+**Task:** QQ plots vs Laplace, same grid/legend as ECDF cell (bench/caster.ipynb, new cell 8e96142c after ca8607f0).
+**Change:** per series standardized by Laplace MLE (median, mean abs dev) vs Laplace(0,1) quantiles; y=x + Gaussian reference; KS D box. ECDF cell: `_KDE_BRANCHES` is a plain node list (any count per category; `check_branch` validates), panel category from `branch_category(node)`; `kde_branches` now a list (QQ + gtrees cells updated, grid `squeeze=False`).
+
+---
+
+## session-20260927-ecdf-branch-label
+
+**Status:** done
+**Task:** ECDF panel titles (bench/caster.ipynb cell 14) show branch length / divergence time.
+**Change:** `branch_label()` helper: admixture -> `get_admixture_divergence_time` (Myr, from sim name); others -> `get_simulation_clade` + `get_cu_branch_length_from_population_info` (CU). Appended to title line 2.
+
+---
+
+## session-20260926-branches-tpr-fpr-lines
+
+**Status:** done
+**Task:** `_plot_branches` tpr_fpr panel (bench/utils.py) had no connecting lines.
+**Change:** one line per window (>1 config) through its configs, turbo colors over only those lines, "window" legend; uniform "o" s=36 points colored by config; config palette = tab10 reordered (pink 5th, purple/cyan last — too close to blue); removed unused `markers`.
+
+---
+
 ## session-20260926-rho-beta-multi
 
 **Status:** done
 **Task:** `--rho`/`--beta`/`--beta-prime` accept multiple values, cartesian product with each other and `-w`/`-s` (phlag/phlag.py `main()`).
 **Change:** nargs="+"; `--beta` set drops `--beta-prime` from product (would duplicate). Batch + `-o` → `<o.parent>/[w.._s..]/[rho.._beta[prime]..]/<o.name>`. bench/benchmark.py, phlagster.py untouched (still scalar).
-**Also:** FASTA/locus-spec sibling resolution picked `quartet_counts.tsv` (not excluded by `is_score_candidate`); fixed. Still picks newest variant (e.g. exp-minus) -- pass explicit scores path to choose.
+**Also:** FASTA/locus-spec sibling resolution picked `quartet_counts.tsv` (not excluded by `is_score_candidate`); fixed. Newest verified sibling picks the w/s config; within it, plain scores.tsv preferred over variants (site/ilr/normalize/exp-minus/_z suffixes).
 
 ---
 
@@ -439,3 +653,21 @@ Could not render-test locally (no matplotlib in this shell, same limitation as t
 **Task:** `cra.plot(run=[...])` accepts a list of run dirs (label = dir minus trailing node/pattern); aggregate.ipynb Transition Prior cell uses a hardcoded list of the 5 KDE branches (was referencing caster.ipynb's undefined `kde_branches`).
 **Verified:** headless render of that cell's config over the 5 branches.
 **Follow-up:** relative run paths that do not exist under the repo root now resolve under `out/msa` (`_resolve_run_path`). The 5 branches only have 45-55 w10k reports in out/msa; N109 37-62 only has old c25k dirs.
+
+---
+
+## session-20261001-legend-below-xaxis
+
+**Status:** done
+**Task:** bottom legend overlapped x tick labels in `_plot_branches` bar grids.
+**Change:** bench/utils.py: new `_legend_below_axes` (measures legend, reserves bottom via tight_layout rect, anchors legend top under lowest axes tightbbox); used by `_plot_branches` and the window-line plot's bottom legend.
+**Verified:** synthetic 2x5 grid, legend top 52px < axes bottom 63px.
+**Follow-up:** `_rho_beta_palette` shades now light→base*0.75 (was →base*0.5, near-black); others greys 0..0.6; new `_separate_colors` final CIELAB check (ΔE<20 across groups, <10 within a rho group → swap to farthest tab10/Dark2/Set1/tab20/Set2 color). Empty config label `(run)` → `(none)`.
+
+---
+
+## session-20261002-core-budget
+
+**Status:** done
+**Task:** show cores in use; budget stays 80 (raise to cpu_count reverted per user).
+**Change:** ~/.bash_aliases `check` prints `cores in use: X of 512 (N processes)` -- 1s delta of utime+stime+cutime+cstime over matched process trees (reaped phlag children counted via parent).

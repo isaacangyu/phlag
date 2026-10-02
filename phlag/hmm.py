@@ -365,9 +365,11 @@ class PhlagHMMTransitions(HMMTransitions):
         self,
         num_states: int,
         concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
+        dirichlet_mean: bool = False,
     ):
         self.num_states = num_states
         self.concentration = concentration * jnp.ones((num_states, num_states))
+        self.dirichlet_mean = dirichlet_mean
 
     def distribution(
         self, params: ParamsStandardHMMTransitions, state: IntScalar, inputs=None
@@ -446,7 +448,11 @@ class PhlagHMMTransitions(HMMTransitions):
                 #   expected_trans_counts = batch_stats.sum(axis=0) + self.concentration
                 #   transition_matrix = expected_trans_counts / (expected_trans_counts.sum(axis=-1, keepdims=True) + 1e-12)
                 expected_trans_counts = batch_stats.sum(axis=0)
-                transition_matrix = tfd.Dirichlet(self.concentration + expected_trans_counts).mode()
+                if self.dirichlet_mean:
+                    posterior = self.concentration + expected_trans_counts
+                    transition_matrix = posterior / (posterior.sum(axis=-1, keepdims=True) + 1e-12)
+                else:
+                    transition_matrix = tfd.Dirichlet(self.concentration + expected_trans_counts).mode()
             params = params._replace(transition_matrix=transition_matrix)
         return params, m_step_state
 
@@ -475,10 +481,12 @@ class PhlagHMMEmissions(HMMEmissions):
         n_iters: int = 10,
         increment_steps: int = 5,
         sigma_min: float = 1e-2,
+        anchor_dims: Tuple[int, ...] = (),
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
         self.penalty_lambda = penalty_lambda
+        self.anchor_dims = tuple(anchor_dims)
         self.parameterization = parameterization
         self.lm_damping = lm_damping
         self.repulsion_optimizer = repulsion_optimizer
@@ -775,7 +783,12 @@ class PhlagHMMEmissions(HMMEmissions):
 
                 if mode is EmissionParam.FREE:
                     mu_s = xbar_s
-                    Sigma_s = Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, xbar_s) + 1e-5 * jnp.eye(self.emission_dim)
+                    if self.anchor_dims:
+                        free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
+                        mu_s = jnp.where(free, xbar_s, 0.0)
+                    Sigma_s = Sxx_s / (n_s + 1e-12) - jnp.outer(mu_s, mu_s) + 1e-5 * jnp.eye(self.emission_dim)
+                    if self.anchor_dims:
+                        Sigma_s = jnp.where(jnp.outer(free, free), Sigma_s, 0.0)
                 elif mode is EmissionParam.REPULSION:
                     other = 1 - s # assumes 2 states
                     mu_s, Sigma_s, clip_count_s, clip_attempts_s = self.map_estimate_repulsion(
@@ -846,6 +859,7 @@ class PhlagHMM(HMM):
         initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]] = 1.1,
         transition_concentration: Union[Scalar, Float[Array, "num_states num_states"]] = 1.1,
         model_design: str = "gaussian",
+        transition_dirichlet_mean: bool = False,
         **kwargs,
     ):
         self.num_states = num_states
@@ -871,7 +885,8 @@ class PhlagHMM(HMM):
             num_states=self.num_states, initial_probs_concentration=self.initial_probs_concentration
         )
         self.transition_component = PhlagHMMTransitions(
-            num_states=self.num_states, concentration=self.transition_concentration
+            num_states=self.num_states, concentration=self.transition_concentration,
+            dirichlet_mean=transition_dirichlet_mean,
         )
         if model_design == "gmm":
             num_mixtures = kwargs.get("num_mixtures", 2)
@@ -893,6 +908,7 @@ class PhlagHMM(HMM):
                 n_iters=kwargs.get("n_iters", 10),
                 increment_steps=kwargs.get("increment_steps", 5),
                 sigma_min=kwargs.get("sigma_min", 1e-2),
+                anchor_dims=kwargs.get("anchor_dims", ()),
             )
         super().__init__(
             num_states=self.num_states,

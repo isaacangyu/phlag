@@ -18,6 +18,7 @@ phlag_env/
 # Data and outputs
 store
 logs/
+out/*
 out/**/scores.tsv
 out/**/quartet_counts.tsv
 

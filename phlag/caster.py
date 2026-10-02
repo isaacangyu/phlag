@@ -507,8 +507,16 @@ def get_fasta_length(fasta_path):
     return length
 
 
+def qq_dists(plots):
+    return list(dict.fromkeys("dexp" if p == "qq" else p[3:] for p in plots or () if p == "qq" or p.startswith("qq-")))
+
+
+def missing_plots(plots, out_dir):
+    return [p for p in plots or () if not (pathlib.Path(out_dir) / f"{'qq-dexp' if p == 'qq' else p}.png").exists()]
+
+
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, locus_pattern=None, predicted_intervals=None):
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, plot_ecdf=False, plot_qq=(), locus_pattern=None, predicted_intervals=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
@@ -569,6 +577,10 @@ class CasterPlotter:
                 self.plot_quartet_dists()
             if plot_sums:
                 self.plot_sums()
+            if plot_ecdf:
+                self.plot_ecdf()
+            for dist in plot_qq or ():
+                self.plot_qq(dist)
 
     def load_data(self):
         """Parses the tab-separated value file into a Pandas DataFrame."""
@@ -1522,8 +1534,106 @@ class CasterPlotter:
         print(f"Saved topology score sums plot to: {save_path}")
         plt.close()
 
+    def _topology_series(self):
+        col_for_topo = self._resolve_topo_columns_strict()
+        if col_for_topo is None:
+            return None
+        labels = self._compute_null_alt_labels()
+        out = {}
+        for t in ('ABBA', 'BABA', 'AABB'):
+            v = self.df[col_for_topo[t]].to_numpy(dtype=float)
+            finite = np.isfinite(v)
+            if labels is None:
+                out[t] = [('All', '-', v[finite])]
+            else:
+                out[t] = [(r, ls, v[finite & (labels == k)]) for k, r, ls in (('Null', 'Null', '--'), ('Alt', 'Outlier', '-'))]
+        return out
 
-def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None, dist_type="gaussian"):
+    def _save_topology_grid(self, fig, title, filename, what):
+        title = re.sub(r'(?<![A-Za-z0-9])w([0-9.]+[kKmM]?)_s\1(?![A-Za-z0-9])', r'w\1', title)
+        if self.data_tag:
+            title += f' ({self.data_tag})'
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        os.makedirs(self.data_dir, exist_ok=True)
+        save_path = os.path.join(self.data_dir, filename)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved {what} to: {save_path}")
+        plt.close()
+
+    def plot_ecdf(self):
+        series = self._topology_series()
+        if series is None:
+            print("Need all three ABBA/BABA/AABB topology columns for an ECDF plot; skipping.")
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        for ax, (t, groups) in zip(axes, series.items()):
+            color = self.topo_colors[t]
+            allv = np.concatenate([v for _, _, v in groups])
+            mean_lines = []
+            for region, ls, v in groups:
+                if len(v) == 0:
+                    continue
+                sns.ecdfplot(v, ax=ax, color=color, linestyle=ls, linewidth=1.6, label=f"{t} {region}")
+                mean_lines.append(f"{region}: {v.mean():.4g} (n={len(v)})")
+            log_x = len(allv) and allv.min() > 0 and self._needs_log_scale(allv)
+            if log_x:
+                ax.set_xscale('log')
+            if len(allv):
+                lo, hi = np.percentile(allv, [0.5, 100])
+                if hi > lo:
+                    ax.set_xlim(lo, hi)
+            ax.text(0.98, 0.02, "\n".join(mean_lines), transform=ax.transAxes, ha="right", va="bottom", multialignment="left",
+                    fontsize=8, family="monospace", bbox=dict(boxstyle="round", facecolor="white", alpha=0.85))
+            ax.set_title(t, fontsize=11, fontweight='bold')
+            ax.set_xlabel("Topology score (log)" if log_x else "Topology score")
+            ax.set_ylabel("Proportion" if t == 'ABBA' else "")
+            ax.legend(loc='upper left', fontsize=8, framealpha=0.9)
+        split = "Null (dashed) vs Outlier (solid) " if len(series['ABBA']) > 1 else ""
+        self._save_topology_grid(fig, f'{split}Topology-Score ECDFs: {self.gene_name}', 'ecdf.png', 'topology ECDF plot')
+
+    QQ_DISTS = {
+        "gaussian": (norm, "norm", "Gaussian"),
+        "exp": (expon, "expon", "Exponential"),
+        "dexp": (laplace, "laplace", "Laplace"),
+    }
+
+    def plot_qq(self, dist="dexp"):
+        series = self._topology_series()
+        if series is None:
+            print("Need all three ABBA/BABA/AABB topology columns for a QQ plot; skipping.")
+            return
+        rv, ks_name, label = self.QQ_DISTS[dist]
+        probs = np.linspace(0.005, 0.995, 199)
+        theo = rv.ppf(probs)
+        from scipy.stats import kstest
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        for ax, (t, groups) in zip(axes, series.items()):
+            color = self.topo_colors[t]
+            ks_lines = []
+            for region, ls, v in groups:
+                if len(v) < 2:
+                    continue
+                loc, scale = rv.fit(v)
+                if not scale > 0:
+                    continue
+                z = (np.quantile(v, probs) - loc) / scale
+                ax.plot(theo, z, color=color, linestyle=ls, linewidth=1.6, label=f"{t} {region}")
+                ks = kstest(v, ks_name, args=(loc, scale)).statistic
+                ks_lines.append(f"{region}: D={ks:.3f}")
+            ax.plot(theo, theo, color="black", linewidth=1, label=f"{label} (y=x)")
+            if dist == "dexp":
+                ax.plot(theo, norm.ppf(probs) / np.sqrt(2 / np.pi), color="gray", linestyle=":", linewidth=1.2, label="Gaussian ref")
+            ax.text(0.98, 0.02, "\n".join(ks_lines), transform=ax.transAxes, ha="right", va="bottom", multialignment="left",
+                    fontsize=8, family="monospace", bbox=dict(boxstyle="round", facecolor="white", alpha=0.85))
+            ax.set_title(t, fontsize=11, fontweight='bold')
+            ax.set_xlabel(f"{label}(0,1) quantile")
+            ax.set_ylabel("Standardized sample quantile" if t == 'ABBA' else "")
+            ax.legend(loc='upper left', fontsize=8, framealpha=0.9)
+        split = "Null (dashed) vs Outlier (solid) " if len(series['ABBA']) > 1 else ""
+        self._save_topology_grid(fig, f'{split}Topology-Score QQ vs Fitted {label}: {self.gene_name}', f'qq-{dist}.png', f'topology QQ ({dist}) plot')
+
+def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None, dist_type="gaussian", merge=False):
     """
     Writes gt_stats.txt (Null/Alt/Overall mean+covariance across the 3
     topology dimensions, ABBA/BABA/AABB order, plus each label's per-topology
@@ -1561,7 +1671,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     per topology via laplace.fit on the raw Null/Alt values and computes
     Hellinger2 via laplace_hellinger2_nd.
     """
-    from .utils import parse_pattern_string, write_gt_stats_file, mardia_skewness, gaussian_hellinger2_nd, exponential_hellinger2_nd, laplace_hellinger2_nd, GT_STATS_FILENAME
+    from .utils import parse_pattern_string, write_gt_stats_file, read_gt_stats_file, mardia_skewness, gaussian_hellinger2_nd, exponential_hellinger2_nd, laplace_hellinger2_nd, GT_STATS_FILENAME
 
     try:
         df = pd.read_csv(scores_file, sep='\t')
@@ -1699,6 +1809,13 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
                     )
 
     output_path = pathlib.Path(output_dir) / GT_STATS_FILENAME
+    if merge:
+        existing = read_gt_stats_file(output_path)
+        missing = {k: v for k, v in stats.items() if k not in existing}
+        if not missing:
+            return
+        print(f"Adding {sorted(missing)} to '{output_path}'")
+        stats = {**existing, **missing}
     write_gt_stats_file(output_path, stats)
 
 
@@ -1810,7 +1927,7 @@ def build_parser():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums"],
+        choices=["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf", "qq", "qq-gaussian", "qq-exp", "qq-dexp", "none"],
         default=None,
         help="List of plots to generate (choices: scatter, the topology "
              "scatter plot; dist, per-topology Null/Alt "
@@ -1831,14 +1948,20 @@ def build_parser():
              "entirely; "
              "sums, histogram of the summed ABBA+BABA+AABB topology score per "
              "row (bins=auto), each bar split into 3 stacked colors by that "
-             "bin's average per-topology score. scatter/dist/sums/quartet_counts "
+             "bin's average per-topology score; ecdf, 1x3 per-topology "
+             "empirical CDFs (Null dashed vs Alt solid when a ground-truth "
+             "pattern is resolvable, else overall); qq-{gaussian,exp,dexp}, "
+             "1x3 per-topology QQ plots (qq-<dist>.png) of each series "
+             "standardized by that distribution's MLE loc/scale vs its (0,1) "
+             "quantiles, with a y=x line and KS D per series (dexp=Laplace, "
+             "adds a Gaussian reference line); bare qq means qq-dexp. scatter/dist/sums/quartet_counts "
              "each auto-detect their own need for a log y-axis instead of a "
              "manual modifier (see CasterPlotter._needs_log_scale): log kicks "
              "in when the plotted values' 5th-to-95th-percentile spread (positive "
              "values only) covers at least 100x, since past that a linear axis "
-             "can't resolve both ends at once. Default: all of the above when "
-             "--bench is omitted, scatter only under --bench. Passing --plot "
-             "with no choices explicitly requests all of the above, in "
+             "can't resolve both ends at once. Default: all of the above except "
+             "dist and qq when --bench is omitted, none under --bench. Passing "
+             "--plot with no choices requests that same default set, in "
              "either mode)",
     )
     parser.add_argument(
@@ -1868,6 +1991,13 @@ def build_parser():
         help="Path to save scores.tsv (its directory is also where scatter.png is "
              "saved, if plotting). Ignored when --bench is set (canonical tree "
              "always wins there)."
+    )
+    parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action="store_true",
+        help="If scores.tsv already exists at the path these flags resolve to, "
+             "skip recomputing it and only draw --plot entries whose PNG is missing.",
     )
     parser.add_argument(
         "--output-base",
@@ -2115,7 +2245,7 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
         dist_type=args.dist_type,
     )
 
-    if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
+    if args.plot and (any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf")) or qq_dists(args.plot)):
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-pair.cpp to mirror dstar's scores.tsv exactly, so the same
         # CasterPlotter -- same palette, same ground-truth shading -- renders
@@ -2131,6 +2261,8 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
             plot_topology_pairs=("topology_pairs" in args.plot),
             plot_quartet_counts=("quartet_counts" in args.plot),
             plot_sums=("sums" in args.plot),
+            plot_ecdf=("ecdf" in args.plot),
+            plot_qq=qq_dists(args.plot),
             locus_pattern=locus_pattern,
         )
 
@@ -2245,7 +2377,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         dist_type=args.dist_type,
     )
 
-    if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
+    if args.plot and (any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf")) or qq_dists(args.plot)):
         # chunk_scores.tsv's columns (pos, c*ABBA, c*BABA, c*AABB) are written
         # by caster-site.cpp to mirror dstar's scores.tsv exactly, so the same
         # CasterPlotter -- same palette, same ground-truth shading -- renders
@@ -2261,10 +2393,91 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
             plot_topology_pairs=("topology_pairs" in args.plot),
             plot_quartet_counts=("quartet_counts" in args.plot),
             plot_sums=("sums" in args.plot),
+            plot_ecdf=("ecdf" in args.plot),
+            plot_qq=qq_dists(args.plot),
             locus_pattern=locus_pattern,
         )
 
     return chunk_scores_path
+
+
+def canonical_scores_path(args, normalize_flag, ilr_flag):
+    from .utils import get_data_dir, clean_locus_name, parse_filename_to_dir_structure, get_simulation_categories, get_short_sim_name
+    data_dir = get_data_dir()
+    window_str = format_val(args.window_size)
+    step_str = format_val(args.step_size)
+    zscale_suffix = "_z" if args.zscale else ""
+    clean_stem = clean_locus_name(args.fasta_file.stem)
+    left_str = format_val(args.left)
+    right_str = format_val(args.right if args.right is not None else 0)
+    parsed = parse_filename_to_dir_structure(clean_stem)
+    is_sim = "simulations" in args.fasta_file.parts
+    cats = short_sim = None
+    if is_sim:
+        sim_dir = args.fasta_file.parent
+        if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
+            sim_dir = sim_dir.parent
+        cats = get_simulation_categories(args.fasta_file)
+        short_sim = get_short_sim_name(sim_dir.name)
+    # --bench (set only by benchmark's own subprocess invocations) keeps
+    # scores.tsv in the shared canonical tree, keyed only by window/step
+    # -- caster's windowed dstar statistics don't depend on dist_type or
+    # --output-base/--base at all (those only select a phlag-side
+    # model/variant tree), so every dist_type/--base variant reads and
+    # writes the same cached scores.tsv here instead of each getting its
+    # own copy recomputed from scratch. Lives in its own store/caster/
+    # tree, not nested under store/phlag/, since it isn't a phlag output.
+    # --pair/--site key this the same way they key the standalone tree
+    # (c<chunk>_s<step>, see below) -- otherwise a --pair/--site run
+    # sharing a dstar run's -w/-s values would collide on the exact
+    # same cached scores.tsv, silently mixing quartet-branch scores
+    # with D* scores. --site and --normalize each nest their own
+    # named subdirectory ('site'/'normalize') under the size segment
+    # instead of a flat suffix -- keeps the caster/ tree's directory
+    # names legible (c<chunk>_s<step>/site/normalize/... rather than
+    # c<chunk>_s<step>_site_n) -- '--site' likewise keeps --site from
+    # colliding with a --pair run sharing the same chunk/step, and
+    # 'normalize' keeps normalized and raw scores from sharing a
+    # cache entry. --zscale still appends a flat zscale_suffix ("_z")
+    # to the size segment itself, unchanged. --norm-eps is a boolean
+    # (see apply_normalize) that nests its own 'norm-eps' segment
+    # under 'normalize' when set, leaving plain 'normalize' as the
+    # original unguarded data (bit-for-bit reproducible, nothing
+    # existing needs to move) and 'normalize/norm-eps' as the fixed
+    # data -- exactly two cache entries, not an eps<value> family.
+    # Any future new flag that changes what ends up in
+    # scores.tsv/report.tsv should get the same treatment -- its own
+    # named segment here (and mirrored in bench/cli/benchmark.py's
+    # get_expected_caster_sim_dir) -- rather than folding into an
+    # existing directory's cache entry.
+    if args.pair or args.site:
+        chunk = args.chunk_size if args.chunk_size is not None else args.window_size
+        caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
+        if args.site:
+            caster_root = caster_root / "site"
+    else:
+        caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}"
+    if ilr_flag:
+        caster_root = caster_root / "ilr"
+    elif normalize_flag:
+        caster_root = caster_root / "normalize"
+        if args.norm_eps:
+            caster_root = caster_root / "norm-eps"
+    if args.exp_minus:
+        caster_root = caster_root / "exp-minus"
+    if parsed:
+        rel_dir = parsed["relative_dir_no_window"]
+        return caster_root / rel_dir / "scores.tsv"
+    elif is_sim:
+        pattern_stem = clean_stem
+        if cats:
+            return caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
+        else:
+            return caster_root / short_sim / pattern_stem / "scores.tsv"
+    else:
+        pattern_stem = clean_stem
+        final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}.tsv"
+        return caster_root / pattern_stem / final_output_name
 
 
 def _strip_ws_flags(argv):
@@ -2292,6 +2505,16 @@ def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parse_arguments(argv)
 
+    from .utils import expand_node_spec
+    patterns = expand_node_spec(args.fasta_file) if args.fasta_file is not None else None
+    if patterns:
+        rest = [t for t in raw_argv if pathlib.Path(t) != args.fasta_file]
+        results = []
+        for spec in patterns:
+            print(f"[caster] node spec -- running {spec}...")
+            results.append(main([spec] + rest))
+        return results
+
     window_sizes = args.window_size
     step_sizes = args.step_size
     if len(window_sizes) > 1 or len(step_sizes) > 1:
@@ -2316,13 +2539,14 @@ def main(argv=None):
     elif isinstance(args.step_size, float):
         args.step_size = max(1, round(args.step_size * args.window_size))
 
-    ALL_PLOTS = ["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums"]
+    ALL_PLOTS = ["scatter", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf"]
     if args.plot is None:
         # --plot omitted entirely: bench default is no plots, ad-hoc default is everything.
         args.plot = [] if args.bench else ALL_PLOTS
     elif args.plot == []:
         # Bare "--plot" (no choices given): plot everything, in either mode.
         args.plot = ALL_PLOTS
+    args.plot = [p for p in args.plot if p != "none"]
 
     if not args.bench:
         flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
@@ -2421,13 +2645,7 @@ def main(argv=None):
         args.bench = False
 
     # Ground-truth locus pattern (e.g. '37-62') for CasterPlotter's scatter.png shading.
-    window_str = format_val(args.window_size)
-    step_str = format_val(args.step_size)
-    norm_suffix = "_n" if args.normalize else ""
-    zscale_suffix = "_z" if args.zscale else ""
     clean_stem = clean_locus_name(args.fasta_file.stem)
-    left_str = format_val(args.left)
-    right_str = format_val(args.right if args.right is not None else 0)
 
     from .utils import parse_filename_to_dir_structure, get_simulation_categories, get_short_sim_name
     parsed = parse_filename_to_dir_structure(clean_stem)
@@ -2444,7 +2662,7 @@ def main(argv=None):
         cats = get_simulation_categories(args.fasta_file)
         short_sim = get_short_sim_name(sim_dir.name)
 
-    def _derive_output_path(normalize_flag, ilr_flag):
+    def _derive_output_path(normalize_flag, ilr_flag, bench=None):
         """
         Same derivation as below, parameterized on the normalize/ilr flags so
         the --normalize/--ilr short-circuits (see below) can also derive the
@@ -2453,66 +2671,8 @@ def main(argv=None):
         takes the place of --normalize's, never stacking with it, even if
         --normalize was also explicitly passed.
         """
-        if args.bench:
-            # --bench (set only by benchmark's own subprocess invocations) keeps
-            # scores.tsv in the shared canonical tree, keyed only by window/step
-            # -- caster's windowed dstar statistics don't depend on dist_type or
-            # --output-base/--base at all (those only select a phlag-side
-            # model/variant tree), so every dist_type/--base variant reads and
-            # writes the same cached scores.tsv here instead of each getting its
-            # own copy recomputed from scratch. Lives in its own store/caster/
-            # tree, not nested under store/phlag/, since it isn't a phlag output.
-            # --pair/--site key this the same way they key the standalone tree
-            # (c<chunk>_s<step>, see below) -- otherwise a --pair/--site run
-            # sharing a dstar run's -w/-s values would collide on the exact
-            # same cached scores.tsv, silently mixing quartet-branch scores
-            # with D* scores. --site and --normalize each nest their own
-            # named subdirectory ('site'/'normalize') under the size segment
-            # instead of a flat suffix -- keeps the caster/ tree's directory
-            # names legible (c<chunk>_s<step>/site/normalize/... rather than
-            # c<chunk>_s<step>_site_n) -- '--site' likewise keeps --site from
-            # colliding with a --pair run sharing the same chunk/step, and
-            # 'normalize' keeps normalized and raw scores from sharing a
-            # cache entry. --zscale still appends a flat zscale_suffix ("_z")
-            # to the size segment itself, unchanged. --norm-eps is a boolean
-            # (see apply_normalize) that nests its own 'norm-eps' segment
-            # under 'normalize' when set, leaving plain 'normalize' as the
-            # original unguarded data (bit-for-bit reproducible, nothing
-            # existing needs to move) and 'normalize/norm-eps' as the fixed
-            # data -- exactly two cache entries, not an eps<value> family.
-            # Any future new flag that changes what ends up in
-            # scores.tsv/report.tsv should get the same treatment -- its own
-            # named segment here (and mirrored in bench/benchmark.py's
-            # get_expected_caster_sim_dir) -- rather than folding into an
-            # existing directory's cache entry.
-            if args.pair or args.site:
-                chunk = args.chunk_size if args.chunk_size is not None else args.window_size
-                caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
-                if args.site:
-                    caster_root = caster_root / "site"
-            else:
-                caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}"
-            if ilr_flag:
-                caster_root = caster_root / "ilr"
-            elif normalize_flag:
-                caster_root = caster_root / "normalize"
-                if args.norm_eps:
-                    caster_root = caster_root / "norm-eps"
-            if args.exp_minus:
-                caster_root = caster_root / "exp-minus"
-            if parsed:
-                rel_dir = parsed["relative_dir_no_window"]
-                return caster_root / rel_dir / "scores.tsv"
-            elif is_sim:
-                pattern_stem = clean_stem
-                if cats:
-                    return caster_root / cats[0] / cats[1] / short_sim / pattern_stem / "scores.tsv"
-                else:
-                    return caster_root / short_sim / pattern_stem / "scores.tsv"
-            else:
-                pattern_stem = clean_stem
-                final_output_name = f"{clean_stem}_{left_str}_{right_str}_w{window_str}_s{step_str}.tsv"
-                return caster_root / pattern_stem / final_output_name
+        if args.bench if bench is None else bench:
+            return canonical_scores_path(args, normalize_flag, ilr_flag)
         else:
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
@@ -2532,6 +2692,59 @@ def main(argv=None):
         final_output_path = args.output_file
     plot_data_dir = final_output_path.parent
 
+    def _write_stats_and_plots():
+        write_ground_truth_stats(
+            scores_file=str(final_output_path.resolve()),
+            output_dir=str(plot_data_dir.resolve()),
+            locus_pattern=locus_pattern,
+            topologies=args.topologies,
+            dist_type=args.dist_type,
+        )
+        if args.plot:
+            CasterPlotter(
+                scores_file=str(final_output_path.resolve()),
+                distribution=args.dist_type,
+                data_dir=str(plot_data_dir.resolve()),
+                topologies=args.topologies,
+                plot_scores=("scatter" in args.plot),
+                plot_dist=("dist" in args.plot),
+                plot_correlation=("correlation" in args.plot),
+                plot_topology_pairs=("topology_pairs" in args.plot),
+                plot_quartet_counts=("quartet_counts" in args.plot),
+                plot_sums=("sums" in args.plot),
+                plot_ecdf=("ecdf" in args.plot),
+                plot_qq=qq_dists(args.plot),
+                locus_pattern=locus_pattern,
+            )
+
+    if args.skip_existing and final_output_path.exists():
+        args.plot = missing_plots(args.plot, plot_data_dir)
+        print(f"Found existing scores at '{final_output_path}' -- skipping regeneration"
+              + (f", drawing missing plots {args.plot}." if args.plot else ", no plots missing."))
+        if args.plot:
+            _write_stats_and_plots()
+        return final_output_path
+
+    same_as_bench = not args.shift_caster and args.left == 0 and args.right is None and args.mapping is None
+    if not args.bench and same_as_bench and args.output_file != regen_output_path:
+        store_path = _derive_output_path(args.normalize, args.ilr, bench=True)
+        if store_path.exists() and store_path.resolve() != final_output_path.resolve():
+            print(f"Found benchmarked scores at '{store_path}' -- reusing instead of recomputing.")
+            final_output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(store_path, final_output_path)
+            copy_quartet_counts_if_missing(store_path.parent, plot_data_dir)
+            if args.dist_type != "exp":
+                write_ground_truth_stats(
+                    scores_file=str(store_path.resolve()),
+                    output_dir=str(store_path.parent.resolve()),
+                    locus_pattern=locus_pattern,
+                    topologies=args.topologies,
+                    dist_type=args.dist_type,
+                    merge=True,
+                )
+            _write_stats_and_plots()
+            return final_output_path
+
     # Exact-cache check: if final_output_path itself already exists (this
     # precise -w/-s[/--pair/--site]+ilr/normalize combination was already
     # computed), skip regeneration entirely -- cheaper than even the
@@ -2546,27 +2759,7 @@ def main(argv=None):
     if (args.ilr or args.normalize or args.exp_minus or regen_plot_only) and final_output_path.exists():
         print(f"Found existing scores at '{final_output_path}' -- skipping regeneration.")
         copy_quartet_counts_if_missing(strip_exp_minus(_derive_output_path(False, False)).parent, plot_data_dir)
-        write_ground_truth_stats(
-            scores_file=str(final_output_path.resolve()),
-            output_dir=str(plot_data_dir.resolve()),
-            locus_pattern=locus_pattern,
-            topologies=args.topologies,
-            dist_type=args.dist_type,
-        )
-        if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
-            CasterPlotter(
-                scores_file=str(final_output_path.resolve()),
-                distribution=args.dist_type,
-                data_dir=str(plot_data_dir.resolve()),
-                topologies=args.topologies,
-                plot_scores=("scatter" in args.plot),
-                plot_dist=("dist" in args.plot),
-                    plot_correlation=("correlation" in args.plot),
-                plot_topology_pairs=("topology_pairs" in args.plot),
-                plot_quartet_counts=("quartet_counts" in args.plot),
-                plot_sums=("sums" in args.plot),
-                locus_pattern=locus_pattern,
-            )
+        _write_stats_and_plots()
         return final_output_path
 
     if args.exp_minus:
@@ -2581,27 +2774,7 @@ def main(argv=None):
         apply_exp_minus_to_scores_file(base_path, final_output_path)
         print(f"Success: TSV output file generated at: {final_output_path}")
         copy_quartet_counts_if_missing(base_path.parent, plot_data_dir)
-        write_ground_truth_stats(
-            scores_file=str(final_output_path.resolve()),
-            output_dir=str(plot_data_dir.resolve()),
-            locus_pattern=locus_pattern,
-            topologies=args.topologies,
-            dist_type=args.dist_type,
-        )
-        if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
-            CasterPlotter(
-                scores_file=str(final_output_path.resolve()),
-                distribution=args.dist_type,
-                data_dir=str(plot_data_dir.resolve()),
-                topologies=args.topologies,
-                plot_scores=("scatter" in args.plot),
-                plot_dist=("dist" in args.plot),
-                plot_correlation=("correlation" in args.plot),
-                plot_topology_pairs=("topology_pairs" in args.plot),
-                plot_quartet_counts=("quartet_counts" in args.plot),
-                plot_sums=("sums" in args.plot),
-                locus_pattern=locus_pattern,
-            )
+        _write_stats_and_plots()
         return final_output_path
 
     # --ilr short-circuit: if the raw sibling scores.tsv (same -w/-s or
@@ -2617,27 +2790,7 @@ def main(argv=None):
             apply_ilr_to_scores_file(raw_path, final_output_path, has_q123=args.pair)
             print(f"Success: TSV output file generated at: {final_output_path}")
             copy_quartet_counts_if_missing(raw_path.parent, plot_data_dir)
-            write_ground_truth_stats(
-                scores_file=str(final_output_path.resolve()),
-                output_dir=str(plot_data_dir.resolve()),
-                locus_pattern=locus_pattern,
-                topologies=args.topologies,
-                dist_type=args.dist_type,
-            )
-            if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
-                CasterPlotter(
-                    scores_file=str(final_output_path.resolve()),
-                    distribution=args.dist_type,
-                    data_dir=str(plot_data_dir.resolve()),
-                    topologies=args.topologies,
-                    plot_scores=("scatter" in args.plot),
-                    plot_dist=("dist" in args.plot),
-                            plot_correlation=("correlation" in args.plot),
-                    plot_topology_pairs=("topology_pairs" in args.plot),
-                    plot_quartet_counts=("quartet_counts" in args.plot),
-                    plot_sums=("sums" in args.plot),
-                    locus_pattern=locus_pattern,
-                )
+            _write_stats_and_plots()
             return final_output_path
 
     # --normalize short-circuit: if the un-normalized sibling scores.tsv (same
@@ -2652,27 +2805,7 @@ def main(argv=None):
             apply_normalize_to_scores_file(unnormalized_path, final_output_path, has_q123=args.pair, eps=(DEFAULT_NORM_EPS if args.norm_eps else None))
             print(f"Success: TSV output file generated at: {final_output_path}")
             copy_quartet_counts_if_missing(unnormalized_path.parent, plot_data_dir)
-            write_ground_truth_stats(
-                scores_file=str(final_output_path.resolve()),
-                output_dir=str(plot_data_dir.resolve()),
-                locus_pattern=locus_pattern,
-                topologies=args.topologies,
-                dist_type=args.dist_type,
-            )
-            if args.plot and any(p in args.plot for p in ("scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums")):
-                CasterPlotter(
-                    scores_file=str(final_output_path.resolve()),
-                    distribution=args.dist_type,
-                    data_dir=str(plot_data_dir.resolve()),
-                    topologies=args.topologies,
-                    plot_scores=("scatter" in args.plot),
-                    plot_dist=("dist" in args.plot),
-                            plot_correlation=("correlation" in args.plot),
-                    plot_topology_pairs=("topology_pairs" in args.plot),
-                    plot_quartet_counts=("quartet_counts" in args.plot),
-                    plot_sums=("sums" in args.plot),
-                    locus_pattern=locus_pattern,
-                )
+            _write_stats_and_plots()
             return final_output_path
 
     if not args.fasta_file.exists():
@@ -2994,38 +3127,7 @@ def main(argv=None):
         shutil.rmtree(temp_dir)
 
     print(f"Using scores file: {final_output_path}")
-
-    write_ground_truth_stats(
-        scores_file=str(final_output_path.resolve()),
-        output_dir=str(plot_data_dir.resolve()),
-        locus_pattern=locus_pattern,
-        topologies=args.topologies,
-        dist_type=args.dist_type,
-    )
-
-    if args.plot:
-        plot_scores = "scatter" in args.plot
-        plot_dist = "dist" in args.plot
-        plot_correlation = "correlation" in args.plot
-        plot_topology_pairs = "topology_pairs" in args.plot
-        plot_quartet_counts = "quartet_counts" in args.plot
-        plot_sums = "sums" in args.plot
-
-        if plot_scores or plot_dist or plot_correlation or plot_topology_pairs or plot_quartet_counts or plot_sums:
-            CasterPlotter(
-                scores_file=str(final_output_path.resolve()),
-                distribution=args.dist_type,
-                data_dir=str(plot_data_dir.resolve()),
-                topologies=args.topologies,
-                plot_scores=plot_scores,
-                plot_dist=plot_dist,
-                plot_correlation=plot_correlation,
-                plot_topology_pairs=plot_topology_pairs,
-                plot_quartet_counts=plot_quartet_counts,
-                plot_sums=plot_sums,
-                locus_pattern=locus_pattern,
-            )
-
+    _write_stats_and_plots()
     return final_output_path
 
 if __name__ == "__main__":

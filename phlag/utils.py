@@ -288,7 +288,7 @@ def write_gt_stats_file(path, stats):
     old "Null/Alt fitted mean/covariance" bookkeeping convention so
     read_gt_stats_file can recover it exactly. Also writes a "<label>
     mean norm" line (L2 norm of the mean vector) and a "<label>
-    covariance norm" line (Frobenius norm, matching bench/benchmark.py's
+    covariance norm" line (Frobenius norm, matching bench/cli/benchmark.py's
     np.linalg.norm(cov_arr) computation) per label for quick eyeballing --
     read_gt_stats_file doesn't parse either back since they're derivable
     from the mean/covariance themselves. An optional "<label>Skewness"
@@ -729,10 +729,57 @@ SIM_CATEGORY_PAIRS = {
 }
 
 
+PHLAG_SEGMENT_DEFAULTS = {
+    "double_variance_init": False,
+    "alt_emission_parameterization": "free",
+    "annealing": False,
+    "emission_lambda": 1.0,
+    "null_emission_parameterization": "free",
+    "n_iters": 10,
+    "repulsion_optimizer": "lm",
+    "lm_damping": 1.0,
+    "silhouette_threshold": 0.5,
+    "n_clusters": 2,
+    "best_paths": 1,
+    "correct_transition": None,
+    "dirichlet_mean": False,
+    "prior_init_probs": False,
+    "emission_param": "free",
+}
+PHLAG_SEGMENT_BARE_VALUES = {"correct_transition": "auto"}
+_NAMED_SEGMENTS = {
+    "var2x": ("double_variance_init", True),
+    "repulsion": ("alt_emission_parameterization", "repulsion"),
+    "annealing": ("annealing", True),
+    "zero-alt-anchor": ("emission_param", "zero-alt-anchor"),
+}
+
+
+def phlag_segment_value(args, dest):
+    value = args.get(dest) if isinstance(args, dict) else getattr(args, dest, None)
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return PHLAG_SEGMENT_DEFAULTS[dest] if value is None else value
+
+
+def phlag_param_segment(dest, value):
+    for seg, (seg_dest, seg_value) in _NAMED_SEGMENTS.items():
+        if dest == seg_dest and value == seg_value:
+            return seg
+    if dest == "emission_lambda":
+        return f"lam{value}"
+    name = dest.replace("_", "-")
+    if value is True or value == PHLAG_SEGMENT_BARE_VALUES.get(dest):
+        return name
+    value = re.sub(r"[\s/]+", ",", str(value).strip())
+    return f"{name}={value}"
+
+
 def get_phlag_param_segments(args):
     """
     Phlag-param directory segments, in store/phlag's order:
-    <dist_type>[/rho<X>_beta[prime]<Y>][/var2x][/repulsion][/annealing][/lam<X>].
+    <dist_type>[/rho<X>_beta[prime]<Y>][/var2x][/repulsion][/annealing][/lam<X>]
+    then '<flag>[=<value>]' for every other PHLAG_SEGMENT_DEFAULTS flag off its default.
     """
     segments = [getattr(args, "model_design", None) or "gaussian"]
     rho, beta = getattr(args, "rho", None), getattr(args, "beta", None)
@@ -741,16 +788,34 @@ def get_phlag_param_segments(args):
         segments.append(f"rho{float(rho)}_beta{float(beta)}")
     elif rho is not None and beta_prime is not None:
         segments.append(f"rho{float(rho)}_betaprime{float(beta_prime)}")
-    if getattr(args, "double_variance_init", False):
-        segments.append("var2x")
-    if getattr(args, "alt_emission_parameterization", None) == "repulsion":
-        segments.append("repulsion")
-    if getattr(args, "annealing", False):
-        segments.append("annealing")
-    lam = getattr(args, "emission_lambda", None)
-    if lam not in (None, 1.0):
-        segments.append(f"lam{lam}")
+    for dest, default in PHLAG_SEGMENT_DEFAULTS.items():
+        value = phlag_segment_value(args, dest)
+        if value != default:
+            segments.append(phlag_param_segment(dest, value))
     return segments
+
+
+def parse_phlag_param_segment(seg):
+    """Inverse of get_phlag_param_segments for one non-dist segment: a
+    {dest: value} dict, or None if seg isn't a phlag-param segment."""
+    m = re.fullmatch(r"rho([-\d.eE+]+)_beta(prime)?([-\d.eE+]+)", seg)
+    if m:
+        return {"rho": float(m.group(1)), "beta_prime" if m.group(2) else "beta": float(m.group(3))}
+    m = re.fullmatch(r"lam([-\d.eE+]+)", seg)
+    if m:
+        return {"emission_lambda": float(m.group(1))}
+    if seg in _NAMED_SEGMENTS:
+        return dict([_NAMED_SEGMENTS[seg]])
+    name, sep, raw = seg.partition("=")
+    dest = name.replace("-", "_")
+    if dest not in PHLAG_SEGMENT_DEFAULTS:
+        return None
+    default = PHLAG_SEGMENT_DEFAULTS[dest]
+    if not sep:
+        if isinstance(default, bool):
+            return {dest: True}
+        return {dest: PHLAG_SEGMENT_BARE_VALUES[dest]} if dest in PHLAG_SEGMENT_BARE_VALUES else None
+    return {dest: raw if default is None else type(default)(raw)}
 
 
 def get_simulation_categories(sim_name):
@@ -1264,6 +1329,19 @@ def resolve_locus_spec(spec):
     if len(parts) != 4:
         return None
     cat, sub, node, pattern = parts
+    for d in _locus_node_dirs(cat, sub, node):
+        for ext in FASTA_EXTS:
+            cand = d / "concat" / f"{pattern}{ext}"
+            if cand.is_file():
+                return cand.resolve()
+    return None
+
+
+FASTA_EXTS = (".fa", ".fasta", ".fa.gz")
+
+
+def _locus_node_dirs(cat, sub, node):
+    import pathlib
     roots = [get_repo_root() / "store" / "simulations", get_repo_root() / "simulations", pathlib.Path("/drive2/iang/simulations")]
     try:
         roots.insert(1, get_data_dir() / "simulations")
@@ -1278,13 +1356,24 @@ def resolve_locus_spec(spec):
             key=lambda d: (d.name != node, get_short_sim_name(d.name) != node, d.name.split("_")[0] != node),
         )
         for d in node_dirs:
-            if d.name != node and get_short_sim_name(d.name) != node and d.name.split("_")[0] != node:
-                continue
-            for ext in (".fa", ".fasta", ".fa.gz"):
-                cand = d / "concat" / f"{pattern}{ext}"
-                if cand.is_file():
-                    return cand.resolve()
+            if d.name == node or get_short_sim_name(d.name) == node or d.name.split("_")[0] == node:
+                yield d
+
+
+def expand_node_spec(spec):
+    import pathlib
+    parts = pathlib.PurePath(str(spec)).parts
+    if len(parts) != 3 or pathlib.Path(spec).is_file():
+        return None
+    for d in _locus_node_dirs(*parts):
+        patterns = sorted({f.name[:-len(ext)] for ext in FASTA_EXTS for f in (d / "concat").glob(f"*{ext}")})
+        if patterns:
+            return [str(pathlib.PurePath(*parts, p)) for p in patterns]
     return None
+
+
+def expand_node_specs(specs):
+    return [s for spec in specs for s in (expand_node_spec(spec) or [str(spec)])]
 
 
 def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefixes=None, target_dir_name=None):

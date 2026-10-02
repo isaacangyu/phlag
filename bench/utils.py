@@ -1,7 +1,10 @@
+import argparse
 import colorsys
+import functools
 import itertools
 import math
 import re
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -10,29 +13,35 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from bench.benchmark import (
+from bench.cli.benchmark import (
     ADMIXTURE_BINS,
     BRANCH_LENGTH_BINS,
     CASTER_ARG_SPECS,
+    CATEGORY_TO_COLUMN,
     COL_ADMIXTURE,
+    DEFAULT_CONCAT_PATTERNS,
     FIGURE_COLUMNS,
     FRACTION_BINS,
     HD_NUM_BINS,
     PHLAG_ARG_SPECS,
     TOPOLOGY_NAMES,
+    BenchmarkStats,
     _build_parser,
     _read_args_json,
     assign_bin,
+    discover_leaf_dirs,
     parse_report,
 )
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path
 from phlag.utils import (
     ADMIXTURE_DIVERGENCE_THRESHOLD_MYR,
+    PHLAG_SEGMENT_DEFAULTS,
     get_admixture_divergence_time,
     get_cu_branch_length_from_population_info,
     get_out_root,
     get_repo_root,
     get_simulation_clade,
+    parse_phlag_param_segment,
     read_gt_stats_file,
 )
 
@@ -40,6 +49,7 @@ STORE_ROOT = "store/phlag"
 
 PHLAG_SOURCE_ROOTS = {"gtrees": str(get_repo_root() / "out" / "gtrees"), "msa": str(get_out_root())}
 WINDOWLESS_PHLAG_SOURCES = {"gtrees"}
+_GT_STATS_COLUMN = re.compile(r"^(null|alt|pooled)_(mean|cov|var|within)_")
 
 SWEEP_METRICS = ["em_hd", "roc_auc", "f1"]
 
@@ -200,7 +210,11 @@ def _canonical_flag_name(flag):
     return _DEST_TO_LONG_FLAG.get(dest, flag) if dest is not None else flag
 _PARAM_LABELS = {"emission_lambda": "lambda"}
 
-_CONFIG_PALETTE = list(matplotlib.colormaps["tab10"].colors)
+_CONFIG_PALETTE = (
+    list(matplotlib.colormaps["tab10"].colors)
+    + [matplotlib.colormaps["tab20b"].colors[i] for i in (0, 4, 8, 12, 16)]
+    + [matplotlib.colormaps["tab20c"].colors[i] for i in (0, 4, 8, 12)]
+)
 
 
 def _match_cache_key(flags):
@@ -266,6 +280,7 @@ class CrossRunAnalysis:
         self._leaf_dirs = None
         self._args_json_cache = {}
         self._match_cache = {}
+        _windowless_runs_df.cache_clear()
 
     def _get_args(self, run_dir):
         """_read_args_json(run_dir/"args.json"), cached per run_dir for this
@@ -351,8 +366,38 @@ class CrossRunAnalysis:
             if any(kw in str(run_dir) for kw in exclude_keywords):
                 continue
             recorded = self._get_args(run_dir)
-            values.add(recorded.get(dest))
+            values.add(_recorded_value(recorded, dest))
         return sorted(values, key=_param_value_sort_key)
+
+    def _unlisted_toggle_flags(self, agg_seq, axes, exclude_keywords=()):
+        """On/off flags that aren't pinned in `axes` or named anywhere in agg
+        and take more than one value on disk."""
+        named = set(axes)
+        for name in agg_seq:
+            named.update(m for m in name if m != "...") if isinstance(name, tuple) else named.add(name)
+        seen = {_FLAG_TO_DEST[f] for f in named if f in _FLAG_TO_DEST}
+        extra = []
+        for flag, dest in _FLAG_TO_DEST.items():
+            if dest in seen:
+                continue
+            seen.add(dest)
+            if isinstance(_PARSER._option_string_actions[flag], argparse._StoreTrueAction) \
+                    and len(self._discover_flag_tuple_values((flag,), exclude_keywords)) > 1:
+                extra.append(_canonical_flag_name(flag))
+        return extra
+
+    def _expand_tuple_wildcards(self, agg_seq, axes, exclude_keywords=()):
+        """Replaces a "..." member of a tuple agg element with
+        _unlisted_toggle_flags, so new flags are categorized automatically
+        (realized combinations only -- see _discover_flag_tuple_values)."""
+        if not any(isinstance(name, tuple) and "..." in name for name in agg_seq):
+            return agg_seq
+        extra = self._unlisted_toggle_flags(agg_seq, axes, exclude_keywords)
+        return [
+            tuple(m for member in name for m in (extra if member == "..." else (member,)))
+            if isinstance(name, tuple) else name
+            for name in agg_seq
+        ]
 
     def _discover_flag_tuple_values(self, flags, exclude_keywords=()):
         """Every distinct joint combination of `flags`' dests that actually
@@ -369,12 +414,18 @@ class CrossRunAnalysis:
             if dest is None:
                 raise KeyError(f"{flag!r} is not one of benchmark.py's mirrored caster/phlag flags")
             dests.append(dest)
+        off_is_missing = [
+            isinstance(_PARSER._option_string_actions[flag], argparse._StoreTrueAction) for flag in flags
+        ]
         combos = set()
         for run_dir in self._all_leaf_dirs():
             if any(kw in str(run_dir) for kw in exclude_keywords):
                 continue
             recorded = self._get_args(run_dir)
-            combos.add(tuple(recorded.get(dest) for dest in dests))
+            combos.add(tuple(
+                False if off and recorded.get(dest) is None else _recorded_value(recorded, dest)
+                for dest, off in zip(dests, off_is_missing)
+            ))
         return sorted(combos, key=lambda combo: tuple(_param_value_sort_key(v) for v in combo))
 
     def _discover_row_values(self, col, exclude_keywords=()):
@@ -571,8 +622,14 @@ class CrossRunAnalysis:
         placeholder while agg[1] (bar) has real values -- see its
         docstring."""
         agg_seq = [agg] if isinstance(agg, str) else (list(agg) if agg else list(axes))
-        agg_set = set(agg_seq)
         axes = dict(axes)
+        agg_seq = self._expand_tuple_wildcards(agg_seq, axes, exclude_keywords)
+        implicit_flags = self._unlisted_toggle_flags(agg_seq, axes, exclude_keywords)
+        agg_set = set(agg_seq)
+        sources = axes.pop("phlag", None)
+        if sources is None:
+            sources = list(PHLAG_SOURCE_ROOTS) if "phlag" in agg_seq else ["msa"]
+        sources = [sources] if isinstance(sources, str) else list(sources)
 
         data_col_axes = {}
         for name in list(axes.keys()) + agg_seq:
@@ -639,6 +696,8 @@ class CrossRunAnalysis:
                     )
                     states.append((fs, True, disp))
                 consumed_flags.update(name)
+            elif name == "phlag":
+                states = [({"phlag": v}, False, v) for v in sources]
             elif name in data_col_axes:
                 states = [({name: v}, False, str(v)) for v in data_col_axes[name]]
             elif name in axes:
@@ -679,20 +738,35 @@ class CrossRunAnalysis:
                 else:
                     row_filter.update(contribution)
             label = " ".join(label_bits) or "(none)"
+            combo_sources = [row_filter.pop("phlag")] if "phlag" in row_filter else sources
             dirs = []
-            for pool_combo in pool_combos:
-                merged = dict(agg_flags)
-                for part in pool_combo:
-                    merged.update(part)
-                merged = _resolve_step_fraction(merged)
-                dirs.extend(self.find_matching_leaf_dirs(merged, exclude_keywords))
+            for source in combo_sources:
+                if source in WINDOWLESS_PHLAG_SOURCES:
+                    if not _windowless_runs_df(source).empty:
+                        dirs.append(Path(PHLAG_SOURCE_ROOTS[source]))
+                    continue
+                for pool_combo in pool_combos:
+                    merged = dict(agg_flags)
+                    for part in pool_combo:
+                        merged.update(part)
+                    merged = _resolve_step_fraction(merged)
+                    dirs.extend(self.find_matching_leaf_dirs(merged, exclude_keywords))
             if not dirs:
                 continue
-            configs.append((label, dirs))
-            self._row_filters[label] = row_filter
-            self._config_axes[label] = axis_values
-            self._agg_axis_names[label] = level_names
-            self._restrictions[label] = restriction
+            splits, windowless_roots = {}, {PHLAG_SOURCE_ROOTS[x] for x in WINDOWLESS_PHLAG_SOURCES}
+            for d in dirs:
+                recorded = {} if str(d) in windowless_roots else self._get_args(d)
+                key = tuple(bool(recorded.get(_FLAG_TO_DEST[f])) for f in implicit_flags)
+                splits.setdefault(key, []).append(d)
+            for key, split_dirs in splits.items():
+                text = " ".join(_strip_flag(f) for f, on in zip(implicit_flags, key) if on)
+                split_label = f"{label} {text}" if text else label
+                split_axes = ([f"{axis_values[0]} {text}" if text else axis_values[0]] + axis_values[1:]) if axis_values else axis_values
+                configs.append((split_label, split_dirs))
+                self._row_filters[split_label] = row_filter
+                self._config_axes[split_label] = split_axes
+                self._agg_axis_names[split_label] = level_names
+                self._restrictions[split_label] = restriction
         return configs
 
     def print_configs(self, configs=None, metrics=None, paths=False):
@@ -751,7 +825,7 @@ class CrossRunAnalysis:
                 ys = [p[2] for p in points]
                 if len(xs) > 1:
                     ax.plot(xs, ys, color=colors[label], alpha=0.45, linewidth=1.0, zorder=2)
-                shades = [_shade_color(colors[label], i / max(len(points) - 1, 1)) for i in range(len(points))]
+                shades = [_shade_color(colors[label], x_bins.index(p[0]) / max(len(x_bins) - 1, 1)) for p in points]
                 ax.scatter(xs, ys, color=shades, s=34, edgecolor="white", linewidth=0.7, zorder=3)
 
         fig = _cross_run_grid(configs, title, cell, categorical_x=False)
@@ -832,7 +906,7 @@ class CrossRunAnalysis:
             (len(line_vals) if show_line_legend else 0)
             + (len(point_vals) + 1 if show_shade_legend else 0)  # +1: shade legend's own title row
         )
-        legend_extra_in = 0.32 * legend_rows
+        legend_extra_in = 0.2 * legend_rows
 
         fig, axes = plt.subplots(
             n_rows, n_cols, figsize=(3.3 * n_cols, 3.1 * n_rows + 0.8 + legend_extra_in), squeeze=False)
@@ -872,9 +946,9 @@ class CrossRunAnalysis:
                     ys = [p[2] for p in points]
                     if len(xs) > 1:
                         ax.plot(xs, ys, color=colors[lv], alpha=0.45, linewidth=1.0, zorder=2)
-                    shades = [_shade_color(colors[lv], i / max(len(points) - 1, 1)) for i in range(len(points))]
+                    shades = [_shade_color(colors[lv], point_vals.index(p[0]) / max(len(point_vals) - 1, 1)) for p in points]
                     ax.scatter(xs, ys, color=shades, s=34, edgecolor="white", linewidth=0.7, zorder=3)
-        fig.suptitle(title, fontsize=12, y=0.995)
+        _suptitle(fig, title, fontsize=12, y=0.995)
 
         # The two legends used to sit in opposite top corners (upper-left/
         # upper-right) sharing one row of vertical space -- fine for a wide
@@ -923,11 +997,11 @@ class CrossRunAnalysis:
             fig.canvas.draw()
             cursor_y = (shade_legend.get_window_extent(renderer).y0 - 4) / fig_h_px
 
-        fig.tight_layout(rect=[0, 0.04, 1, cursor_y])
+        fig.tight_layout(rect=[0, 0.04, 1, _below_title_top(fig, cursor_y)])
         return fig
 
-    def _plot_run(self, axes, path, metrics, exclude_keywords=(), logy=False, title=""):
-        df = _collect_run_df(axes, path, exclude_keywords)
+    def _plot_run(self, axes, path, metrics, exclude_keywords=(), logy=False, title="", dir="out"):
+        df = _collect_run_df(axes, path, exclude_keywords, dir, self.root)
         panels = [(m,) if isinstance(m, str) else tuple(m) for m in metrics]
         missing = sorted({m for panel in panels for m in panel} - set(df.columns))
         if missing:
@@ -972,18 +1046,19 @@ class CrossRunAnalysis:
             handles += [plt.Line2D([], [], color="0.3", marker=markers[mi % len(markers)], linestyle=("-", "--", ":")[mi % 3],
                                    markersize=4) for mi in range(len(widest))]
             labels += list(widest)
+        _suptitle(fig, title or _path_after_out(path), fontsize=9)
         if len(handles) > 1:
-            fig.legend(handles, labels, loc="lower center", ncol=min(len(handles), 4), fontsize=7, frameon=False)
-        fig.suptitle(title or _path_after_out(path), fontsize=9)
-        fig.tight_layout(rect=[0, 0.08 if len(handles) > 1 else 0, 1, 0.95])
+            _legend_below_axes(fig, handles, labels, ncol=min(len(handles), 4), fontsize=7)
+        else:
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
         return fig
 
-    def _plot_branches(self, axes, runs, metrics, exclude_keywords=(), title=""):
-        dfs = {label: _collect_run_df(axes, path, exclude_keywords) for label, path in runs.items()}
-        configs = sorted({c for df in dfs.values() for c in df["config"]})
-        palette = dict(zip(configs, sns.color_palette("tab10", max(len(configs), 1))))
-        markers = ["o", "s", "^", "D", "v", "P"]
+    def _plot_branches(self, axes, runs, metrics, exclude_keywords=(), title="", dir="out"):
+        dfs = {label: _collect_run_df(axes, path, exclude_keywords, dir, self.root) for label, path in runs.items()}
+        columns = [c for m in metrics for c in (("tpr", "fpr") if m == "tpr_fpr" else (m,))]
+        configs = sorted({c for df in dfs.values() for c in df.loc[df[columns].notna().any(axis=1), "config"]})
+        configs, palette, legend_labels, legend_ncol = _rho_beta_palette(configs)
         fig, axs = plt.subplots(len(metrics), len(runs), figsize=(3.4 * len(runs), 3.2 * len(metrics)),
                                 squeeze=False)
         for ci, (label, path) in enumerate(runs.items()):
@@ -1004,13 +1079,23 @@ class CrossRunAnalysis:
                 ax.grid(alpha=0.25)
                 if metric == "tpr_fpr":
                     ax.plot([0, 1], [0, 1], color="0.7", linestyle="--", linewidth=0.8)
-                    for k, config in enumerate(configs):
-                        for si, (w, s) in enumerate(sizes):
+                    lines = []
+                    for si, (w, s) in enumerate(sizes):
+                        pts = []
+                        for config in configs:
                             sub = rows_at(config, w, s)
                             if sub.empty:
                                 continue
-                            ax.scatter(sub["fpr"].mean(), sub["tpr"].mean(), color=palette[config],
-                                       marker=markers[si % len(markers)], s=70 / (k + 1), zorder=3)
+                            pts.append((sub["fpr"].mean(), sub["tpr"].mean()))
+                            ax.scatter(*pts[-1], color=palette[config], s=36, zorder=3)
+                        if len(pts) > 1:
+                            lines.append((size_labels[si], pts))
+                    window_colors = plt.cm.turbo(np.linspace(0.05, 0.95, max(len(lines), 1)))
+                    for (size_label, pts), color in zip(lines, window_colors):
+                        ax.plot(*zip(*pts), color=color, linewidth=1.2, zorder=2, label=size_label)
+                    if lines:
+                        ax.legend(title="window", fontsize=6, title_fontsize=6, loc="lower right",
+                                  ncol=2, framealpha=0.85)
                     ax.set_xlim(-0.02, 1.02)
                     ax.set_ylim(-0.02, 1.02)
                     ax.set_xlabel("FPR")
@@ -1028,15 +1113,32 @@ class CrossRunAnalysis:
                 ax.set_xticklabels(size_labels, fontsize=8)
                 ax.set_ylabel(metric if ci == 0 else "")
                 _apply_bounded_yaxis(ax, metric)
-        handles = [plt.Rectangle((0, 0), 1, 1, facecolor=palette[c]) for c in configs]
-        fig.legend(handles, configs, loc="lower center", ncol=min(len(configs), 6), fontsize=8, frameon=False)
-        fig.suptitle(title or ", ".join(f"{k}={v}" for k, v in axes.items()), fontsize=10)
-        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+        handles = [plt.Rectangle((0, 0), 1, 1, facecolor=palette.get(c, "none"), edgecolor="none") for c in legend_labels]
+        _suptitle(fig, title or ", ".join(f"{k}={v}" for k, v in axes.items()), fontsize=10)
+        _legend_below_axes(fig, handles, [c or "" for c in legend_labels], ncol=legend_ncol, fontsize=8)
         plt.show()
         return fig
 
-    def plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
-             title="", options=None, show_config_suffix=True, logy=False):
+    def plot(self, *args, show_axes=True, show_legend=True, **kwargs):
+        figs = self._plot(*args, **kwargs)
+        for fig in figs if isinstance(figs, (list, tuple)) else [figs]:
+            if fig is None:
+                continue
+            if not show_legend:
+                for legend in fig.legends + [ax.get_legend() for ax in fig.axes if ax.get_legend() is not None]:
+                    legend.set_title(None)
+            if not show_axes:
+                for label in (fig._supxlabel, fig._supylabel):
+                    if label is not None:
+                        label.set_visible(False)
+                for ax in fig.axes:
+                    ax.set_xlabel("")
+                    ax.set_ylabel("")
+                    ax.set_title("")
+        return figs
+
+    def _plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
+              title="", options=None, show_config_suffix=True, logy=False, dir="out"):
         """`run` (a directory, e.g. "out/10X/down/N276/37-62") makes this a
         run-specific plot: `axes` is still the config dict, but it now only
         FILTERS the reports found under `run` (see collect_out_runs) instead of
@@ -1050,7 +1152,10 @@ class CrossRunAnalysis:
         (label = the dir minus its trailing <node>/<pattern>) plots one
         column per run instead.
         `exclude_keywords` drops report paths containing any keyword; `logy`
-        log-scales y; agg/grid_by/plot_type don't apply. Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
+        log-scales y; agg/grid_by/plot_type don't apply. dir="store" reads
+        the same run's reports from self.root's leaf dirs instead of out/
+        (reports/<run>.tsv, filtered by each leaf's args.json, config = leaf
+        path minus its size segment -- see collect_store_runs). Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
         (see its docstring, including its "" placeholder and tuple-axis
         handling) and renders the result -- one call replaces the old
         separate resolve_configs_cartesian(...) + plot_stat(configs, ...)
@@ -1212,9 +1317,9 @@ class CrossRunAnalysis:
         elif run is not None:
             run = _resolve_run_path(run)
         if isinstance(run, dict):
-            return self._plot_branches(axes, run, metrics, exclude_keywords=exclude_keywords, title=title)
+            return self._plot_branches(axes, run, metrics, exclude_keywords=exclude_keywords, title=title, dir=dir)
         if run is not None:
-            return self._plot_run(axes, run, metrics, exclude_keywords=exclude_keywords, logy=logy, title=title)
+            return self._plot_run(axes, run, metrics, exclude_keywords=exclude_keywords, logy=logy, title=title, dir=dir)
         assert plot_type in ("bar", "violin", "heatmap")
         assert grid_by in (None, "hd_bin") or plot_type == "heatmap"
         options = options or {}
@@ -1305,7 +1410,7 @@ class CrossRunAnalysis:
                         if plot_type == "violin" and not bounded:
                             _clip_axis_to_whiskers(ax, cell_bounds)
                 metric_part = metric if len(metrics) > 1 else ""
-                fig.suptitle(_compose_title(suffix, metric_part, "by HD bin"), fontsize=12, y=0.995)
+                _suptitle(fig, _compose_title(suffix, metric_part, "by HD bin"), fontsize=12, y=0.995)
                 metric_values = self._metric_by_label(configs, metric)
                 agg_legend_labels = [f"{label} ({metric}={metric_values[label]:.4f})" for label in legend_labels]
                 fig.canvas.draw()
@@ -1316,7 +1421,7 @@ class CrossRunAnalysis:
                                      bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
                 fig.canvas.draw()
                 cursor_y = (legend.get_window_extent(renderer).y0 - 4) / fig_h_px
-                fig.tight_layout(rect=[0, 0.02, 1, cursor_y])
+                fig.tight_layout(rect=[0, 0.02, 1, _below_title_top(fig, cursor_y)])
                 figs.append(fig)
             return figs
 
@@ -1419,7 +1524,7 @@ class CrossRunAnalysis:
                     interp_pts.sort()
                     xs, ys = zip(*interp_pts)
                     ax.plot(xs, ys, "-", color="black", linewidth=1.2, alpha=0.6, zorder=4)
-        fig.suptitle(_compose_title(suffix, title), fontsize=12, y=0.99)
+        _suptitle(fig, _compose_title(suffix, title), fontsize=12, y=0.99)
         flat_metrics = [m for panel in metrics for m in (panel if isinstance(panel, tuple) else (panel,))]
         metric_values = {metric: self._metric_by_label(configs, metric) for metric in flat_metrics}
         fig.canvas.draw()
@@ -1441,7 +1546,7 @@ class CrossRunAnalysis:
                                  bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
             fig.canvas.draw()
             cursor_y = (legend.get_window_extent(renderer).y0 - 4) / fig_h_px
-        fig.tight_layout(rect=[0, 0, 1, cursor_y])
+        fig.tight_layout(rect=[0, 0, 1, _below_title_top(fig, cursor_y)])
         figs.append(fig)
         return figs
 
@@ -1743,13 +1848,13 @@ class CrossRunAnalysis:
                             if len(pts) > 1:
                                 xs, ys = zip(*pts)
                                 ax.plot(xs, ys, "-", color=colors[hv], linewidth=1.3, alpha=0.85, zorder=4)
-            fig.suptitle(_compose_title(title_suffix, ""), fontsize=12, y=0.99)
+            _suptitle(fig, _compose_title(title_suffix, ""), fontsize=12, y=0.99)
             if bar_axis_label and grid_rows * grid_cols == 1:
                 fig.supxlabel(bar_axis_label, fontsize=9)
             if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
                 handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in hue_vals]
                 fig.legend(handles, [str(hv) for hv in hue_vals], loc="center left",
-                           bbox_to_anchor=(1.0, 0.5), fontsize=8, framealpha=0.9)
+                           bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             figs.append(fig)
             return figs
@@ -1818,7 +1923,7 @@ class CrossRunAnalysis:
                             if len(pts) > 1:
                                 xs, ys = zip(*pts)
                                 ax.plot(xs, ys, "-", color=colors[hv], linewidth=1.3, alpha=0.85, zorder=4)
-            fig.suptitle(_compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
+            _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
             # A single subplot's bar categories aren't otherwise labeled
             # anywhere, so the shared axis label carries real information
             # there -- but a multi-subplot grid repeats the same bar
@@ -1851,7 +1956,7 @@ class CrossRunAnalysis:
                 # the figure's right edge just grows the saved/displayed
                 # canvas sideways instead of colliding with anything.
                 fig.legend(handles, hue_legend_labels, loc="center left",
-                           bbox_to_anchor=(1.0, 0.5), fontsize=8, framealpha=0.9)
+                           bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             figs.append(fig)
         return figs
@@ -2086,7 +2191,8 @@ class CrossRunAnalysis:
             title_metric = "/".join(metrics) if metric_role else outer_metric
             base_label = "value" if metric_role else outer_metric
             multi_metric = metric_role is None and len(metrics) > 1
-            fig.suptitle(_compose_title(title_suffix, title_metric if multi_metric else "", "heatmap"), fontsize=12)
+            _suptitle(fig, _compose_title(title_suffix, title_metric if multi_metric else "", "heatmap"), fontsize=12)
+            fig.subplots_adjust(top=_title_bottom(fig, 0.88))
             if x_axis_label:
                 fig.supxlabel(x_axis_label, fontsize=9)
             if y_axis_label:
@@ -2098,7 +2204,7 @@ class CrossRunAnalysis:
                 # side, exactly as before.
                 if raw_mesh is not None:
                     fig.colorbar(raw_mesh, ax=all_axes, label=base_label, fraction=0.05, pad=0.02, location="right")
-                fig.subplots_adjust(left=0.12, bottom=0.2, right=0.88, top=0.88, wspace=0.3, hspace=0.35)
+                fig.subplots_adjust(left=0.12, bottom=0.2, right=0.88, top=_title_bottom(fig, 0.88), wspace=0.3, hspace=0.35)
             else:
                 # Split, rather than stack, when both are present: the diff
                 # colorbar keeps the usual right side (unaffected below), the
@@ -2116,7 +2222,7 @@ class CrossRunAnalysis:
                 # final, and place the colorbar's own axes (via add_axes, which
                 # -- unlike ax=/location=, doesn't reflow other axes) snug
                 # against whatever that measured extent turns out to be.
-                fig.subplots_adjust(left=0.32, bottom=0.2, right=0.85, top=0.88, wspace=0.3, hspace=0.35)
+                fig.subplots_adjust(left=0.32, bottom=0.2, right=0.85, top=_title_bottom(fig, 0.88), wspace=0.3, hspace=0.35)
                 fig.canvas.draw()
                 renderer = fig.canvas.get_renderer()
                 fig_w, fig_h = fig.bbox.width, fig.bbox.height
@@ -2191,7 +2297,7 @@ class CrossRunAnalysis:
                             ax.text(ci + 0.5, ri + 0.5, f"{v:.3f}", ha="center", va="center",
                                      color=color, fontsize=6.5)
             metric_part = metric if len(metrics) > 1 else ""
-            fig.suptitle(_compose_title(title_suffix, metric_part, "by HD bin x alt proportion"), fontsize=11, y=1.0)
+            _suptitle(fig, _compose_title(title_suffix, metric_part, "by HD bin x alt proportion"), fontsize=11, y=1.0)
             fig.text(0.5, 0.01, "HD bin (em_gt_hd)", ha="center", fontsize=8.5)
             fig.text(0.005, 0.5, "alt proportion", va="center", rotation="vertical", fontsize=8.5)
             fig.colorbar(mesh, ax=axes[0].tolist(), label=metric, fraction=0.05, pad=0.02)
@@ -2231,7 +2337,6 @@ _OUT_SIZE_SEGMENT = re.compile(r"^([wc])\d+[km]?_s\d+[km]?(.*)$", re.IGNORECASE)
 _DEST_TO_FLAG = {}
 for _flag, _dest in _FLAG_TO_DEST.items():
     _DEST_TO_FLAG.setdefault(_dest, _flag)
-_OUT_PARAM_SEGMENT = re.compile(r"^(?:rho(?P<rho>[-\d.eE+]+)_beta(?P<bp>prime)?(?P<beta>[-\d.eE+]+)|var2x|repulsion|annealing|lam(?P<lam>[-\d.eE+]+))$")
 
 
 def _path_after_out(path):
@@ -2243,7 +2348,7 @@ def _path_after_out(path):
 def _recorded_from_report_path(report):
     """args.json-shaped, dest-keyed dict recovered from an out/ report's own
     path (parse_ws_from_path for window/step/site/ilr/normalize/norm-eps/z,
-    plus get_phlag_param_segments' dist/rho_beta/var2x/repulsion/annealing/lam
+    plus get_phlag_param_segments' dist/rho_beta/flag
     segments after the size dir). Only what the path encodes is present, so
     callers can tell "not recorded" (key absent) from "off" (False/None)."""
     report = Path(report)
@@ -2254,38 +2359,27 @@ def _recorded_from_report_path(report):
     recorded = {
         "window_size": window, "step_size": step, "site": is_site, "zscale": is_z, "ilr": is_ilr,
         "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "pair": mode == "c" and not is_site,
-        "rho": None, "beta": None, "beta_prime": None, "double_variance_init": False, "alt_emission_parameterization": "free",
-        "annealing": False, "emission_lambda": None,
+        "rho": None, "beta": None, "beta_prime": None, **PHLAG_SEGMENT_DEFAULTS, "emission_lambda": None,
     }
     if rest:
         recorded["dist_type"] = rest[0]
     for seg in rest[1:]:
-        m = _OUT_PARAM_SEGMENT.match(seg)
-        if not m:
-            continue
-        if m.group("rho"):
-            recorded["rho"] = float(m.group("rho"))
-            recorded["beta_prime" if m.group("bp") else "beta"] = float(m.group("beta"))
-        elif m.group("lam"):
-            recorded["emission_lambda"] = float(m.group("lam"))
-        elif seg == "var2x":
-            recorded["double_variance_init"] = True
-        elif seg == "repulsion":
-            recorded["alt_emission_parameterization"] = "repulsion"
-        elif seg == "annealing":
-            recorded["annealing"] = True
+        recorded.update(parse_phlag_param_segment(seg) or {})
     return recorded
 
 
-def _filter_out_runs(df, axes):
+def _filter_out_runs(df, axes, recorded=None):
     """Keeps the rows of collect_out_runs' `df` whose path-derived flags
     (_recorded_from_report_path) satisfy every entry of `axes` -- a
     {cli_flag: requirement} dict as in the store-mode plot(), each requirement
     optionally a list/tuple meaning any-of, matched via _matches_flags (same
     None/False/typed-value rules); "-s" as a (0, 1] fraction is resolved
     against each row's own window. Flags the path can't tell (e.g. --np) are
-    returned as `skipped` instead of silently passing or failing every row."""
-    recorded = [_recorded_from_report_path(p) for p in df["report_path"]]
+    returned as `skipped` instead of silently passing or failing every row.
+    `recorded` (one args.json dict per row) replaces the path-derived flags,
+    as for collect_store_runs."""
+    if recorded is None:
+        recorded = [_recorded_from_report_path(p) for p in df["report_path"]]
     known = set(recorded[0]) | {"dist_type"} if recorded else set()
     skipped, checks = [], []
     for flag, requirement in axes.items():
@@ -2387,9 +2481,58 @@ def collect_out_runs(path, exclude_keywords=(), windowless=False):
     while shared < depth and len({r["_tokens"][shared] for r in records}) == 1:
         shared += 1
     for r in records:
-        r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(run)"
+        r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(none)"
     df = pd.DataFrame(records)
     return df.reindex(columns=OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS)
+
+
+def collect_store_runs(rel, root=STORE_ROOT, exclude_keywords=()):
+    """collect_out_runs' store/ counterpart: one row per finished leaf run dir
+    under `root` (own args.json + analysis.tsv) holding reports/<rel>.tsv,
+    `rel` being <category>/<subcategory>/<node>/<pattern>. window/step come
+    from the leaf's args.json, gt_stats columns from its runs.tsv row, and
+    `config` is the leaf's path below `root` minus its size segment, shared
+    leading segments dropped. Returns (df, recorded args.json per row)."""
+    rel = Path(rel)
+    source_leaf, pattern = "/".join(rel.parts[:-1]), rel.name
+    records, recorded = [], []
+    for args_path in sorted(Path(root).rglob("args.json")):
+        leaf = args_path.parent
+        report = leaf / "reports" / rel.parent / f"{pattern}.tsv"
+        if not report.exists() or not (leaf / "analysis.tsv").exists():
+            continue
+        if any(k in str(report) for k in exclude_keywords):
+            continue
+        args = _read_args_json(args_path)
+        ws = parse_ws_from_path(leaf)
+        parsed = parse_report(report)
+        row = {"report_path": str(report), "mode": ws[0] if ws else None,
+               "window": args.get("window_size"), "step": args.get("step_size"),
+               "_tokens": [p for p in leaf.relative_to(root).parts if not _OUT_SIZE_SEGMENT.match(p)]}
+        row.update({col: parsed[key] for col, key in _OUT_RUN_METRIC_KEYS.items()})
+        runs = pd.read_csv(leaf / "runs.tsv", sep="\t")
+        match = runs[(runs["source_leaf"] == source_leaf) & (runs["pattern"].astype(str) == pattern)]
+        if not match.empty:
+            row.update({c: match.iloc[0][c] for c in _OUT_GT_STATS_COLUMNS if c in match.columns})
+        records.append(row)
+        recorded.append(args)
+    if not records:
+        return pd.DataFrame(columns=OUT_RUN_ID_COLUMNS), []
+    depth = min(len(r["_tokens"]) for r in records)
+    shared = 0
+    while shared < depth and len({r["_tokens"][shared] for r in records}) == 1:
+        shared += 1
+    for r in records:
+        r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(none)"
+    df = pd.DataFrame(records)
+    return df.reindex(columns=OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS), recorded
+
+
+def _windowless_source_of(d):
+    for source in WINDOWLESS_PHLAG_SOURCES:
+        if Path(d) == Path(PHLAG_SOURCE_ROOTS[source]):
+            return source
+    return None
 
 
 def _path_below_source_root(path):
@@ -2409,16 +2552,25 @@ def _resolve_run_path(path):
     return str(Path(get_out_root()) / path)
 
 
-def _collect_run_df(axes, path, exclude_keywords=()):
+def _collect_run_df(axes, path, exclude_keywords=(), dir="out", store_root=STORE_ROOT):
     """collect_out_runs + _filter_out_runs for one run dir. An axes "phlag"
     entry (a PHLAG_SOURCE_ROOTS key, or a list of them) instead reads `path`
     (relative to a source root, or with one as prefix) under each named root,
     prefixing every row's config with its source name. A
     WINDOWLESS_PHLAG_SOURCES source has no w<W>_s<S> dirs, so its reports
-    are kept unfiltered by `axes`, with window/step None."""
+    are kept unfiltered by `axes`, with window/step None. dir="store" reads
+    the same run's reports from `store_root` instead (collect_store_runs),
+    filtered by each leaf's args.json."""
+    assert dir in ("out", "store")
     axes = dict(axes)
     sources = axes.pop("phlag", None)
-    if sources is None:
+    if dir == "store":
+        assert sources is None, "axes 'phlag' only applies to dir='out'"
+        df, recorded = collect_store_runs(_path_below_source_root(path), store_root, exclude_keywords)
+        if df.empty:
+            raise FileNotFoundError(f"No store report found for {path} under {store_root}")
+        df, _ = _filter_out_runs(df, axes, recorded)
+    elif sources is None:
         df = collect_out_runs(path, exclude_keywords)
         if df.empty:
             raise FileNotFoundError(f"No report.tsv found under {path}")
@@ -2433,13 +2585,81 @@ def _collect_run_df(axes, path, exclude_keywords=()):
                 continue
             if not windowless:
                 d, _ = _filter_out_runs(d, axes)
-            d = d.assign(config=[source if c == "(run)" else f"{source}/{c}" for c in d["config"]])
+            d = d.assign(config=[source if c == "(none)" else f"{source}/{c}" for c in d["config"]])
             frames.append(d.dropna(axis=1, how="all"))
         columns = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS
         df = pd.concat(frames, ignore_index=True).reindex(columns=columns) if frames else pd.DataFrame()
     if df.empty:
         raise ValueError(f"No report under {path} matches {axes} (phlag={sources})")
     return df
+
+
+_RHO_BETA_CONFIG = re.compile(r"rho([^_/]+)_beta(?:prime)?([^_/]+)")
+
+
+def _srgb_to_lab(rgb):
+    rgb = np.asarray(rgb, dtype=float)[..., :3]
+    lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    xyz = lin @ np.array([[0.4124, 0.2126, 0.0193], [0.3576, 0.7152, 0.1192], [0.1805, 0.0722, 0.9505]])
+    xyz = xyz / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
+
+
+def _separate_colors(palette, order, group_of, min_delta_e=20, min_shade_delta_e=10):
+    pool = [tuple(c) for name in ("tab10", "Dark2", "Set1", "tab20", "Set2") for c in sns.color_palette(name)]
+    pool += [(0.5, 0.5, 0.5), (0.75, 0.75, 0.75)]
+    pool_lab = _srgb_to_lab(pool)
+    out, used, used_groups = {}, [], []
+    for c in order:
+        color = palette[c]
+        lab = _srgb_to_lab(color)
+        same = np.array([g is not None and g == group_of.get(c) for g in used_groups], dtype=bool)
+        dists = np.linalg.norm(np.array(used) - lab, axis=1) if used else np.array([])
+        if (dists < np.where(same, min_shade_delta_e, min_delta_e)).any():
+            gaps = np.linalg.norm(pool_lab[:, None] - np.array(used)[None], axis=2).min(axis=1)
+            color = pool[int(gaps.argmax())]
+            lab = pool_lab[int(gaps.argmax())]
+        out[c] = color
+        used.append(lab)
+        used_groups.append(group_of.get(c))
+    return out
+
+
+def _rho_beta_palette(configs):
+    """One tab10 hue per rho, shades of it from light to slightly-darker-than-
+    base (never near black) by ascending beta;
+    configs without a rho<X>_beta[prime]<Y> segment get black/greys. Any color
+    too close (CIELAB) to an earlier one is swapped for a distinct one. Returns
+    configs reordered (rho, beta ascending, others last), the palette, legend
+    labels padded with None so each rho group fills one column, and ncol."""
+    groups, others = {}, []
+    for c in configs:
+        m = _RHO_BETA_CONFIG.search(c)
+        if m:
+            groups.setdefault(float(m.group(1)), []).append((float(m.group(2)), c))
+        else:
+            others.append(c)
+    tab10 = sns.color_palette("tab10")
+    hues = [tab10[i] for i in (0, 1, 2, 3, 4, 5, 6, 8, 9)]
+    palette, ordered = {}, []
+    for hi, rho in enumerate(sorted(groups)):
+        members = [c for _, c in sorted(groups[rho])]
+        base = np.array(hues[hi % len(hues)])
+        for t, c in zip(np.linspace(0.6, -0.25, len(members)) if len(members) > 1 else [0], members):
+            palette[c] = tuple(base + (1 - base) * t if t >= 0 else base * (1 + t))
+            ordered.append(c)
+    for i, c in enumerate(others):
+        palette[c] = (0.6 * i / max(len(others) - 1, 1),) * 3
+    ordered += others
+    group_of = {c: rho for rho, members in groups.items() for _, c in members}
+    palette = _separate_colors(palette, ordered, group_of)
+    if not groups:
+        return ordered, palette, others, max(min(len(others), 6), 1)
+    rows = max(max(len(v) for v in groups.values()), len(others))
+    legend = [c for rho in sorted(groups) for c in ([c for _, c in sorted(groups[rho])] + [None] * rows)[:rows]]
+    legend += (others + [None] * rows)[:rows] if others else []
+    return ordered, palette, legend, len(legend) // rows
 
 
 def _branch_length_label(df, path):
@@ -2506,7 +2726,7 @@ def _matches_flags(recorded, flags):
         dest = _FLAG_TO_DEST.get(flag)
         if dest is None:
             raise KeyError(f"{flag!r} is not one of benchmark.py's mirrored caster/phlag flags")
-        value = recorded.get(dest)
+        value = _recorded_value(recorded, dest)
         if requirement is None:
             if value is not None and value is not False:
                 return False
@@ -2751,6 +2971,18 @@ def _resolve_logy(logy, dfs, metrics):
     return math.log10(hi / lo) >= _AUTOLOG_MIN_DECADES
 
 
+def _legend_below_axes(fig, handles, labels, top=0.95, pad_px=6, **kwargs):
+    legend = fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0), frameon=False, **kwargs)
+    renderer = fig.canvas.get_renderer()
+    fig_h_px = fig.get_size_inches()[1] * fig.dpi
+    legend_h = (legend.get_window_extent(renderer).height + 2 * pad_px) / fig_h_px
+    fig.tight_layout(rect=[0, legend_h, 1, top])
+    fig.canvas.draw()
+    axes_bottom = min(ax.get_tightbbox(renderer).y0 for ax in fig.axes if ax.get_visible())
+    legend.set_bbox_to_anchor((0.5, (axes_bottom - pad_px) / fig_h_px), transform=fig.transFigure)
+    return legend
+
+
 def _apply_bounded_yaxis(ax, metrics):
     """Pins `ax`'s y-axis to [0, 1] with 0.2-step ticks when `metrics` (a
     single metric name, or an iterable of them sharing one combined subplot
@@ -2952,6 +3184,28 @@ def _is_true(series):
     return series.astype(str).str.strip() == "True"
 
 
+@functools.cache
+def _windowless_runs_df(source):
+    from phlag.utils import get_data_dir, get_simulation_categories
+
+    root = Path(PHLAG_SOURCE_ROOTS[source])
+    stats = BenchmarkStats()
+    rows = []
+    for leaf_dir in discover_leaf_dirs(get_data_dir() / "simulations"):
+        rel_leaf = leaf_dir.relative_to(get_data_dir() / "simulations").as_posix()
+        cats = get_simulation_categories(str(leaf_dir))
+        column = CATEGORY_TO_COLUMN.get(tuple(cats[:2])) if cats else None
+        if column is None:
+            continue
+        for report in sorted((root / rel_leaf).glob("*/report.tsv")):
+            if report.parent.name in DEFAULT_CONCAT_PATTERNS:
+                record = stats._build_record(report, leaf_dir.name, rel_leaf, cats[0], cats[1], column, report.parent.name)
+                rows.append(stats.run_row(record))
+    df = pd.DataFrame(rows, columns=BenchmarkStats.RUN_COLUMNS)
+    df[[c for c in df.columns if _GT_STATS_COLUMN.match(c)]] = np.nan
+    return df
+
+
 def _load_raw_config_df(dirs, get_args, bin_specs=None):
     """Concats `dirs`' runs.tsv into one frame, tagging every row with its
     source dir's window_size as "_window_size" (a config's dirs, see
@@ -2969,9 +3223,13 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
     frames = []
     for d in dirs:
         p = Path(d) / "runs.tsv"
-        if not p.exists():
+        source = _windowless_source_of(d)
+        if source is not None:
+            frame = _windowless_runs_df(source).copy()
+        elif p.exists():
+            frame = pd.read_csv(p, sep="\t")
+        else:
             continue
-        frame = pd.read_csv(p, sep="\t")
         frame["_window_size"] = get_args(d).get("window_size")
         # Per-row source dir, so a post-load row_filter/panel_col filter
         # (either of which can drop an entire run's rows) can still be
@@ -3083,6 +3341,39 @@ def _cross_run_grid(configs, title, cell_plot_fn, categorical_x=True):
                 ax.set_xlabel(x_axis_label_for_column(column), fontsize=8)
             if col_idx == 0:
                 ax.set_ylabel(f"alt proportion {fraction_bin}", fontsize=8.5)
-    fig.suptitle(title, fontsize=12, y=0.995)
+    _suptitle(fig, title, fontsize=12, y=0.995)
     fig.tight_layout(rect=[0, 0.04, 1, 0.95])
     return fig
+
+
+def _recorded_value(recorded, dest):
+    value = recorded.get(dest)
+    return PHLAG_SEGMENT_DEFAULTS.get(dest) if value is None else value
+
+
+def _suptitle(fig, text, fontsize=12, **kwargs):
+    width = max(20, int(fig.get_figwidth() * 72 / (fontsize * 0.6)))
+    lines = textwrap.wrap(text, width, break_on_hyphens=False) or [""]
+    if len(lines) > 1:
+        fig.set_figheight(fig.get_figheight() + (len(lines) - 1) * fontsize * 1.2 / 72)
+    return fig.suptitle("\n".join(lines), fontsize=fontsize, **kwargs)
+
+
+def _title_bottom(fig, default=0.95):
+    if fig._suptitle is None or not fig._suptitle.get_text():
+        return default
+    fig.canvas.draw()
+    return min(default, (fig._suptitle.get_window_extent(fig.canvas.get_renderer()).y0 - 4) / fig.bbox.height)
+
+
+def _below_title_top(fig, top):
+    """tight_layout rect top that lands the axes at `top` even though
+    tight_layout also reserves the suptitle's own height plus a pad (its
+    default pad=1.08 x font size) below rect's top -- for figures whose
+    axes top is already measured below the suptitle."""
+    if fig._suptitle is None or not fig._suptitle.get_text():
+        return top
+    fig.canvas.draw()
+    rel_height = fig._suptitle.get_window_extent(fig.canvas.get_renderer()).height / fig.bbox.height
+    pad = 1.08 * matplotlib.rcParams["font.size"] / 72 / fig.get_figheight()
+    return min(1.0, top + rel_height + pad)

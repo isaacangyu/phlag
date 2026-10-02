@@ -3,6 +3,7 @@ import pathlib
 import os
 import argparse
 import math
+import re
 
 import jax
 import numpy as np
@@ -21,9 +22,10 @@ from sklearn.metrics import silhouette_score
 from . import hmm
 from . import utils
 from .caster import step_size_or_fraction, CasterPlotter
+from .utils import PHLAG_SEGMENT_DEFAULTS, parse_phlag_param_segment
 
 E_STEP_EPS = 0.0001
-PSI_EPS = 0.001
+PSI_EPS = 1e-9 # lowered from 1e-3, increased from 1e-9 since denominator is in thousands
 NUM_STATES = 2
 BETA_PRIME = 0.0025
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
@@ -866,11 +868,35 @@ class Phlag:
 
             if transition_corrected and gt_tm is not None:
                 from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
+                from dynamax.hidden_markov_model.models.initial import ParamsStandardHMMInitialState
+                if is_auto:
+                    n_alt = float(np.sum(y_true == 1))
+                    gt_init = np.array([1.0 - n_alt / len(y_true), n_alt / len(y_true)], dtype=np.float32)
+                else:
+                    leave_null, leave_alt = 1.0 - gt_tm[0, 0], 1.0 - gt_tm[1, 1]
+                    stay_null = leave_alt / (leave_null + leave_alt) if (leave_null + leave_alt) > 0 else 0.5
+                    gt_init = np.array([stay_null, 1.0 - stay_null], dtype=np.float32)
+
+                states_swapped = False
+                if self.has_ground_truth:
+                    occupancy = np.argmax(log_likelihoods_np, axis=1)
+                    matched = int(np.sum((occupancy == 0) & (y_true == 0)) + np.sum((occupancy == 1) & (y_true == 1)))
+                    states_swapped = matched < len(y_true) - matched
+                if states_swapped:
+                    gt_tm = gt_tm[::-1, ::-1].copy()
+                    gt_init = gt_init[::-1].copy()
+
                 transition_matrix_np = gt_tm
+                initial_probs_np = gt_init
                 self.params = self.params._replace(
-                    transitions=ParamsStandardHMMTransitions(transition_matrix=jnp.array(gt_tm, dtype=jnp.float32))
+                    initial=ParamsStandardHMMInitialState(probs=jnp.array(gt_init, dtype=jnp.float32)),
+                    transitions=ParamsStandardHMMTransitions(transition_matrix=jnp.array(gt_tm, dtype=jnp.float32)),
                 )
-                print(f"\n[Ground Truth Transition Matrix Override] Applied: {gt_tm.tolist()}\n")
+                print(
+                    f"\n[Ground Truth Transition Matrix Override] Applied: {gt_tm.tolist()}, "
+                    f"initial probs {gt_init.tolist()}"
+                    f"{' (states swapped to match ground-truth occupancy)' if states_swapped else ''}\n"
+                )
 
         n_paths = getattr(self.args, "best_paths", 1)
         paths, path_likelihoods = self.get_n_best_viterbi_paths(
@@ -997,7 +1023,7 @@ class Phlag:
             headers.append("Clade size: N/A")
 
         # Self-describing ground-truth/evaluation summary. These lines let downstream
-        # consumers (bench.benchmark) read the anomaly fraction and the eval-time
+        # consumers (bench.cli.benchmark) read the anomaly fraction and the eval-time
         # label polarity straight out of the report, instead of re-deriving them from
         # the locus pattern -- the fraction in particular is not a pure function of
         # the pattern string, since it depends on where the actual window grid
@@ -1012,7 +1038,7 @@ class Phlag:
             headers.append("Anomaly fraction: N/A (no ground truth pattern)")
             headers.append("Label polarity flipped for evaluation: N/A (no ground truth pattern)")
 
-        # Source mtimes at report-generation time -- let bench.benchmark's run_all()
+        # Source mtimes at report-generation time -- let bench.cli.benchmark's run_all()
         # detect a stale report (caster.py or phlag.py/hmm.py edited since this report
         # was written) and rerun just the stage whose source actually changed, instead
         # of relying purely on report.tsv/scores.tsv presence.
@@ -1083,6 +1109,9 @@ class Phlag:
             headers.append(f"EM final joint log-likelihood: {format_number(self.final_em_log_prob)}")
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
+        if getattr(self, "anchor_dims", ()):
+            d, f = self.Y.shape[-1], self.Y.shape[-1] - len(self.anchor_dims)
+            k_params -= NUM_STATES * (d * d - f * f + d - f)
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1317,6 +1346,7 @@ class Phlag:
                     CasterPlotter(
                         str(self.args.caster_scores),
                         distribution=getattr(self.args, "model_design", "gaussian"),
+                        data_dir=str(pathlib.Path(self.args.output_file).parent) if self.args.output_file else None,
                         locus_pattern=getattr(self.args, "locus_pattern", None),
                         plot_dist=False, plot_correlation=False, plot_topology_pairs=False,
                         plot_quartet_counts=False, plot_sums=False,
@@ -1393,8 +1423,8 @@ class Phlag:
         if self.beta is None and getattr(self.args, "beta_prime", None) is not None:
             self.beta = self.args.beta_prime * self.n_windows
         if self.rho is None and self.beta is None:
-            # neutral for Dirichlet mode, would be zeros for mean
-            self.psi = jnp.ones((2, 2)) + PSI_EPS
+            # neutral for Dirichlet mode (ones) / mean (zeros)
+            self.psi = (jnp.zeros((2, 2)) if self.args.dirichlet_mean else jnp.ones((2, 2))) + PSI_EPS
         elif self.rho is None or self.beta is None:
             raise ValueError("--rho and --beta must both be set, or both omitted "
                               "(omitting both disables the transition prior)")
@@ -1410,6 +1440,12 @@ class Phlag:
             self.args.alt_emission_parameterization,
         )
 
+        self.anchor_dims = ()
+        if self.args.emission_param == "zero-alt-anchor":
+            if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3 or "repulsion" in self.emission_parameterization:
+                raise ValueError("--emission-param zero-alt-anchor needs -d gaussian, 3 topology columns, and free --np/--ap")
+            self.anchor_dims = (0, 1)
+
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
             self.Y.shape[-1],
@@ -1417,6 +1453,7 @@ class Phlag:
             emission_parameterization=self.emission_parameterization,
             initial_probs_concentration=self.nu,
             transition_concentration=self.psi,
+            transition_dirichlet_mean=self.args.dirichlet_mean,
             model_design=self.args.model_design,
             num_mixtures=getattr(self, "num_mixtures", 2),
             lm_damping=self.args.lm_damping,
@@ -1424,6 +1461,7 @@ class Phlag:
             penalty_lambda_anneal=self.args.annealing,
             n_iters=self.args.n_iters,
             increment_steps=self.args.increment_steps,
+            anchor_dims=self.anchor_dims,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1432,11 +1470,30 @@ class Phlag:
         data_mean = jnp.mean(self.Y, axis=0)
         data_cov = jnp.cov(self.Y, rowvar=False)
         data_var = jnp.diag(data_cov)
+        if self.anchor_dims:
+            anchored = jnp.zeros(self.Y.shape[-1], dtype=bool).at[jnp.array(self.anchor_dims)].set(True)
+            data_cov = jnp.where(jnp.outer(~anchored, ~anchored), data_cov, 0.0)
+            data_mean = jnp.where(anchored, 0.0, data_mean)
 
         # alt variance = double null variance if --double-variance-init, else same as null
         alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
-        p0, p1 = 0.99, 0.99
-        initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
+        initial_probs = INITIAL_PROBS
+        if self.args.prior_init_probs and self.rho is not None:
+            initial_probs = jnp.array([self.rho, 1 - self.rho], dtype=jnp.float32)
+        if self.beta is None:
+            p0 = p1 = 0.99
+            initial_transition_matrix = jnp.array([[p0, 1-p0], [1-p1, p1]], dtype=jnp.float32)
+        else:
+            prior_mean = self.psi / self.psi.sum(axis=-1, keepdims=True)
+            prior_mode = (self.psi - 1) / (self.psi.sum(axis=-1, keepdims=True) - NUM_STATES)
+            if self.args.dirichlet_mean:
+                initial_transition_matrix = prior_mean
+            elif bool(jnp.all(prior_mode > 0)):
+                initial_transition_matrix = prior_mode
+            else:
+                print(f"Warning: transition prior mode undefined (beta={self.beta} <= 1) -- initializing with its mean instead.")
+                initial_transition_matrix = prior_mean
+            initial_transition_matrix = initial_transition_matrix.astype(jnp.float32)
 
         if self.args.model_design == "gmm":
             # Only used as a fallback seed if gmm_init_params wasn't computed
@@ -1446,7 +1503,7 @@ class Phlag:
             state1_init = jnp.stack([data_mean, alt_variance_mult * data_var], axis=-1)
             init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
-                initial_probs=INITIAL_PROBS,
+                initial_probs=initial_probs,
                 emission_probs=init_emissions,
                 transition_matrix=initial_transition_matrix,
                 initial_gmm_params=getattr(self, "gmm_init_params", None),
@@ -1459,7 +1516,7 @@ class Phlag:
             state1_init = jnp.concatenate([data_mean[:, None], alt_variance_mult * data_cov], axis=-1)
             init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
-                initial_probs=INITIAL_PROBS,
+                initial_probs=initial_probs,
                 emission_probs=init_emissions,
                 transition_matrix=initial_transition_matrix,
             )
@@ -1510,12 +1567,121 @@ class Phlag:
         # (log_prior(params) + sum of per-step data log-likelihoods); its last entry is
         # the final joint log-likelihood EM converged to.
         self.final_em_log_prob = float(log_probs[-1])
+        self.fit_state = {
+            "params": jax.tree_util.tree_map(np.asarray, self.params),
+            "final_em_log_prob": self.final_em_log_prob,
+            "clip_activation_count": self.clip_activation_count,
+            "clip_activation_attempts": self.clip_activation_attempts,
+        }
         self.compute_output()
+
+    def load_fit(self, fit_path):
+        import pickle
+        with open(fit_path, "rb") as f:
+            self.fit_state = pickle.load(f)
+        self.params = jax.tree_util.tree_map(jnp.asarray, self.fit_state["params"])
+        self.final_em_log_prob = self.fit_state["final_em_log_prob"]
+        self.clip_activation_count = self.fit_state["clip_activation_count"]
+        self.clip_activation_attempts = self.fit_state["clip_activation_attempts"]
+        self.compute_output()
+
+    def save_fit(self, fit_path):
+        import pickle
+        tmp_path = fit_path.with_name(f".{fit_path.name}.tmp")
+        with open(tmp_path, "wb") as f:
+            pickle.dump({**self.fit_state, "em_args": em_args_signature(self.args)}, f)
+        os.replace(tmp_path, fit_path)
 
     def save_output(self):
         with open(self.output_file, "w") as f:
             f.write(self.output_str)
         print(f"Saved PHLAG output report to: {self.output_file}")
+        self.save_fit(fit_path_for(self.output_file))
+
+    def _store_scores_path(self):
+        from .caster import parse_ws_from_path, recover_source_fasta, canonical_scores_path
+        from .utils import get_data_dir, get_repo_root
+        src = pathlib.Path(self.args.caster_scores).resolve()
+        caster_root = (get_data_dir() / "caster").resolve()
+        if caster_root in src.parents:
+            return src, caster_root
+        ws = parse_ws_from_path(src)
+        fasta = recover_source_fasta(src)
+        if ws is None or fasta is None:
+            return None, caster_root
+        if not fasta.is_absolute():
+            fasta = next((b / fasta for b in (pathlib.Path.cwd(), get_repo_root()) if (b / fasta).exists()), fasta)
+        mode, val, step, is_site, is_zscale, is_ilr, is_normalize, norm_eps = ws
+        ns = argparse.Namespace(
+            fasta_file=fasta, window_size=val, step_size=step,
+            pair=(mode == "c" and not is_site), site=is_site, chunk_size=(val if mode == "c" else None),
+            zscale=is_zscale, norm_eps=norm_eps, exp_minus="exp-minus" in src.parts, left=0, right=None,
+        )
+        return canonical_scores_path(ns, is_normalize, is_ilr).resolve(), caster_root
+
+    def find_store_report(self):
+        import filecmp
+        from .utils import get_data_dir, get_phlag_output_base
+        store_scores, caster_root = self._store_scores_path()
+        if store_scores is None or not store_scores.exists():
+            return None
+        src = pathlib.Path(self.args.caster_scores).resolve()
+        if src != store_scores and not filecmp.cmp(src, store_scores, shallow=False):
+            return None
+        rel_parts = list(store_scores.relative_to(caster_root).parts[1:-1])
+        while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+            rel_parts.pop(0)
+        if not rel_parts:
+            return None
+        rel = pathlib.Path(*rel_parts[:-1], f"{rel_parts[-1]}.tsv")
+
+        reports_dirs = []
+        for root, dirs, _ in os.walk(get_phlag_output_base(get_data_dir())):
+            if pathlib.Path(root).name == "reports":
+                reports_dirs.append(pathlib.Path(root))
+                dirs[:] = []
+            else:
+                dirs[:] = [d for d in dirs if d != "source"]
+
+        want = em_args_signature(self.args)
+        matches = []
+        for reports_dir in reports_dirs:
+            candidate = reports_dir / rel
+            if not candidate.exists():
+                continue
+            with open(candidate) as f:
+                tokens = f.readline().split()[1:]
+            try:
+                recorded, _ = build_parser().parse_known_args(tokens)
+            except SystemExit:
+                continue
+            if not recorded.caster_scores or pathlib.Path(recorded.caster_scores[0]).resolve() != store_scores:
+                continue
+            if em_args_signature(recorded) == want:
+                matches.append(candidate)
+        if not matches:
+            return None
+        return max(matches, key=lambda p: (fit_path_for(p).exists(), p.stat().st_mtime))
+
+    def update_store_report(self, store_report):
+        old = store_report.read_text()
+        store_fit = fit_path_for(store_report)
+        if not store_fit.exists():
+            reproduced = all(
+                report_numbers_close(report_line(old, key), report_line(self.output_str, key))
+                for key in ("Final transition matrix (after EM)", "TPR", "EM final joint log-likelihood")
+            )
+            if not reproduced:
+                print(f"Warning: rerun didn't reproduce '{store_report}' -- leaving it untouched.")
+                return
+            self.save_fit(store_fit)
+            print(f"Saved fit alongside '{store_report}'.")
+        merged, missing = merge_missing_report_lines(old, self.output_str)
+        if missing:
+            tmp_path = store_report.with_name(f".{store_report.name}.tmp")
+            tmp_path.write_text(merged)
+            os.replace(tmp_path, store_report)
+            print(f"Added {len(missing)} line(s) to '{store_report}': {[l.split(': ', 1)[0] for l in missing]}")
 
 
 class PhlagPlotter:
@@ -1535,9 +1701,13 @@ class PhlagPlotter:
         self.extract_metadata()
 
         # Generate the visual distribution charts
-        self.plot_distributions()
-        self.plot_correlations()
-        self.plot_topologies_3d()
+        plots = self.phlag.args.plot
+        if "em" in plots:
+            self.plot_distributions()
+        if "correlations" in plots:
+            self.plot_correlations()
+        if "topologies_3d" in plots:
+            self.plot_topologies_3d()
 
     def extract_metadata(self):
         """Extracts genomic filename, dimension, and styles configuration."""
@@ -2069,15 +2239,23 @@ def build_parser():
         "-o", dest="output_file", type=pathlib.Path, required=False, default=None, help="Path to save the output"
     )
     parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action="store_true",
+        help="If report.tsv and its .fit.pkl already exist at the output path with "
+             "matching EM args, skip EM and only draw --plot entries whose PNG is missing.",
+    )
+    parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["em", "states", "relerr"],
+        choices=["em", "states", "relerr", "correlations", "topologies_3d", "none"],
         default=["em", "states"],
-        help="List of plots to generate (choices: em, states, relerr. Default: "
-             "em and states; relerr is opt-in, saving relerr.png -- fitted-vs-"
-             "ground-truth relative error per topology/state/statistic, "
-             "requires ground truth. Passing --plot with no choices explicitly "
-             "requests all of the above, including relerr).",
+        help="List of plots to generate (choices: em, states, relerr, "
+             "correlations, topologies_3d. Default: em and states; relerr is "
+             "opt-in, saving relerr.png -- fitted-vs-ground-truth relative error "
+             "per topology/state/statistic, requires ground truth; correlations "
+             "and topologies_3d are opt-in too. Passing --plot with no choices "
+             "explicitly requests all of the above).",
     )
     parser.add_argument(
         "-L",
@@ -2156,6 +2334,16 @@ def build_parser():
                     (default: free): free (unconstrained MLE) or repulsion (pushed
                     away from the null state's currently fitted distribution).""",
     ) 
+    hmm_group.add_argument(
+        "--emission-param",
+        dest="emission_param",
+        type=str.lower,
+        default="free",
+        choices=["free", "zero-alt-anchor"],
+        help="Gaussian emission constraint shared by both states (default: free): "
+             "zero-alt-anchor fixes the alternative topologies' (ABBA, BABA) means, "
+             "variances and covariances at 0.",
+    )
     hmm_group.add_argument(
         "--lam",
         dest="emission_lambda",
@@ -2307,6 +2495,19 @@ def build_parser():
                     values, see --rho.""",
     )
     hmm_group.add_argument(
+        "--dirichlet-mean",
+        dest="dirichlet_mean",
+        action="store_true",
+        help="Transition M-step uses the Dirichlet posterior mean instead of its mode "
+             "(defined for any --beta >= 0; default: mode).",
+    )
+    hmm_group.add_argument(
+        "--prior-init-probs",
+        dest="prior_init_probs",
+        action="store_true",
+        help="Initial state probs = (rho, 1-rho) when --rho is set (default: start in null, [1, 0]).",
+    )
+    hmm_group.add_argument(
         "--correct-transition",
         dest="correct_transition",
         nargs="?",
@@ -2314,6 +2515,7 @@ def build_parser():
         default=None,
         help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
     )
+    parser.set_defaults(**PHLAG_SEGMENT_DEFAULTS)
     return parser
 
 
@@ -2332,35 +2534,23 @@ def parse_arguments(argv=None):
         # its out/ path already encodes the run's config: the sibling
         # scores.tsv sits right above the <dist> segment, and the segments
         # after it are get_phlag_param_segments' own
-        # [/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>], so
+        # [/rho<X>_beta<Y>][/var2x][/repulsion][/annealing][/lam<X>][/<flag>[=<value>]], so
         # rebuild the invocation from those. This run's own flags still win:
         # recovered tokens go first and this invocation's own tokens (with
         # the report.tsv positional stripped out) go after, relying on
         # argparse's left-to-right store semantics.
-        import re
         parts = report_arg.parts[:-1]
         dist_idx = next((i for i in range(len(parts) - 1, -1, -1) if parts[i] in ("gaussian", "gmm")), None)
         if dist_idx is None:
             parser.error(f"'{report_arg}' has no gaussian/gmm segment to recover its config from")
         recovered_tokens = [str(pathlib.Path(*parts[:dist_idx]) / "scores.tsv"), "-d", parts[dist_idx]]
+        flag_for = {a.dest: a.option_strings[-1] for a in parser._actions if a.option_strings}
         for seg in parts[dist_idx + 1:]:
-            m_rb = re.fullmatch(r"rho([\d.]+)_beta([\d.]+)", seg)
-            m_rbp = re.fullmatch(r"rho([\d.]+)_betaprime([\d.]+)", seg)
-            m_lam = re.fullmatch(r"lam([\d.]+)", seg)
-            if m_rb:
-                recovered_tokens += ["--rho", m_rb.group(1), "--beta", m_rb.group(2)]
-            elif m_rbp:
-                recovered_tokens += ["--rho", m_rbp.group(1), "--beta-prime", m_rbp.group(2)]
-            elif m_lam:
-                recovered_tokens += ["--lam", m_lam.group(1)]
-            elif seg == "var2x":
-                recovered_tokens.append("--double-variance-init")
-            elif seg == "repulsion":
-                recovered_tokens += ["--ap", "repulsion"]
-            elif seg == "annealing":
-                recovered_tokens.append("--annealing")
-            else:
+            parsed = parse_phlag_param_segment(seg)
+            if parsed is None:
                 parser.error(f"'{report_arg}': unrecognized config segment '{seg}'")
+            for dest, value in parsed.items():
+                recovered_tokens += [flag_for[dest]] if value is True else [flag_for[dest], str(value)]
         raw_argv = list(argv) if argv is not None else sys.argv[1:]
         override_tokens = list(raw_argv)
         try:
@@ -2375,7 +2565,8 @@ def parse_arguments(argv=None):
     if args.plot == []:
         # Bare "--plot" (no choices given): plot everything, same as
         # caster.py's own --plot (see phlag/caster.py's main()).
-        args.plot = ["em", "states", "relerr"]
+        args.plot = ["em", "states", "relerr", "correlations", "topologies_3d"]
+    args.plot = [p for p in args.plot if p != "none"]
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
@@ -2498,25 +2689,35 @@ def parse_arguments(argv=None):
 
         from .caster import parse_ws_from_path
 
-        # Variant flags (--pair/--site/-z/--ilr/--normalize/--exp-minus) are
-        # caster's, not phlag's, so a bare FASTA means caster's plain dstar
-        # output -- prefer that over a newer variant sibling (stable sort
-        # keeps newest-first within each group).
+        # The newest verified sibling picks the window config (its
+        # w<...>_s<...> segment); within that config, prefer caster's plain
+        # output over variants, since variant flags (--site/-z/--ilr/
+        # --normalize/--exp-minus) are caster's, not phlag's. Stable sort keeps
+        # newest-first within each group.
         def is_variant(sfile):
             ws = parse_ws_from_path(sfile)
-            return (ws is None or ws[0] != "w" or any(ws[3:])
+            return (ws is None or any(ws[3:])
                     or bool({"site", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
 
-        fasta_resolved = fasta_path.resolve()
-        candidates = sorted(resolve_model_scores(target_name=node_name, return_all=True), key=is_variant)
-        for candidate in candidates:
+        def ws_config(sfile):
+            ws = parse_ws_from_path(sfile)
+            return ws[:3] if ws else None
+
+        def matches_fasta(sfile):
             try:
-                src = recover_source_fasta(candidate)
+                src = recover_source_fasta(sfile)
             except (OSError, UnicodeDecodeError):
-                continue
-            if src is not None and src.resolve() == fasta_resolved:
-                return candidate.resolve()
-        return None
+                return False
+            return src is not None and src.resolve() == fasta_resolved
+
+        fasta_resolved = fasta_path.resolve()
+        candidates = resolve_model_scores(target_name=node_name, return_all=True)
+        newest = next((c for c in candidates if matches_fasta(c)), None)
+        if newest is None:
+            return None
+        config = ws_config(newest)
+        same_config = sorted((c for c in candidates if ws_config(c) == config), key=is_variant)
+        return next((c.resolve() for c in same_config if matches_fasta(c)), newest.resolve())
 
     if args.recent or args.caster_scores == pathlib.Path("-r") or args.caster_scores is None:
         recent_file = resolve_model_scores()
@@ -2569,6 +2770,65 @@ def parse_arguments(argv=None):
     return args
 
 
+EM_ARG_DESTS = ("model_design", *PHLAG_SEGMENT_DEFAULTS, "rho", "beta", "beta_prime")
+
+
+def em_args_signature(args):
+    sig = {}
+    for dest in EM_ARG_DESTS:
+        val = getattr(args, dest, None)
+        if isinstance(val, list):
+            val = val[0] if len(val) == 1 else tuple(val)
+        sig[dest] = val
+    sig["model_design"] = sig["model_design"] or "gaussian"
+    if sig["beta"] is not None:
+        sig["beta_prime"] = None
+    return sig
+
+
+REPORT_METADATA_PREFIXES = ("Clade", "Branch length", "Height", "Caster source mtime", "Phlag source mtime")
+
+
+def fit_path_for(report_path):
+    return pathlib.Path(report_path).with_suffix(".fit.pkl")
+
+
+def fit_matches_args(fit_path, args):
+    import pickle
+    if not fit_path.exists():
+        return False
+    with open(fit_path, "rb") as f:
+        return pickle.load(f).get("em_args") == em_args_signature(args)
+
+
+def report_line(report, key):
+    return next((l for l in report.splitlines() if l.startswith(f"{key}: ")), None)
+
+
+def report_numbers_close(old_line, new_line):
+    if old_line is None or new_line is None:
+        return False
+    num = r"-?\d+\.?\d*(?:[eE][-+]?\d+)?|nan"
+    old_vals = [float(x) for x in re.findall(num, old_line.split(": ", 1)[1])]
+    new_vals = [float(x) for x in re.findall(num, new_line.split(": ", 1)[1])]
+    return len(old_vals) == len(new_vals) and np.allclose(old_vals, new_vals, rtol=1e-2, atol=1e-3, equal_nan=True)
+
+
+def merge_missing_report_lines(old, new):
+    old_lines = old.splitlines()
+    keys = {l.split(": ", 1)[0] for l in old_lines if ": " in l}
+    missing = [
+        l for l in new.splitlines()[1:]
+        if ": " in l and l.split(": ", 1)[0] not in keys and not l.startswith(REPORT_METADATA_PREFIXES)
+    ]
+    if "--- Bookkeeping ---" in old_lines:
+        idx = old_lines.index("--- Bookkeeping ---")
+    else:
+        idx = next((i for i, l in enumerate(old_lines) if re.fullmatch(r"[01](,[01])*", l)), len(old_lines))
+    merged = "\n".join(old_lines[:idx] + missing + old_lines[idx:]) + ("\n" if old.endswith("\n") else "")
+    return merged, missing
+
+
 def _run_single(args):
     if not args.bench:
         flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
@@ -2576,10 +2836,32 @@ def _run_single(args):
 
     phlag = Phlag(args)
 
-    phlag.run()
-    phlag.save_output()
+    reuse_fit = args.correct_transition is None
+    own_fit = fit_path_for(phlag.output_file)
+    if reuse_fit and args.skip_existing and phlag.output_file.exists() and fit_matches_args(own_fit, args):
+        args.plot = [p for p in args.plot if not phlag.output_file.with_name(f"{p}.png").exists()]
+        if not args.plot:
+            print(f"Found existing report '{phlag.output_file}' with matching fit -- skipping, no plots missing.")
+            return phlag.output_file
+        print(f"Found existing report '{phlag.output_file}' with matching fit -- skipping EM, drawing missing plots {args.plot}.")
+        phlag.load_fit(own_fit)
+        if {"em", "correlations", "topologies_3d"} & set(args.plot):
+            PhlagPlotter(phlag)
+        return phlag.output_file
 
-    if args.plot and "em" in args.plot:
+    store_report = None if args.bench or not reuse_fit else phlag.find_store_report()
+    if store_report is not None and fit_path_for(store_report).exists():
+        print(f"Found benchmarked fit for '{store_report}' -- skipping EM.")
+        phlag.load_fit(fit_path_for(store_report))
+    else:
+        if store_report is not None:
+            print(f"Found benchmarked report '{store_report}' without a saved fit -- rerunning EM to backfill it.")
+        phlag.run()
+    phlag.save_output()
+    if store_report is not None:
+        phlag.update_store_report(store_report)
+
+    if args.plot and {"em", "correlations", "topologies_3d"} & set(args.plot):
         PhlagPlotter(phlag)
 
     return phlag.output_file
@@ -2587,10 +2869,12 @@ def _run_single(args):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    specs = build_parser().parse_args(raw_argv).caster_scores or []
-    if len(specs) > 1:
-        spec_tokens = {str(spec) for spec in specs}
-        rest = [t for t in raw_argv if t not in spec_tokens]
+    from .utils import expand_node_specs
+    raw_specs = build_parser().parse_args(raw_argv).caster_scores or []
+    specs = expand_node_specs(raw_specs)
+    if len(specs) > 1 or [str(s) for s in raw_specs] != specs:
+        spec_paths = {pathlib.Path(spec) for spec in raw_specs}
+        rest = [t for t in raw_argv if pathlib.Path(t) not in spec_paths]
         results = []
         for spec in specs:
             print(f"[phlag] multi-input -- running {spec}...")
