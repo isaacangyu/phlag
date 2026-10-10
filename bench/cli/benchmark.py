@@ -15,7 +15,9 @@ and ``phlag.py`` uses for ``PhlagPlotter``):
 """
 
 import ast
+import io
 import os
+import fcntl
 import re
 import sys
 import json
@@ -25,6 +27,7 @@ import shutil
 import pathlib
 import datetime
 import argparse
+import contextlib
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,9 +53,41 @@ RESET = "\033[0m"
 TOTAL_CORE_BUDGET = 80
 
 
-def inner_worker_cap():
+def inner_worker_cap(pending):
+    if os.environ.get("PHLAG_JOBSERVER"):
+        return min(pending, TOTAL_CORE_BUDGET)
     outer_jobs = max(1, int(os.environ.get("PHLAG_BENCH_JOBS", "1")))
-    return max(1, TOTAL_CORE_BUDGET // outer_jobs)
+    return min(pending, max(1, TOTAL_CORE_BUDGET // outer_jobs))
+
+
+# bench/cli/run_batch.py's FIFO preloaded with TOTAL_CORE_BUDGET tokens, shared
+# by every sibling benchmark -- each caster/phlag subprocess holds one token,
+# so cores freed by a finished run go to whichever run still has work.
+@contextlib.contextmanager
+def core_token():
+    path = os.environ.get("PHLAG_JOBSERVER")
+    if not path:
+        yield
+        return
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.read(fd, 1)
+        try:
+            yield
+        finally:
+            os.write(fd, b"+")
+    finally:
+        os.close(fd)
+
+
+def report_progress(done, total):
+    path = os.environ.get("PHLAG_PROGRESS_FILE")
+    if not path:
+        return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(f"{done} {total}\n")
+    os.replace(tmp, path)
 
 DEFAULT_DIST_TYPE = "gaussian"
 DEFAULT_WINDOW_SIZE = 50000
@@ -561,6 +596,13 @@ def parse_report(report_path):
     return parsed
 
 
+def transition_total(parsed):
+    to_alt, to_null = parsed["transition_null_to_alt"], parsed["transition_alt_to_null"]
+    if to_alt is None or to_null is None or not math.isfinite(to_alt + to_null):
+        return None
+    return to_alt + to_null
+
+
 def nominal_anomaly_fraction(pattern_str):
     """
     Fallback anomaly fraction for reports written before the 'Anomaly fraction:'
@@ -699,6 +741,7 @@ class RunRecord:
     transition_null_to_alt: Optional[float] = None
     transition_alt_to_null: Optional[float] = None
     transition_alt_to_alt: Optional[float] = None
+    transition_total: Optional[float] = None
     bic: Optional[float] = None
     log_likelihood: Optional[float] = None
     n_trainable_params: Optional[int] = None
@@ -1133,6 +1176,7 @@ class BenchmarkStats:
         record.transition_null_to_alt = parsed["transition_null_to_alt"]
         record.transition_alt_to_null = parsed["transition_alt_to_null"]
         record.transition_alt_to_alt = parsed["transition_alt_to_alt"]
+        record.transition_total = transition_total(parsed)
 
         if parsed["anomaly_fraction"] is not None:
             record.anomaly_fraction = parsed["anomaly_fraction"]
@@ -1420,7 +1464,7 @@ class BenchmarkStats:
         "pooled_mean_ABBA", "pooled_mean_BABA", "pooled_mean_AABB",
     ] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"pooled_{c}" for c in TOPO_WITHIN_COLUMNS] + [
         "transition_null_to_null", "transition_null_to_alt",
-        "transition_alt_to_null", "transition_alt_to_alt",
+        "transition_alt_to_null", "transition_alt_to_alt", "transition_total",
         "bic", "log_likelihood", "n_trainable_params",
         "clip_activation_count", "clip_activation_rate", "clip_unsafe",
     ] + RELERR_RUN_COLUMNS + [
@@ -1520,6 +1564,7 @@ class BenchmarkStats:
             "transition_null_to_alt": record.transition_null_to_alt,
             "transition_alt_to_null": record.transition_alt_to_null,
             "transition_alt_to_alt": record.transition_alt_to_alt,
+            "transition_total": record.transition_total,
             "bic": record.bic,
             "log_likelihood": record.log_likelihood,
             "n_trainable_params": record.n_trainable_params,
@@ -2252,7 +2297,7 @@ class BenchmarkFigurePlotter:
 # Each dest matches caster.py's/phlag.py's own build_parser() dest exactly, so
 # vars(args) values can be forwarded straight through. step_size is caster's
 # alone here but shared with phlag (see _build_forward_args's callers in
-# run_all()) since phlag's plotting step-size requirement is satisfied
+# run_all()) since phlag's -s is passed
 # separately from this list.
 CASTER_ARG_SPECS = [
     ("window_size", "-w", False),
@@ -2285,7 +2330,6 @@ PHLAG_ARG_SPECS = [
     ("correct_transition", "--correct-transition", False),
     ("dirichlet_mean", "--dirichlet-mean", True),
     ("prior_init_probs", "--prior-init-probs", True),
-    ("emission_param", "--emission-param", False),
     ("rho", "--rho", False),
     ("beta", "--beta", False),
     ("beta_prime", "--beta-prime", False),
@@ -2303,7 +2347,7 @@ MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, 
 SEGMENT_CONVENTIONS = [
     dict(
         name="rho_beta",
-        regex=re.compile(r"^rho([\d.]+)_beta([\d.]+)$"),
+        regex=re.compile(r"^rho([-\d.eE+]+)_beta([-\d.eE+]+)$"),
         is_set=lambda d: (d.get("rho") is not None or d.get("beta") is not None)
             and not (d.get("beta") is None and d.get("beta_prime") is not None),
         matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta") == float(m.group(2)),
@@ -2311,7 +2355,7 @@ SEGMENT_CONVENTIONS = [
     ),
     dict(
         name="rho_betaprime",
-        regex=re.compile(r"^rho([\d.]+)_betaprime([\d.]+)$"),
+        regex=re.compile(r"^rho([-\d.eE+]+)_betaprime([-\d.eE+]+)$"),
         is_set=lambda d: d.get("beta") is None and d.get("beta_prime") is not None,
         matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta_prime") == float(m.group(2)),
         expected=lambda d: f"rho{d.get('rho')}_betaprime{d.get('beta_prime')}",
@@ -2502,7 +2546,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion"],
+        default="free", choices=["free", "repulsion", "null-alt-anchor", "snr"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(
@@ -2556,23 +2600,16 @@ def _build_parser():
         help="Forwarded to phlag's --dirichlet-mean.",
     )
     phlag_group.add_argument(
-        "--emission-param", dest="emission_param", type=str.lower,
-        default="free", choices=["free", "zero-alt-anchor"],
-        help="Forwarded to phlag's --emission-param (default: free).",
-    )
-    phlag_group.add_argument(
         "--prior-init-probs", dest="prior_init_probs", action="store_true",
         help="Forwarded to phlag's --prior-init-probs.",
     )
     phlag_group.add_argument(
         "--rho", dest="rho", type=float, default=None,
-        help="Forwarded to phlag's --rho. Must be set together with --beta; "
-             "omitting both disables the transition prior (default: unset, no prior).",
+        help="Forwarded to phlag's --rho (default: unset, no transition prior).",
     )
     phlag_group.add_argument(
         "--beta", dest="beta", type=float, default=None,
-        help="Forwarded to phlag's --beta. Must be set together with --rho; "
-             "omitting both disables the transition prior (default: unset, no prior).",
+        help="Forwarded to phlag's --beta (default: unset, no transition prior).",
     )
     phlag_group.add_argument(
         "--beta-prime", dest="beta_prime", type=float, default=None,
@@ -2814,6 +2851,59 @@ def create_source_snapshot():
     return snapshot_root, snapshot_env
 
 
+def discover_work_items(sim_root):
+    from phlag.utils import find_mapping_file
+    work_items, incomplete = [], []
+    for leaf_dir in discover_leaf_dirs(sim_root):
+        rel_path = leaf_dir.relative_to(sim_root).as_posix()
+        mapping_path, mapping_reason = find_mapping_file(leaf_dir)
+        if mapping_path is None:
+            incomplete.append(f"[skip] {rel_path}: incomplete ({mapping_reason})")
+            continue
+        concat_dir = leaf_dir / "concat"
+        fasta_paths = sorted(
+            p for p in concat_dir.glob("*.fa")
+            if p.is_file() and p.stem in DEFAULT_CONCAT_PATTERNS
+        ) if concat_dir.is_dir() else []
+        if not fasta_paths:
+            incomplete.append(f"[skip] {rel_path}: incomplete (missing default-pattern concat/*.fa)")
+            continue
+        work_items += [(leaf_dir, rel_path, fasta_path) for fasta_path in fasta_paths]
+    return work_items, incomplete
+
+
+def scores_path_for(args, fasta_path, leaf_dir):
+    return get_expected_scores_path(
+        fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
+        pair=args.pair, site=args.site, chunk_size=args.chunk_size,
+        normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
+        exp_minus=args.exp_minus,
+    )
+
+
+def planned_work(argv, work_items):
+    with contextlib.redirect_stdout(io.StringIO()):
+        args = parse_arguments(argv)
+        out_dir = resolve_run_dir(args)
+    leaves = [(out_dir, args)]
+    if args.sweep is not None:
+        dest, value_pairs = args.sweep
+        leaves = []
+        for raw_value, value in value_pairs:
+            leaf_args = argparse.Namespace(**vars(args))
+            setattr(leaf_args, dest, value)
+            if dest == "window_size" and "step_size" not in args.explicit_dests:
+                leaf_args.step_size = value
+            leaves.append((out_dir / f"{dest}={raw_value}", leaf_args))
+    for leaf_dir, leaf_args in leaves:
+        if not args.resummarize and finished_with_same_args(leaf_args, leaf_dir):
+            continue
+        pending = {path for path in (scores_path_for(leaf_args, fasta_path, sim_leaf)
+                                     for sim_leaf, _, fasta_path in work_items)
+                   if not path.exists()}
+        yield leaf_dir, pending
+
+
 def run_all(args, sim_root, out_dir):
     """
     Runs phlagster (caster + phlag) over every complete simulation leaf x concat-fasta
@@ -2851,8 +2941,6 @@ def run_all(args, sim_root, out_dir):
     a flat '<pattern>.tsv' file, so there's no separate archive-copy step
     afterward (see get_run_reports_base_override).
     """
-    from phlag.utils import find_mapping_file
-
     snapshot_root, snapshot_env = create_source_snapshot()
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2872,32 +2960,10 @@ def run_all(args, sim_root, out_dir):
     shutil.copytree(snapshot_root / "phlag", source_snapshot_dir)
     print(f"Wrote source snapshot: {source_snapshot_dir}")
 
-    leaf_dirs = discover_leaf_dirs(sim_root)
-
-    work_items = []
-    skipped_incomplete = 0
-
-    for leaf_dir in leaf_dirs:
-        rel_path = leaf_dir.relative_to(sim_root).as_posix()
-
-        mapping_path, mapping_reason = find_mapping_file(leaf_dir)
-        if mapping_path is None:
-            print(f"[skip] {rel_path}: incomplete ({mapping_reason})")
-            skipped_incomplete += 1
-            continue
-
-        concat_dir = leaf_dir / "concat"
-        fasta_paths = sorted(
-            p for p in concat_dir.glob("*.fa")
-            if p.is_file() and p.stem in DEFAULT_CONCAT_PATTERNS
-        ) if concat_dir.is_dir() else []
-        if not fasta_paths:
-            print(f"[skip] {rel_path}: incomplete (missing default-pattern concat/*.fa)")
-            skipped_incomplete += 1
-            continue
-
-        for fasta_path in fasta_paths:
-            work_items.append((leaf_dir, rel_path, fasta_path))
+    work_items, incomplete = discover_work_items(sim_root)
+    for msg in incomplete:
+        print(msg)
+    skipped_incomplete = len(incomplete)
 
     report_base_override = get_run_reports_base_override(out_dir)
 
@@ -2933,12 +2999,7 @@ def run_all(args, sim_root, out_dir):
     items = []
     for leaf_dir, rel_path, fasta_path in work_items:
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
-        scores_path = get_expected_scores_path(
-            fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
-            pair=args.pair, site=args.site, chunk_size=args.chunk_size,
-            normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
-            exp_minus=args.exp_minus,
-        )
+        scores_path = scores_path_for(args, fasta_path, leaf_dir)
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
         )
@@ -2954,20 +3015,21 @@ def run_all(args, sim_root, out_dir):
     # subprocess work running concurrently.
     def run_caster_item(item):
         rel_path, fasta_path, scores_path, report_path = item
-        ok, out = run_step(
-            [sys.executable, "-m", "phlag.caster", str(fasta_path)]
-            + ["--bench"] + caster_forward_args
-            + ["--plot", "topology_pairs", "correlation"],
-            "caster",
-            cwd=str(snapshot_root), env=snapshot_env,
-        )
+        with core_token():
+            ok, out = run_step(
+                [sys.executable, "-m", "phlag.caster", str(fasta_path)]
+                + ["--bench"] + caster_forward_args,
+                "caster",
+                cwd=str(snapshot_root), env=snapshot_env,
+            )
         return item, ok, out
 
     pending_caster = [item for item in items if not item[2].exists()]
     progress = tqdm(total=len(items), desc="[caster]", unit="file")
     progress.update(len(items) - len(pending_caster))
+    report_progress(progress.n, 2 * len(items))
     if pending_caster:
-        workers = min(len(pending_caster), inner_worker_cap())
+        workers = inner_worker_cap(len(pending_caster))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for item, ok, out in pool.map(run_caster_item, pending_caster):
                 rel_path, fasta_path, scores_path, report_path = item
@@ -2982,18 +3044,20 @@ def run_all(args, sim_root, out_dir):
                 else:
                     caster_processed += 1
                 progress.update(1)
+                report_progress(progress.n, 2 * len(items))
     progress.close()
 
     def run_phlag_item(item):
         rel_path, fasta_path, scores_path, report_path = item
-        ok, out = run_step(
-            [sys.executable, "-m", "phlag.phlag", str(scores_path)]
-            + ["--output-base", report_base_override, "--bench"]
-            + phlag_forward_args
-            + ["--plot", "-s", str(args.step_size)],
-            "phlag",
-            cwd=str(snapshot_root), env=snapshot_env,
-        )
+        with core_token():
+            ok, out = run_step(
+                [sys.executable, "-m", "phlag.phlag", str(scores_path)]
+                + ["--output-base", report_base_override, "--bench"]
+                + phlag_forward_args
+                + ["-s", str(args.step_size)],
+                "phlag",
+                cwd=str(snapshot_root), env=snapshot_env,
+            )
         return item, ok, out
 
     pending_phlag = []
@@ -3011,8 +3075,9 @@ def run_all(args, sim_root, out_dir):
 
     progress = tqdm(total=len(items), desc="[phlag]", unit="file")
     progress.update(len(items) - len(pending_phlag))
+    report_progress(len(items) + progress.n, 2 * len(items))
     if pending_phlag:
-        workers = min(len(pending_phlag), inner_worker_cap())
+        workers = inner_worker_cap(len(pending_phlag))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for item, ok, out in pool.map(run_phlag_item, pending_phlag):
                 rel_path, fasta_path, scores_path, report_path = item
@@ -3027,6 +3092,7 @@ def run_all(args, sim_root, out_dir):
                 else:
                     processed += 1
                 progress.update(1)
+                report_progress(len(items) + progress.n, 2 * len(items))
     progress.close()
 
     shutil.rmtree(snapshot_root, ignore_errors=True)
@@ -3047,6 +3113,7 @@ def run_all(args, sim_root, out_dir):
     return processed, skipped_incomplete, skipped_present, failures
 
 
+ANALYSIS_NAN_AS_ZERO = {"tpr", "fpr", "f1"}
 ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["tp", "fp", "fn", "tn"] + [
     f"relerr_{topo}_{state}"
     for topo in TOPOLOGY_NAMES
@@ -3096,6 +3163,8 @@ def compute_analysis(runs_path, out_path=None):
         if metric not in df.columns:
             continue
         values = pd.to_numeric(df[metric], errors="coerce")
+        if metric in ANALYSIS_NAN_AS_ZERO:
+            values = values.fillna(0.0)
         valid = values.notna()
         n = int(valid.sum())
         if n == 0:
@@ -3263,6 +3332,17 @@ def finished_with_same_args(args, out_dir):
     return all(recorded.get(dest, defaults[dest]) == value for dest, value in current.items())
 
 
+def claim_run_dir(out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(out_dir / ".benchmark.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
+
+
 def summarize(args, sim_root, stats, out_dir, start_time=None):
     """
     Aggregates every finished run into the Figure-3 panels and writes them out.
@@ -3290,7 +3370,7 @@ def summarize(args, sim_root, stats, out_dir, start_time=None):
     phlag_cmd = " ".join(
         ["phlag", "<scores.tsv>", "--output-base", get_run_reports_base_override(out_dir), "--bench"]
         + _build_forward_args(args, PHLAG_ARG_SPECS)
-        + ["--plot", "-s", str(args.step_size)]
+        + ["-s", str(args.step_size)]
     )
 
     run_at = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
@@ -3382,18 +3462,28 @@ def main(argv=None):
             setattr(leaf_args, dest, value)
             if dest == "window_size" and "step_size" not in args.explicit_dests:
                 leaf_args.step_size = value
-            if not args.resummarize and finished_with_same_args(leaf_args, leaf_dir):
-                print(f"[skip] {leaf_dir}: report.txt already exists with this config")
+            lock = claim_run_dir(leaf_dir)
+            if lock is None:
+                print(f"[skip] {leaf_dir}: already running in another benchmark process")
                 continue
-            run_all(leaf_args, sim_root, leaf_dir)
-            summarize(leaf_args, sim_root, make_stats(leaf_args), leaf_dir, start_time=start_time)
+            with lock:
+                if not args.resummarize and finished_with_same_args(leaf_args, leaf_dir):
+                    print(f"[skip] {leaf_dir}: report.txt already exists with this config")
+                    continue
+                run_all(leaf_args, sim_root, leaf_dir)
+                summarize(leaf_args, sim_root, make_stats(leaf_args), leaf_dir, start_time=start_time)
         return
 
-    if not args.resummarize and finished_with_same_args(args, out_dir):
-        print(f"[skip] {out_dir}: report.txt already exists with this config")
+    lock = claim_run_dir(out_dir)
+    if lock is None:
+        print(f"[skip] {out_dir}: already running in another benchmark process")
         return
-    run_all(args, sim_root, out_dir)
-    summarize(args, sim_root, make_stats(args), out_dir, start_time=start_time)
+    with lock:
+        if not args.resummarize and finished_with_same_args(args, out_dir):
+            print(f"[skip] {out_dir}: report.txt already exists with this config")
+            return
+        run_all(args, sim_root, out_dir)
+        summarize(args, sim_root, make_stats(args), out_dir, start_time=start_time)
 
 
 if __name__ == "__main__":

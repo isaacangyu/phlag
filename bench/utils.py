@@ -1,10 +1,12 @@
 import argparse
 import colorsys
 import functools
+import io
 import itertools
 import math
 import re
 import textwrap
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -30,7 +32,9 @@ from bench.cli.benchmark import (
     _read_args_json,
     assign_bin,
     discover_leaf_dirs,
+    nominal_anomaly_fraction,
     parse_report,
+    transition_total,
 )
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path
 from phlag.utils import (
@@ -47,11 +51,22 @@ from phlag.utils import (
 
 STORE_ROOT = "store/phlag"
 
-PHLAG_SOURCE_ROOTS = {"gtrees": str(get_repo_root() / "out" / "gtrees"), "msa": str(get_out_root())}
-WINDOWLESS_PHLAG_SOURCES = {"gtrees"}
+
+def _latest_phlag_orig_dir():
+    root = get_repo_root() / "store" / "phlag_orig"
+    dirs = [d for d in root.glob("*/") if next(d.glob("*/*/*/*/report.tsv"), None)]
+    return max(dirs, key=lambda d: d.stat().st_mtime, default=root)
+
+
+PHLAG_SOURCE_ROOTS = {"gtrees": str(_latest_phlag_orig_dir()), "msa": str(get_out_root())}
+PAPER_SOURCE = "paper"
+PHLAG_SOURCE_ROOTS[PAPER_SOURCE] = PHLAG_SOURCE_ROOTS["gtrees"]
+WINDOWLESS_PHLAG_SOURCES = {"gtrees", PAPER_SOURCE}
 _GT_STATS_COLUMN = re.compile(r"^(null|alt|pooled)_(mean|cov|var|within)_")
 
 SWEEP_METRICS = ["em_hd", "roc_auc", "f1"]
+
+_BETA_FLAGS = {"--beta", "--beta-prime"}
 
 _METRIC_PANEL_COLUMN = {
     "f1": "in_panel_a",
@@ -60,6 +75,9 @@ _METRIC_PANEL_COLUMN = {
     "null_kl_agg": "in_panel_relerr",
     "alt_kl_agg": "in_panel_relerr",
 }
+
+_NO_METRICS_EXCLUSION = "no TPR/FPR metrics line in report"
+_FAILED_RUN_ZERO_METRICS = ["f1", "tpr", "fpr", "precision"]
 
 _SIGNED_METRIC_SUFFIX = "_signed"
 
@@ -77,7 +95,7 @@ def _null_col_val(col_vals):
     """Which of a heatmap's subplot-column values (_plot_heatmap's col_vals,
     i.e. agg[2]'s display values) counts as the "null"/baseline column for a
     "_signed" metric: the first one that's a flag's off/negated state
-    ("(none)") or missing state ("no-<flag>") -- see _combo_label_part --
+    or missing state ("(base)") -- see _combo_label_part --
     since that's the closest thing to a real baseline/control. Falls back to
     col_vals[0] (the first/leftmost column, in whatever order agg produced
     it) when no such state is present, e.g. a tuple axis's realized combos
@@ -85,7 +103,7 @@ def _null_col_val(col_vals):
     one exists on disk, so this still lands on it there too) or a plain
     value list like -w's, which has no notion of "off" at all."""
     for cv in col_vals:
-        if cv == "(none)" or (isinstance(cv, str) and cv.startswith("no-")):
+        if cv in ("(none)", "(base)"):
             return cv
     return col_vals[0]
 
@@ -93,7 +111,7 @@ def _null_col_val(col_vals):
 # their bar/violin y-axis is pinned to [0, 1] with 0.2-step ticks (see
 # _apply_bounded_yaxis) instead of autoscaling/whisker-clipping to whatever a
 # given cell's data happens to span, so figures stay comparable to each other.
-_BOUNDED_METRICS = {"f1", "em_hd", "em_gt_hd", "roc_auc", "transition_null_to_alt", "transition_alt_to_null"} | {
+_BOUNDED_METRICS = {"f1", "tpr", "fpr", "em_hd", "em_gt_hd", "roc_auc", "transition_null_to_alt", "transition_alt_to_null"} | {
     f"{prefix}_transition_{move}"
     for prefix in ("fitted", "gt", "viterbi")
     for move in ("null_to_null", "null_to_alt", "alt_to_null", "alt_to_alt")
@@ -120,7 +138,31 @@ _DATA_COLUMN_AXES = {
 # are a further special case within this: their enumeration comes from
 # CrossRunAnalysis._bin_specs (compute_hd_bin_edges), not a fresh runs.tsv
 # scan -- see _discover_row_values.
-_DYNAMIC_ROW_AXES = {"category", "subcategory", "merged_category", "em_hd_bin", "em_gt_hd_bin", "pattern"}
+_DYNAMIC_ROW_AXES = {
+    "category", "subcategory", "merged_category", "em_hd_bin", "em_gt_hd_bin", "pattern",
+    "anomaly_fraction", "outlier_pct",
+}
+
+
+NOMINAL_GENOME_SITES = 6_000_000
+
+
+def _outlier_pct(patterns):
+    pct = {p: nominal_anomaly_fraction(p) for p in patterns.dropna().unique()}
+    return patterns.map(lambda p: round(100 * pct[p], 6) if pct.get(p) is not None else None)
+
+
+def _outlier_sites_label(token):
+    pct = _token_to_number(token)
+    if pct is None:
+        return str(token)
+    return f"{_format_param_value(round(pct / 100 * NOMINAL_GENOME_SITES))} ({token})"
+
+
+def _row_axis_display(name, value):
+    if name == "outlier_pct":
+        return f"{value:g}%"
+    return f"{value:g}" if isinstance(value, float) else str(value)
 
 
 def _merged_category(category, subcategory):
@@ -137,6 +179,39 @@ def _merged_category(category, subcategory):
 _CATEGORY_LIKE_AXES = ("category", "merged_category")
 
 _MERGED_CATEGORY_ORDER = ["recombination up", "recombination down", "10X up", "10X down", "admixture"]
+
+PHLAG_PAPER_F1 = {
+    "(0,0.1]": {
+        "recombination up": {"(0,0.1]": (0.26, 0.015), "(0.1,1]": (0.41, 0.02), "(1,5]": (0.70, 0.01)},
+        "recombination down": {"(0,0.1]": (0.08, 0.01), "(0.1,1]": (0.38, 0.015), "(1,5]": (0.53, 0.015)},
+        "10X up": {"(0,0.1]": (0.02, 0.005), "(0.1,1]": (0.27, 0.02), "(1,5]": (0.68, 0.01)},
+        "10X down": {"(0,0.1]": (0.25, 0.02), "(0.1,1]": (0.32, 0.015), "(1,5]": (0.01, 0.005)},
+        "admixture": {"low": (0.03, 0.02), "high": (0.68, 0.09)},
+    },
+    "(0.1,0.25]": {
+        "recombination up": {"(0,0.1]": (0.43, 0.015), "(0.1,1]": (0.66, 0.015), "(1,5]": (0.90, 0.01)},
+        "recombination down": {"(0,0.1]": (0.26, 0.02), "(0.1,1]": (0.67, 0.015), "(1,5]": (0.81, 0.01)},
+        "10X up": {"(0,0.1]": (0.06, 0.01), "(0.1,1]": (0.69, 0.015), "(1,5]": (0.98, 0.005)},
+        "10X down": {"(0,0.1]": (0.46, 0.02), "(0.1,1]": (0.85, 0.01), "(1,5]": (0.09, 0.005)},
+        "admixture": {"low": (0.16, 0.07), "high": (0.97, 0.01)},
+    },
+}
+PHLAG_PAPER_FPR_TPR = {
+    "(0,0.1]": {
+        "recombination up": (0.03, 0.51),
+        "recombination down": (0.03, 0.44),
+        "10X up": (0.03, 0.45),
+        "10X down": (0.07, 0.24),
+        "admixture": (0.07, 0.52),
+    },
+    "(0.1,0.25]": {
+        "recombination up": (0.02, 0.70),
+        "recombination down": (0.03, 0.69),
+        "10X up": (0.05, 0.68),
+        "10X down": (0.02, 0.10),
+        "admixture": (0.04, 0.67),
+    },
+}
 
 
 def _merged_category_sort_key(value):
@@ -178,11 +253,13 @@ def _x_bin_category_compatible(names, level_combo):
 
 _MIRRORED_SPECS = CASTER_ARG_SPECS + PHLAG_ARG_SPECS
 _PARSER = _build_parser()
+_PARSER.add_argument("--emission-param", dest="emission_param", default="free")
+_RECORDED_DEFAULTS = {**PHLAG_SEGMENT_DEFAULTS, "emission_param": "free"}
 # Every option string (both short and long form, e.g. "-n" AND "--normalize")
 # that the real parser registers for a mirrored dest -- not just the one
 # canonical token CASTER_ARG_SPECS/PHLAG_ARG_SPECS happens to list, so a
 # config dict can use either alias interchangeably, same as the actual CLI.
-_MIRRORED_DESTS = {dest for dest, _, _ in _MIRRORED_SPECS}
+_MIRRORED_DESTS = {dest for dest, _, _ in _MIRRORED_SPECS} | {"emission_param"}
 _FLAG_TO_DEST = {
     option_string: action.dest
     for option_string, action in _PARSER._option_string_actions.items()
@@ -244,8 +321,15 @@ class CrossRunAnalysis:
         self._leaf_dirs = None
         self._row_filters = {}
         self._config_axes = {}
+        self._config_rank = {}
         self._agg_axis_names = {}
         self._restrictions = {}
+        self.title_base = {}
+        self._beta_axis_idx = None
+        self._config_beta = {}
+        self._config_implicit = {}
+        self._agg_given = True
+        self._raw_beta_cache = {}
         self._last_configs = None
         self._bin_specs = {}
         self._args_json_cache = {}
@@ -369,9 +453,16 @@ class CrossRunAnalysis:
             values.add(_recorded_value(recorded, dest))
         return sorted(values, key=_param_value_sort_key)
 
-    def _unlisted_toggle_flags(self, agg_seq, axes, exclude_keywords=()):
-        """On/off flags that aren't pinned in `axes` or named anywhere in agg
-        and take more than one value on disk."""
+    def _threshold_flag_values(self, flag, spec, exclude_keywords=()):
+        """"<5k"/">5k": every on-disk value of `flag` strictly below/above the bound."""
+        bound = int_or_abbrev(spec[1:])
+        keep = (lambda v: v < bound) if spec[0] == "<" else (lambda v: v > bound)
+        return [v for v in self._discover_flag_values(flag, exclude_keywords)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and keep(v)]
+
+    def _unlisted_toggle_flags(self, agg_seq, axes, exclude_keywords=(), values=False):
+        """On/off flags (plus value flags if `values`) that aren't pinned in
+        `axes` or named anywhere in agg and take more than one value on disk."""
         named = set(axes)
         for name in agg_seq:
             named.update(m for m in name if m != "...") if isinstance(name, tuple) else named.add(name)
@@ -381,7 +472,7 @@ class CrossRunAnalysis:
             if dest in seen:
                 continue
             seen.add(dest)
-            if isinstance(_PARSER._option_string_actions[flag], argparse._StoreTrueAction) \
+            if (values or isinstance(_PARSER._option_string_actions[flag], argparse._StoreTrueAction)) \
                     and len(self._discover_flag_tuple_values((flag,), exclude_keywords)) > 1:
                 extra.append(_canonical_flag_name(flag))
         return extra
@@ -455,6 +546,9 @@ class CrossRunAnalysis:
             if col == "merged_category":
                 if "category" in df.columns and "subcategory" in df.columns:
                     values.update(_merged_category(df["category"], df["subcategory"]).unique())
+            elif col == "outlier_pct":
+                if "pattern" in df.columns:
+                    values.update(_outlier_pct(df["pattern"]).dropna().unique())
             elif col in df.columns:
                 values.update(df[col].unique())
         if col == "merged_category":
@@ -501,11 +595,11 @@ class CrossRunAnalysis:
     def resolve_configs(self, flags_specs, labels=None, exclude_keywords=()):
         """flags_specs: list of {cli_flag: value} dicts, one per config, e.g.
         [{"-w": "50k"}, {"-w": "100k"}, {"-w": "250k"}]. labels defaults to
-        _combo_label(flags, "(none)") per config. exclude_keywords: forwarded
+        _combo_label(flags, "(base)") per config. exclude_keywords: forwarded
         to find_matching_leaf_dirs."""
         configs = []
         for i, flags in enumerate(flags_specs):
-            label = labels[i] if labels else _combo_label(flags, "(none)")
+            label = labels[i] if labels else _combo_label(flags, "(base)")
             dirs = self.find_matching_leaf_dirs(flags, exclude_keywords)
             if dirs:
                 configs.append((label, dirs))
@@ -620,16 +714,35 @@ class CrossRunAnalysis:
         collapses the legend to a single pooled entry (the metric averaged
         over every config in the figure) when agg[0] (hue) is left as this
         placeholder while agg[1] (bar) has real values -- see its
-        docstring."""
+        docstring.
+
+        A list of such dicts resolves each one and unions the results: configs
+        with the same label pool their dirs (deduplicated), and the title
+        restriction joins each dict's own with " | "."""
+        if isinstance(axes, (list, tuple)):
+            results, beta_idx = [], None
+            for a in axes:
+                results.append(self.resolve_configs_cartesian(a, exclude_keywords, agg))
+                beta_idx = self._beta_axis_idx if beta_idx is None else beta_idx
+            configs = self._union_configs(results)
+            self._beta_axis_idx = beta_idx
+            return configs
+        self._agg_given = bool(agg)
         agg_seq = [agg] if isinstance(agg, str) else (list(agg) if agg else list(axes))
         axes = dict(axes)
+        given_axes = dict(axes)
         agg_seq = self._expand_tuple_wildcards(agg_seq, axes, exclude_keywords)
-        implicit_flags = self._unlisted_toggle_flags(agg_seq, axes, exclude_keywords)
+        implicit_flags = self._unlisted_toggle_flags(agg_seq, axes, exclude_keywords, values=True)
+        unlisted_on = {}
         agg_set = set(agg_seq)
         sources = axes.pop("phlag", None)
         if sources is None:
-            sources = list(PHLAG_SOURCE_ROOTS) if "phlag" in agg_seq else ["msa"]
+            sources = [x for x in PHLAG_SOURCE_ROOTS if x != PAPER_SOURCE] if "phlag" in agg_seq else ["msa"]
         sources = [sources] if isinstance(sources, str) else list(sources)
+
+        unagged = [n for n in axes if (n in _DATA_COLUMN_AXES or n in _DYNAMIC_ROW_AXES) and n not in agg_set]
+        if unagged:
+            raise ValueError(f"row-level axes {unagged} must also be in agg; outside agg they can't be pooled/restricted")
 
         data_col_axes = {}
         for name in list(axes.keys()) + agg_seq:
@@ -639,6 +752,17 @@ class CrossRunAnalysis:
                 data_col_axes[name] = axes.pop(name, None) or self._discover_row_values(name, exclude_keywords)
         agg_set -= set(data_col_axes)
 
+        for flag, spec in list(axes.items()):
+            if flag not in _FLAG_TO_DEST:
+                continue
+            is_threshold = lambda v: isinstance(v, str) and v[:1] in ("<", ">")
+            if is_threshold(spec):
+                axes[flag] = self._threshold_flag_values(flag, spec, exclude_keywords)
+            elif isinstance(spec, list) and any(map(is_threshold, spec)):
+                bounds = [set(self._threshold_flag_values(flag, v, exclude_keywords)) for v in spec if is_threshold(v)]
+                in_range = [v for v in self._discover_flag_values(flag, exclude_keywords) if v in set.intersection(*bounds)]
+                merged = list(dict.fromkeys(in_range + [v for v in spec if not is_threshold(v)]))
+                axes[flag] = sorted(merged, key=lambda v: _token_sort_key(str(v)))
         for flag in agg_seq:
             if flag not in axes and flag not in data_col_axes and flag in _FLAG_TO_DEST:
                 axes[flag] = self._discover_flag_values(flag, exclude_keywords)
@@ -658,7 +782,8 @@ class CrossRunAnalysis:
         pool_axes = {flag: spec for flag, spec in axes.items() if flag not in agg_members}
         pool_axis_states = [_cartesian_axis_states(flag, spec) for flag, spec in pool_axes.items()]
         pool_combos = list(itertools.product(*pool_axis_states)) if pool_axis_states else [()]
-        restriction = _pool_axes_label(pool_axes)
+        at_base = {f for f in pool_axes if f in self.title_base and given_axes.get(f) == self.title_base[f]}
+        restriction = _pool_axes_label(pool_axes, exclude=at_base)
 
         # One "level" per (still-existing) name in agg_seq -- a level's states are
         # (contribution_dict, is_flag, display_value) triples. A fractional -s
@@ -667,6 +792,7 @@ class CrossRunAnalysis:
         # below (see _resolve_step_fraction), not here.
         levels = []
         consumed_flags = set()
+        beta_level_idx = None
         for name in agg_seq:
             if name in consumed_flags:
                 continue
@@ -678,6 +804,24 @@ class CrossRunAnalysis:
                 # docstring/_plot_grouped for what an empty axis 0 (hue) or
                 # axis 1 (bar) does to rendering.
                 states = [({}, False, "")]
+            elif isinstance(name, tuple) and "phlag" in name:
+                rest = [n for n in name if n != "phlag"]
+                rest_states = [
+                    {k: v for fs in combo for k, v in fs.items()}
+                    for combo in itertools.product(*(
+                        _cartesian_axis_states(f, axes[f] if f in axes else self._discover_flag_values(f, exclude_keywords))
+                        for f in rest
+                    ))
+                ]
+                states = []
+                for source in sources:
+                    if source in WINDOWLESS_PHLAG_SOURCES:
+                        states.append(({"phlag": source}, False, source))
+                        continue
+                    for fs in rest_states:
+                        disp = " ".join(part for k, v in fs.items() if (part := _combo_label_part(k, v)) is not None)
+                        states.append(({"phlag": source, **fs}, True, f"{source} {disp}".strip()))
+                consumed_flags.update(rest)
             elif isinstance(name, tuple):
                 # A combined multi-flag axis (e.g. ("--ap", "--annealing"))
                 # -- states are the REALIZED joint combinations these flags
@@ -688,18 +832,34 @@ class CrossRunAnalysis:
                 # every other agg element via level_combos below, same as
                 # any other level.
                 states = []
-                for combo in self._discover_flag_tuple_values(name, exclude_keywords):
+                combos = [
+                    combo for combo in self._discover_flag_tuple_values(name, exclude_keywords)
+                    if all(
+                        any(_matches_flags({_FLAG_TO_DEST[flag]: v}, fs)
+                            for fs in _cartesian_axis_states(flag, axes[flag]))
+                        for flag, v in zip(name, combo) if flag in axes
+                    )
+                ]
+                numeric = [
+                    flag for i, flag in enumerate(name)
+                    if any(isinstance(c[i], (int, float)) and not isinstance(c[i], bool) for c in combos)
+                ]
+                is_beta = _BETA_FLAGS <= set(name)
+                if is_beta:
+                    beta_level_idx = len(levels)
+                for combo in combos:
                     fs = dict(zip(name, combo))
                     disp = " ".join(
                         part for k, v in fs.items()
-                        if (part := _combo_label_part(k, v)) is not None
+                        if not (is_beta and k == "--beta")
+                        and (part := _tuple_member_label(k, v) if k in numeric else _combo_label_part(k, v)) is not None
                     )
                     states.append((fs, True, disp))
                 consumed_flags.update(name)
             elif name == "phlag":
                 states = [({"phlag": v}, False, v) for v in sources]
             elif name in data_col_axes:
-                states = [({name: v}, False, str(v)) for v in data_col_axes[name]]
+                states = [({name: v}, False, _row_axis_display(name, v)) for v in data_col_axes[name]]
             elif name in axes:
                 flag_states = _cartesian_axis_states(name, axes[name])
                 states = []
@@ -718,23 +878,27 @@ class CrossRunAnalysis:
         level_key_names = [name for name, _ in levels]
 
         configs = []
-        level_combos = list(itertools.product(*[states for _, states in levels])) if levels else [()]
-        for level_combo in level_combos:
+        level_combos = list(itertools.product(*[list(enumerate(states)) for _, states in levels])) if levels else [()]
+        for indexed_combo in level_combos:
+            combo_rank = tuple(i for i, _ in indexed_combo)
+            level_combo = tuple(state for _, state in indexed_combo)
             if not _x_bin_category_compatible(level_key_names, level_combo):
                 continue
             agg_flags, row_filter, axis_values, label_bits = {}, {}, [], []
             for contribution, is_flag, disp in level_combo:
-                axis_values.append(disp if disp else "(none)")
+                axis_values.append(disp if disp else ("(base)" if is_flag else "(none)"))
                 # A flag level always contributes something to the label, even
-                # "(none)" for its off state, so two configs whose only
+                # "(base)" for its off state, so two configs whose only
                 # difference is a flag's on/off state never collide onto the
                 # same label text (which self._row_filters/_config_axes key
                 # on) -- a data-column level's disp is never empty, so this
                 # only changes behavior for flag levels.
                 if disp or is_flag:
-                    label_bits.append(disp if disp else "(none)")
+                    label_bits.append(disp if disp else "(base)")
                 if is_flag:
-                    agg_flags.update(contribution)
+                    if "phlag" in contribution:
+                        row_filter["phlag"] = contribution["phlag"]
+                    agg_flags.update({k: v for k, v in contribution.items() if k != "phlag"})
                 else:
                     row_filter.update(contribution)
             label = " ".join(label_bits) or "(none)"
@@ -756,34 +920,106 @@ class CrossRunAnalysis:
             splits, windowless_roots = {}, {PHLAG_SOURCE_ROOTS[x] for x in WINDOWLESS_PHLAG_SOURCES}
             for d in dirs:
                 recorded = {} if str(d) in windowless_roots else self._get_args(d)
-                key = tuple(bool(recorded.get(_FLAG_TO_DEST[f])) for f in implicit_flags)
-                splits.setdefault(key, []).append(d)
-            for key, split_dirs in splits.items():
-                text = " ".join(_strip_flag(f) for f, on in zip(implicit_flags, key) if on)
-                split_label = f"{label} {text}" if text else label
-                split_axes = ([f"{axis_values[0]} {text}" if text else axis_values[0]] + axis_values[1:]) if axis_values else axis_values
+                key = tuple(_implicit_flag_part(f, recorded) for f in implicit_flags)
+                if agg:
+                    for f, part in zip(implicit_flags, key):
+                        if part:
+                            unlisted_on.setdefault(f, set()).add(part)
+                raw_beta = self._raw_beta(d) if beta_level_idx is not None and str(d) not in windowless_roots else None
+                splits.setdefault((key, raw_beta), []).append(d)
+            for (key, raw_beta), split_dirs in splits.items():
+                text = " ".join(part for part in key if part)
+                join = lambda base: (text if base in ("(base)", "(none)") else f"{base} {text}") if text else base
+                split_values, base_label = list(axis_values), label
+                if beta_level_idx is not None and raw_beta is not None:
+                    rest = axis_values[beta_level_idx]
+                    beta_disp = f"(beta={raw_beta:g})" if "beta'=" in rest else f"beta={raw_beta:g}"
+                    split_values[beta_level_idx] = beta_disp if rest == "(base)" else f"{rest} {beta_disp}"
+                    base_label = " ".join(v for v in split_values if v != "(none)")
+                split_label = join(base_label)
+                split_axes = [join(split_values[0])] + split_values[1:] if split_values else split_values
+                existing = next((ds for lbl, ds in configs if lbl == split_label), None)
+                if existing is not None:
+                    existing.extend(split_dirs)
+                    continue
                 configs.append((split_label, split_dirs))
                 self._row_filters[split_label] = row_filter
                 self._config_axes[split_label] = split_axes
+                self._config_rank[split_label] = tuple(
+                    (i, raw_beta if j == beta_level_idx and raw_beta is not None else float("-inf"))
+                    for j, i in enumerate(combo_rank)
+                )
                 self._agg_axis_names[split_label] = level_names
                 self._restrictions[split_label] = restriction
+                self._config_beta[split_label] = raw_beta
+                self._config_implicit[split_label] = text
+        if unlisted_on:
+            warnings.warn("unlisted flags split into separate configs: " + ", ".join(
+                f"{f} ({', '.join(sorted(parts))})" for f, parts in unlisted_on.items()), stacklevel=2)
+            for label, _ in configs:
+                vals = self._config_axes[label]
+                if vals and vals[0] == "(none)":
+                    vals[0] = "(base)"
+        self._beta_axis_idx = beta_level_idx
+        configs.sort(key=lambda c: self._config_rank[c[0]])
         return configs
 
-    def print_configs(self, configs=None, metrics=None, paths=False):
+    def _union_configs(self, results):
+        merged = {}
+        restrictions = list(dict.fromkeys(
+            self._restrictions.get(label, "") for configs in results for label, _ in configs[:1]
+        ))
+        for configs in results:
+            for label, dirs in configs:
+                merged.setdefault(label, {})
+                merged[label].update(dict.fromkeys(dirs))
+        restriction = " | ".join(r for r in restrictions if r)
+        for label in merged:
+            self._restrictions[label] = restriction
+        configs = [(label, list(dirs)) for label, dirs in merged.items()]
+        levels = max((len(self._config_axes.get(label, [])) for label in merged), default=0)
+        order = [
+            {v: i for i, v in enumerate(_ordered_unique(v for r in results for v in self._axis_values(r, idx)))}
+            for idx in range(levels)
+        ]
+        for label, _ in configs:
+            self._config_rank[label] = tuple(
+                (order[idx][v], -1) for idx, v in enumerate(self._config_axes.get(label, []))
+            )
+        configs.sort(key=lambda c: self._config_rank[c[0]])
+        return configs
+
+    def _raw_beta(self, run_dir):
+        key = str(run_dir)
+        if key not in self._raw_beta_cache:
+            recorded = self._get_args(run_dir)
+            beta, beta_prime = recorded.get("beta"), recorded.get("beta_prime")
+            value = None
+            if beta is not None:
+                value = float(beta)
+            elif beta_prime is not None:
+                p = Path(run_dir) / "runs.tsv"
+                n = pd.read_csv(p, sep="\t", usecols=["n_windows"])["n_windows"].dropna() if p.exists() else pd.Series()
+                value = float(beta_prime) * float(n.median()) if not n.empty else None
+            self._raw_beta_cache[key] = value
+        return self._raw_beta_cache[key]
+
+    def print_configs(self, configs=None, agg=(), metrics=None, exclude_keywords=()):
         """Prints each config's label, run count, and mean of every metric in
         `metrics` (pooled across all its runs -- same aggregate plot
         subplots show), followed by the args.json params that actually vary
-        across its matching dirs (see _param_summary_lines) -- e.g. a config
-        pooled via `agg` mixes lambda values, so its dirs disagree on lambda.
-        configs defaults to self._last_configs -- the configs resolved by the
-        most recent plot() call -- so you don't have to keep a configs
-        variable around just to print it; pass configs= explicitly to
-        override (e.g. to inspect a resolve_configs_cartesian call you
-        didn't plot). metrics defaults to self.metrics -- the scalar metrics
-        from the most recent plot() call -- so you don't have to repeat the
-        same list; pass metrics= explicitly to override. paths=True also
-        prints each config's sorted run dirs."""
-        configs = self._last_configs if configs is None else configs
+        across its matching dirs (see _param_summary_lines). configs: a
+        plot()-style {flag: value_spec} dict, resolved via
+        resolve_configs_cartesian with `agg`/`exclude_keywords` (so
+        print_configs(config, agg) prints the same aggregated configs
+        plot(config, agg=agg) draws); an already-resolved [(label, dirs)]
+        list; or None (default) for the configs from the most recent plot().
+        metrics defaults to self.metrics -- the scalar metrics from the most
+        recent plot() call."""
+        if configs is None:
+            configs = self._last_configs
+        elif isinstance(configs, dict) or (isinstance(configs, list) and configs and isinstance(configs[0], dict)):
+            configs = self.resolve_configs_cartesian(configs, exclude_keywords=exclude_keywords, agg=agg)
         metrics = self.metrics if metrics is None else metrics
         metric_values = {metric: self._metric_by_label(configs, metric) for metric in metrics}
         for label, dirs in configs:
@@ -791,9 +1027,34 @@ class CrossRunAnalysis:
             print(f"{label} ({len(dirs)} runs, {stats}):")
             for line in _param_summary_lines(dirs):
                 print(f"  {line}")
-            if paths:
-                for d in sorted(dirs):
-                    print(f"  {d}")
+
+    def top_configs(self, k=5, metric="f1", configs=None, exclude_keywords=(), ascending=False):
+        """Top `k` leaf run dirs under self.root ranked by mean `metric` over
+        their runs.tsv (highest first, or lowest with ascending=True; NaN
+        last), as a DataFrame of config (path relative to self.root) and
+        metric. configs: optional {flag: value_spec} dict restricting which
+        dirs are ranked -- a bare value pins the flag, a list allows any of
+        its values, and "<10k"/">1k" thresholds (bare or in a list, where
+        several thresholds intersect into a range) keep on-disk values past
+        the bound, e.g. {"-w": ["<10k"], "-d": "gaussian"}."""
+        is_threshold = lambda v: isinstance(v, str) and v[:1] in ("<", ">")
+        allowed = {}
+        for flag, spec in (configs or {}).items():
+            specs = spec if isinstance(spec, list) else [spec]
+            bounds = [set(self._threshold_flag_values(flag, s, exclude_keywords)) for s in specs if is_threshold(s)]
+            allowed[flag] = [s for s in specs if not is_threshold(s)] + (list(set.intersection(*bounds)) if bounds else [])
+        rows = []
+        for d in self._all_leaf_dirs():
+            if any(kw in str(d) for kw in exclude_keywords):
+                continue
+            recorded = self._get_args(d)
+            if not all(any(_matches_flags(recorded, {f: v}) for v in vs) for f, vs in allowed.items()):
+                continue
+            df = _load_raw_config_df([d], self._get_args)
+            score = df[metric].dropna().mean() if metric in df.columns else float("nan")
+            rows.append((str(Path(d).relative_to(self.root)), score))
+        df = pd.DataFrame(rows, columns=["config", metric])
+        return df.sort_values(metric, ascending=ascending, na_position="last").head(k).reset_index(drop=True)
 
     # ---- cross-run PNG-metric grids ----
 
@@ -853,7 +1114,16 @@ class CrossRunAnalysis:
         )
         return fig
 
-    def _plot_tpr_fpr_grouped(self, configs, title):
+    def _axis_values(self, configs, idx):
+        rank = {}
+        for label, _ in configs:
+            vals, ranks = self._config_axes.get(label, []), self._config_rank.get(label, ())
+            v = vals[idx] if idx < len(vals) else None
+            r = ranks[idx] if idx < len(ranks) else (float("inf"), float("inf"))
+            rank[v] = min(rank.get(v, r), r)
+        return sorted(rank, key=lambda v: (rank[v], _token_sort_key(v)))
+
+    def _plot_tpr_fpr_grouped(self, configs, title, agg_idx=0):
         """Multi-level agg (2-4 axes, see resolve_configs_cartesian/
         _plot_grouped) version of _plot_tpr_fpr_grid: agg[0] -> one line per
         value (colored, shared legend, different segments), agg[1] -> one
@@ -864,30 +1134,31 @@ class CrossRunAnalysis:
         legend's ROC-AUC per line value is pooled across every *real*
         (flag-based) point/col/row value sharing that line value (agg[0]),
         not just one cell -- invariant to any row-filter agg axis, same as
-        _plot_grouped's legend -- see _metric_by_axis_value."""
+        _plot_grouped's legend -- see _metric_by_axis_value.
+
+        agg_idx: which agg level drives point color + the legend (same as
+        _plot_grouped's). agg_idx == 1 swaps agg[0]/agg[1]: one line per
+        agg[1] value, points along it per agg[0] value (shaded). For
+        agg_idx >= 2 the layout stays fixed and a line is drawn gray when its
+        points span more than one agg[agg_idx] value."""
         def axis_val(label, idx):
             vals = self._config_axes.get(label, [])
             return vals[idx] if idx < len(vals) else None
 
-        line_vals = _ordered_unique(axis_val(label, 0) for label, _ in configs)
-        point_vals = _ordered_unique(axis_val(label, 1) for label, _ in configs)
-        # col/row (agg[2]/[3], the subplot grid) are sorted numerically-aware
-        # rather than left in _ordered_unique's first-seen order -- unlike
-        # line/point (agg[0]/[1], color/shading), a grid axis has no other
-        # ordering signal, and first-seen order is fragile to a value being
-        # skipped for the first several (line, point) combos it's tried
-        # against (e.g. a window size missing data at one --annealing state
-        # but not another) and only "discovered" later, landing it out of
-        # order (e.g. w10 sorting after w50k) -- see _token_sort_key.
-        col_vals = sorted(_ordered_unique(axis_val(label, 2) for label, _ in configs), key=_token_sort_key)
-        row_vals = sorted(_ordered_unique(axis_val(label, 3) for label, _ in configs), key=_token_sort_key)
+        line_idx, point_idx = (1, 0) if agg_idx == 1 else (0, 1)
+        line_vals = self._axis_values(configs, line_idx)
+        point_vals = self._axis_values(configs, point_idx)
+        col_vals = self._axis_values(configs, 2)
+        row_vals = self._axis_values(configs, 3)
 
         by_key = {}
         for label, dirs in configs:
-            key = (axis_val(label, 3), axis_val(label, 2), axis_val(label, 1), axis_val(label, 0))
+            key = (axis_val(label, 3), axis_val(label, 2), axis_val(label, point_idx), axis_val(label, line_idx))
             by_key[key] = (label, dirs)
 
-        colors = {lv: _config_color(i) for i, lv in enumerate(line_vals)}
+        leg_vals = self._axis_values(configs, agg_idx)
+        colors = {v: _config_color(i) for i, v in enumerate(leg_vals)}
+        shade = True
         dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
         n_rows, n_cols = len(row_vals), len(col_vals)
 
@@ -900,10 +1171,10 @@ class CrossRunAnalysis:
         # each legend's real rendered extent instead of trusting this
         # constant, so an under/over estimate here costs at most a
         # slightly bigger-than-necessary canvas, never an overlap.
-        show_line_legend = len(line_vals) > 1 or line_vals != [None]
-        show_shade_legend = len(point_vals) > 1
+        show_line_legend = len(leg_vals) > 1 or leg_vals != [None]
+        show_shade_legend = shade and len(point_vals) > 1
         legend_rows = (
-            (len(line_vals) if show_line_legend else 0)
+            (len(leg_vals) if show_line_legend else 0)
             + (len(point_vals) + 1 if show_shade_legend else 0)  # +1: shade legend's own title row
         )
         legend_extra_in = 0.2 * legend_rows
@@ -939,14 +1210,16 @@ class CrossRunAnalysis:
                         d = d[_is_true(d["in_panel_b"])]
                         if d.empty:
                             continue
-                        points.append((pv, d["fpr"].mean(), d["tpr"].mean()))
+                        points.append((pv, d["fpr"].mean(), d["tpr"].mean(), colors[axis_val(label, agg_idx)]))
                     if not points:
                         continue
                     xs = [p[1] for p in points]
                     ys = [p[2] for p in points]
                     if len(xs) > 1:
-                        ax.plot(xs, ys, color=colors[lv], alpha=0.45, linewidth=1.0, zorder=2)
-                    shades = [_shade_color(colors[lv], point_vals.index(p[0]) / max(len(point_vals) - 1, 1)) for p in points]
+                        cs = {p[3] for p in points}
+                        ax.plot(xs, ys, color=cs.pop() if len(cs) == 1 else "#888888", alpha=0.45, linewidth=1.0, zorder=2)
+                    shades = [_shade_color(p[3], point_vals.index(p[0]) / max(len(point_vals) - 1, 1)) if shade and len(point_vals) > 1 else p[3]
+                              for p in points]
                     ax.scatter(xs, ys, color=shades, s=34, edgecolor="white", linewidth=0.7, zorder=3)
         _suptitle(fig, title, fontsize=12, y=0.995)
 
@@ -967,12 +1240,12 @@ class CrossRunAnalysis:
         cursor_y = (fig._suptitle.get_window_extent(renderer).y0 - 4) / fig_h_px
 
         if show_line_legend:
-            line_auc_values = self._metric_by_axis_value(configs, 0, "roc_auc")
+            line_auc_values = self._metric_by_axis_value(configs, agg_idx, "roc_auc")
             handles = [
                 plt.Line2D([0], [0], marker="o", linestyle="none", markersize=6,
                            markerfacecolor=colors[lv], markeredgecolor="white",
                            label=f"{lv} (ROC-AUC={line_auc_values[lv][0]:.4f}±{line_auc_values[lv][1]:.4f})")
-                for lv in line_vals
+                for lv in leg_vals
             ]
             line_legend = fig.legend(
                 handles=handles, loc="upper right", bbox_to_anchor=(0.995, cursor_y), fontsize=8, framealpha=0.9)
@@ -990,9 +1263,10 @@ class CrossRunAnalysis:
                            markeredgecolor="white", markeredgewidth=0.6, label=str(pv))
                 for i, pv in enumerate(point_vals)
             ]
+            shade_title = f"shade = agg[{point_idx}] (light→dark)"
             shade_legend = fig.legend(
                 handles=shade_handles, loc="upper right", bbox_to_anchor=(0.995, cursor_y), fontsize=7,
-                framealpha=0.85, title="shade = agg[1] (light→dark)", title_fontsize=7,
+                framealpha=0.85, title=shade_title, title_fontsize=7,
             )
             fig.canvas.draw()
             cursor_y = (shade_legend.get_window_extent(renderer).y0 - 4) / fig_h_px
@@ -1029,7 +1303,7 @@ class CrossRunAnalysis:
                     ax.plot(xs[~tiled], ys[~tiled], linestyle="none", markerfacecolor="none", **style)
             ax.set_xscale("log")
             ax.set_xticks(x_windows)
-            ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=7)
+            ax.set_xticklabels(x_labels, rotation=45, ha="right", rotation_mode="anchor", fontsize=7)
             ax.minorticks_off()
             ax.set_xlabel("window (hollow: step != window)" if has_steps else "window")
             ax.set_title(" vs ".join(panel), fontsize=9)
@@ -1119,15 +1393,28 @@ class CrossRunAnalysis:
         plt.show()
         return fig
 
-    def plot(self, *args, show_axes=True, show_legend=True, **kwargs):
-        figs = self._plot(*args, **kwargs)
-        for fig in figs if isinstance(figs, (list, tuple)) else [figs]:
+    def plot(self, *args, show_axes=True, legend=None, gtrees=False, **kwargs):
+        if legend not in (None, "hide", "values"):
+            raise ValueError(f"legend must be None, 'hide', or 'values', got {legend!r}")
+        figs = self._plot_vs_paper(*args, **kwargs) if gtrees else self._plot(*args, **kwargs)
+        split = isinstance(figs, list) and any(isinstance(f, list) for f in figs)
+        for fig in [f for row in figs for f in row] if split else figs if isinstance(figs, (list, tuple)) else [figs]:
             if fig is None:
                 continue
-            if not show_legend:
-                for legend in fig.legends + [ax.get_legend() for ax in fig.axes if ax.get_legend() is not None]:
-                    legend.set_title(None)
+            legends = fig.legends + [ax.get_legend() for ax in fig.axes if ax.get_legend() is not None]
+            if legend == "hide":
+                for leg in legends:
+                    leg.remove()
+            elif legend is None:
+                for leg in legends:
+                    leg.set_title("")
+                    for text in leg.get_texts():
+                        text.set_text(re.sub(r"\s*\([^()]*±[^()]*\)$", "", text.get_text()))
+                    if all(text.get_text() == "all" for text in leg.get_texts()):
+                        leg.remove()
             if not show_axes:
+                if fig._suptitle is not None:
+                    fig._suptitle.set_text("")
                 for label in (fig._supxlabel, fig._supylabel):
                     if label is not None:
                         label.set_visible(False)
@@ -1135,10 +1422,93 @@ class CrossRunAnalysis:
                     ax.set_xlabel("")
                     ax.set_ylabel("")
                     ax.set_title("")
-        return figs
+        return [_hstack_figs(row) for row in figs] if split else figs
+
+    def _plot_silent(self, config, **kwargs):
+        calls, draw, show = [], _draw_stat, plt.show
+
+        def spy(ax, pos, vals, color, width, plot_type, errorbar="default"):
+            before = set(ax.get_children())
+            out = draw(ax, pos, vals, color, width, plot_type, errorbar)
+            calls.append((ax, pos, width, color, [a for a in ax.get_children() if a not in before]))
+            return out
+
+        globals()["_draw_stat"], plt.show = spy, lambda *a, **k: None
+        try:
+            figs = self._plot(config, **kwargs)
+        finally:
+            globals()["_draw_stat"], plt.show = draw, show
+        return (figs[0] if isinstance(figs, list) else figs), calls
+
+    def _plot_vs_paper(self, config, metrics=("f1",), agg=None, **kwargs):
+        def with_sources(c):
+            sources = c.get("phlag", ["msa"])
+            sources = [sources] if isinstance(sources, str) else list(sources)
+            return dict(c, phlag=[PAPER_SOURCE] + [x for x in sources if x != PAPER_SOURCE])
+        config = [with_sources(c) for c in config] if isinstance(config, (list, tuple)) else with_sources(config)
+        figs = [self._tpr_fpr_vs_paper(config, agg, **kwargs) if metric == "tpr_fpr"
+                else self._metric_vs_paper(config, metric, agg, **kwargs) for metric in metrics]
+        return figs[0] if len(figs) == 1 else figs
+
+    def _metric_vs_paper(self, config, metric, agg=None, plot_type="violin", errorbar="sem", **kwargs):
+        from matplotlib.colors import to_hex
+        if metric == "f1":
+            agg = agg or [("phlag", "-w"), "x_bin", "merged_category", "fraction_bin"]
+            paper_of = lambda row, col, label: PHLAG_PAPER_F1[row][col].get(label, (0.0, 0.0))
+        else:
+            agg = agg or [("phlag", "-w"), "", "merged_category", "fraction_bin"]
+            paper_of = lambda row, col, label: (PHLAG_PAPER_FPR_TPR[row][col][1 if metric == "tpr" else 0], 0.0)
+        fig, calls = self._plot_silent(config, metrics=[metric], agg=agg, plot_type=plot_type, errorbar=errorbar, **kwargs)
+        legend = fig.legends[0]
+        paper_idx = next(i for i, t in enumerate(legend.get_texts()) if t.get_text().startswith(PAPER_SOURCE))
+        paper_hex = to_hex(legend.legend_handles[paper_idx].get_facecolor())
+        rows = list(PHLAG_PAPER_F1)
+        for ax, pos, width, color, artists in calls:
+            if to_hex(color) != paper_hex:
+                continue
+            for a in artists:
+                a.remove()
+            spec = ax.get_subplotspec()
+            ticks = ax.get_xticks()
+            label = ax.get_xticklabels()[int(np.argmin(np.abs(ticks - pos)))].get_text()
+            mean, err = paper_of(rows[spec.rowspan.start], _MERGED_CATEGORY_ORDER[spec.colspan.start], label)
+            ax.bar(pos, mean, width=width * 0.92, color=paper_hex, zorder=2)
+            if err and errorbar is not None:
+                ax.errorbar(pos, mean, yerr=err, fmt="none", ecolor="black", elinewidth=1.0, capsize=2, zorder=3)
+        legend.get_texts()[paper_idx].set_text("Phlag (paper)")
+        return fig
+
+    def _tpr_fpr_vs_paper(self, config, agg=None, **kwargs):
+        from matplotlib.colors import to_hex
+        from matplotlib.lines import Line2D
+        agg = agg or [("phlag", "-w"), "", "merged_category", "fraction_bin"]
+        fig, _ = self._plot_silent(config, metrics=["tpr_fpr"], agg=agg, **kwargs)
+        source_legend = next(l for l in fig.legends if any(t.get_text().startswith(PAPER_SOURCE) for t in l.get_texts()))
+        entries = [(t.get_text(), to_hex(h.get_markerfacecolor() if isinstance(h, Line2D) else h.get_facecolor()[0]))
+                   for t, h in zip(source_legend.get_texts(), source_legend.legend_handles)]
+        paper_hex = next(c for label, c in entries if label.startswith(PAPER_SOURCE))
+        rows = list(PHLAG_PAPER_FPR_TPR)
+        for ax in fig.axes:
+            if ax.get_subplotspec() is None:
+                continue
+            for artist in list(ax.collections):
+                if len(artist.get_facecolor()) and all(to_hex(c) == paper_hex for c in artist.get_facecolor()):
+                    artist.remove()
+            for line in list(ax.lines):
+                if to_hex(line.get_color()) == paper_hex:
+                    line.remove()
+            spec = ax.get_subplotspec()
+            fpr, tpr = PHLAG_PAPER_FPR_TPR[rows[spec.rowspan.start]][_MERGED_CATEGORY_ORDER[spec.colspan.start]]
+            ax.scatter(fpr, tpr, marker="*", s=180, color=paper_hex, edgecolor="black", linewidth=0.6, zorder=6)
+        handles = [Line2D([], [], marker="*", ls="", ms=12, color=paper_hex, mec="black", label="Phlag (paper)")]
+        handles += [Line2D([], [], marker="o", ls="", color=c, label=label) for label, c in entries if not label.startswith(PAPER_SOURCE)]
+        fig.legend(handles=handles, loc="upper right", fontsize=8)
+        source_legend.remove()
+        return fig
 
     def _plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
-              title="", options=None, show_config_suffix=True, logy=False, dir="out"):
+              title="", options=None, show_config_suffix=True, logy=False, dir="out", shared=False, agg_idx=0,
+              errorbar="default", color=None, scalex=False, scaley=False):
         """`run` (a directory, e.g. "out/10X/down/N276/37-62") makes this a
         run-specific plot: `axes` is still the config dict, but it now only
         FILTERS the reports found under `run` (see collect_out_runs) instead of
@@ -1214,6 +1584,10 @@ class CrossRunAnalysis:
         (see _plot_tpr_fpr_grouped). A single-level (or no) agg keeps the old
         fixed fraction_bin x FIGURE_COLUMNS x_bin grid (_plot_tpr_fpr_grid).
 
+        agg_idx (multi-level agg only, incl. tpr_fpr): colors bars/points and builds the
+        legend from agg[agg_idx] instead of agg[0], without moving any axis
+        out of its layout slot -- see _plot_grouped.
+
         grid_by="hd_bin": each metric instead gets its OWN figure, gridded
         fraction_bin (rows, 2) x hd_bin (columns, HD_NUM_BINS=6) -- e.g.
         metrics=["f1"] with 2 configs gives 2 bars/cell x 2 rows x 6 columns.
@@ -1258,23 +1632,19 @@ class CrossRunAnalysis:
         itself fills the next role after agg's last one (one metric per
         subplot column with a 2-level agg, one per subplot row with a
         3-level agg) instead of each metric getting a separate figure -- see
-        _plot_heatmap. When
-        every x and y value parses as a positive number (e.g. agg=["-w",
-        "-s"]), both share one log-scaled numeric scale (see
-        _axis_edges/_plot_heatmap) -- cell width/height is proportional to
-        the actual log-space gap between consecutive values, not a fixed
-        size per category, so a window value and a step value that happen to
-        be equal land at the same physical position on their respective axes
-        (e.g. a (window, step) cell with step==window sits on the geometric
-        diagonal). Otherwise (e.g. em_hd_bin/em_gt_hd_bin/merged_category
-        values, which are category labels, not numbers) falls back to a
-        plain evenly-spaced categorical grid, same as _plot_heatmap_hd_bin's
-        hd_bin x fraction_bin grid. All of a figure's subplots share one
+        _plot_heatmap. Each of x/y whose tokens are all numeric (e.g. -w's
+        "w50k", outlier_pct's "25%") is placed at its real values (log if
+        positive and spanning >20x, else linear; options logx/logy force
+        it), otherwise categorical -- see _heatmap_axis. All of a figure's subplots share one
         color scale. A boolean agg axis in its off/negated state contributes
         no display value at all (see _combo_label_part), so mixing a bool
         toggle into agg[0]/agg[1] collapses that axis to one tick; stick to
         real-valued axes (like -w/-s, or a *_bin/merged_category axis) for
         x/y.
+
+        errorbar: "default" keeps bar=mean+-sem, violin=Tukey whiskers only;
+        "sd"/"sem" sets the bar error and overlays mean+-it on violins; None
+        draws no error bars or whiskers.
 
         Returns a list of Figures: the tpr_fpr grid first (if requested),
         then one figure per remaining metric (grid_by or heatmap set) or one
@@ -1320,25 +1690,56 @@ class CrossRunAnalysis:
             return self._plot_branches(axes, run, metrics, exclude_keywords=exclude_keywords, title=title, dir=dir)
         if run is not None:
             return self._plot_run(axes, run, metrics, exclude_keywords=exclude_keywords, logy=logy, title=title, dir=dir)
-        assert plot_type in ("bar", "violin", "heatmap")
+        assert plot_type in ("bar", "violin", "heatmap", "line")
         assert grid_by in (None, "hd_bin") or plot_type == "heatmap"
+        assert grid_by is None or plot_type != "line"
         options = options or {}
         logx, interp = bool(options.get("logx")), bool(options.get("interp"))
         logy = options.get("logy", logy)
         configs = self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords, agg=agg)
+        if shared is not False and shared is not None:
+            configs = self._shared_configs(configs, 1 if shared is True else shared)
         self._last_configs = configs
         suffix = self._title_suffix(configs) if show_config_suffix else ""
+        kw = dict(plot_type=plot_type, grid_by=grid_by, title=title, options=options, logx=logx, logy=logy,
+                  interp=interp, agg_idx=agg_idx, errorbar=errorbar, color=color, scalex=scalex, scaley=scaley)
+        levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
+        if levels <= 4:
+            return self._plot_resolved(configs, metrics, suffix, **kw)
+        split_idx = min(range(levels), key=lambda i: (len(self._axis_values(configs, i)), -i))
+        split_name = _axis_flag_label(self._agg_axis_names[configs[0][0]][split_idx])
+        order = self._axis_values(configs, split_idx)
+        groups = {}
+        for label, dirs in configs:
+            groups.setdefault(self._config_axes[label][split_idx], []).append((label, dirs))
+            for store in (self._config_axes, self._config_rank, self._agg_axis_names):
+                store[label] = type(store[label])(v for i, v in enumerate(store[label]) if i != split_idx)
+        kw["agg_idx"] = agg_idx - (agg_idx > split_idx)
+        per_group = [self._plot_resolved(groups[value], metrics, f"{suffix} — {split_name}={value}", **kw)
+                     for value in order]
+        return [list(row) for row in zip(*per_group)]
+
+    def _plot_resolved(self, configs, metrics, suffix, plot_type, grid_by, title, options, logx, logy, interp,
+                       agg_idx, errorbar, color, scalex, scaley):
         figs = []
+        levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
+        if agg_idx and not 0 <= agg_idx < levels:
+            raise ValueError(f"agg_idx={agg_idx} out of range for {levels} agg level(s)")
         if "tpr_fpr" in metrics:
-            levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
             tpr_fpr_title = _compose_title(suffix, title, "TPR/FPR")
             if levels >= 2:
-                figs.append(self._plot_tpr_fpr_grouped(configs, title=tpr_fpr_title))
+                figs.append(self._plot_tpr_fpr_grouped(configs, title=tpr_fpr_title, agg_idx=agg_idx))
             else:
                 figs.append(self._plot_tpr_fpr_grid(configs, title=tpr_fpr_title))
         metrics = [m for m in metrics if m != "tpr_fpr"]
         self.metrics = [m for panel in metrics for m in (panel if isinstance(panel, tuple) else (panel,))]
         if not metrics:
+            return figs
+
+        if plot_type == "line":
+            figs.extend(self._plot_beta_line(configs, metrics, title_suffix=suffix,
+                                             logx=options.get("logx", True), logy=logy, errorbar=errorbar,
+                                             color=color))
             return figs
 
         if plot_type == "heatmap":
@@ -1351,13 +1752,14 @@ class CrossRunAnalysis:
                     group_suffix = f"{suffix} — {axis_label}={group_value}"
                     figs.extend(self._plot_heatmap_hd_bin(group_configs, metrics, title_suffix=group_suffix))
             else:
-                figs.extend(self._plot_heatmap(configs, metrics, title_suffix=suffix))
+                figs.extend(self._plot_heatmap(configs, metrics, title_suffix=suffix,
+                                               scale=(scalex, scaley)))
             return figs
 
-        levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
         if levels >= 2 and grid_by is None:
             figs.extend(self._plot_grouped(configs, metrics, plot_type, title_suffix=suffix,
-                                            logx=logx, logy=logy, interp=interp))
+                                            logx=logx, logy=logy, interp=interp, agg_idx=agg_idx,
+                                            errorbar=errorbar))
             return figs
 
         colors = {label: _config_color(i) for i, (label, _) in enumerate(configs)}
@@ -1405,8 +1807,9 @@ class CrossRunAnalysis:
                             dd = d[(d["fraction_bin"] == fraction_bin) & (d["_hd_bin"] == hd_bin)]
                             if panel_col is not None:
                                 dd = dd[_is_true(dd[panel_col])]
-                            _assert_single_run(dd)
-                            cell_bounds.append(_draw_stat(ax, cfg_idx, dd[metric], colors[label], 1.0, plot_type))
+                            if self._agg_given:
+                                _assert_single_run(dd)
+                            cell_bounds.append(_draw_stat(ax, cfg_idx, dd[metric], colors[label], 1.0, plot_type, errorbar))
                         if plot_type == "violin" and not bounded:
                             _clip_axis_to_whiskers(ax, cell_bounds)
                 metric_part = metric if len(metrics) > 1 else ""
@@ -1447,12 +1850,12 @@ class CrossRunAnalysis:
                 ax.set_xscale("log")
                 tick_order = sorted(range(n), key=lambda i: positions[i])
                 ax.set_xticks([positions[i] for i in tick_order])
-                ax.set_xticklabels([legend_labels[i] for i in tick_order], rotation=30, ha="right", fontsize=7.5)
+                ax.set_xticklabels([legend_labels[i] for i in tick_order], rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                 ax.set_xlim(min(positions) / 1.5, max(positions) * 1.5)
             else:
                 ax.set_xlim(-0.7, n - 0.3)
                 ax.set_xticks(range(n))
-                ax.set_xticklabels(legend_labels, rotation=30, ha="right", fontsize=7.5)
+                ax.set_xticklabels(legend_labels, rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
             ax.yaxis.grid(True, linestyle="--", alpha=0.4)
             ax.set_axisbelow(True)
             if isinstance(panel, tuple):
@@ -1477,8 +1880,9 @@ class CrossRunAnalysis:
                         frac = (mi - (len(panel) - 1) / 2) / len(panel)
                         x = pos * (1 + frac * _LOG_SPAN) if use_logx else pos + frac * len(panel) * sub_width
                         w = pos * (_LOG_SPAN / len(panel)) if use_logx else sub_width
-                        _assert_single_run(dd)
-                        cell_bounds.append(_draw_stat(ax, x, dd[m], panel_colors[m], w, plot_type))
+                        if self._agg_given:
+                            _assert_single_run(dd)
+                        cell_bounds.append(_draw_stat(ax, x, dd[m], panel_colors[m], w, plot_type, errorbar))
                         if interp:
                             mean = dd[m].dropna().mean()
                             if not pd.isna(mean):
@@ -1512,8 +1916,9 @@ class CrossRunAnalysis:
                         d = d[_is_true(d[panel_col])]
                     pos = positions[cfg_idx]
                     w = pos * 0.5 if use_logx else 1.0
-                    _assert_single_run(d)
-                    cell_bounds.append(_draw_stat(ax, pos, d[metric], colors[label], w, plot_type))
+                    if self._agg_given:
+                        _assert_single_run(d)
+                    cell_bounds.append(_draw_stat(ax, pos, d[metric], colors[label], w, plot_type, errorbar))
                     if interp:
                         mean = d[metric].dropna().mean()
                         if not pd.isna(mean):
@@ -1549,6 +1954,18 @@ class CrossRunAnalysis:
         fig.tight_layout(rect=[0, 0, 1, _below_title_top(fig, cursor_y)])
         figs.append(fig)
         return figs
+
+    def _shared_configs(self, configs, axis=1):
+        def split(label):
+            values = list(self._config_axes.get(label, []))
+            own = values.pop(axis) if axis < len(values) else None
+            return own, tuple(values)
+        present = {}
+        for label, _ in configs:
+            own, rest = split(label)
+            present.setdefault(rest, set()).add(own)
+        common = set.intersection(*present.values()) if present else set()
+        return [(label, dirs) for label, dirs in configs if split(label)[0] in common]
 
     def _title_suffix(self, configs):
         """" -- <pooled-axis restriction>" appended to every plot figure
@@ -1643,9 +2060,9 @@ class CrossRunAnalysis:
         only genuine flag-based differences (including which window sizes
         are actually present) affect it. Used to attach an aggregate score
         to each legend entry in _plot_grouped/_plot_tpr_fpr_grouped. Std (not
-        IQR, 0.0 for a single window size) of the per-window-size means, to
-        match _draw_stat's own bar errorbar convention -- this is std across
-        window sizes' pooled means, not across raw rows or configs. Returns
+        IQR, matching _draw_stat's bar errorbar convention) is taken over
+        every experiment row within each window size (all configs sharing the
+        target value pooled), then averaged across window sizes. Returns
         {axis_value: (mean, std)}."""
         def axis_val(label):
             vals = self._config_axes.get(label, [])
@@ -1670,22 +2087,35 @@ class CrossRunAnalysis:
                 if panel_col is not None:
                     d = d[_is_true(d[panel_col])]
                 for window_size, sub in d.groupby("_window_size", dropna=False):
-                    m = sub[metric].dropna().mean()
-                    if not pd.isna(m):
-                        by_window.setdefault(window_size, []).append(m)
+                    vals = sub[metric].dropna()
+                    if not vals.empty:
+                        means, rows = by_window.setdefault(window_size, ([], []))
+                        means.append(vals.mean())
+                        rows.append(vals)
             window_means = pd.Series(
-                [pd.Series(ms, dtype=float).mean() for ms in by_window.values()], dtype=float,
+                [pd.Series(ms, dtype=float).mean() for ms, _ in by_window.values()], dtype=float,
             )
+            window_stds = pd.Series(
+                [pd.concat(rs).std() for _, rs in by_window.values()], dtype=float,
+            ).fillna(0.0)
             if window_means.empty:
                 values[target] = (float("nan"), float("nan"))
             else:
-                values[target] = (window_means.mean(), window_means.std() if len(window_means) > 1 else 0.0)
+                values[target] = (window_means.mean(), window_stds.mean())
         return values
 
-    def _plot_grouped(self, configs, metrics, plot_type, title_suffix="", logx=False, logy=False, interp=False):
+    def _plot_grouped(self, configs, metrics, plot_type, title_suffix="", logx=False, logy=False, interp=False,
+                      agg_idx=0, errorbar="default"):
         """logx/logy/interp: see plot()'s options= docstring -- applied per
         subplot here, since each (row, col) cell can have its own
         local_bar_vals (and therefore its own logx numeric-parseability).
+
+        agg_idx: which agg level drives bar color + the legend (default 0,
+        the hue axis). Layout roles stay fixed (agg[0] still offsets bars
+        within a group, agg[1..3] still bar-group/col/row) -- only coloring
+        and the legend's per-value pooled score switch to agg[agg_idx]. An
+        interp line (one per hue value) is drawn gray when its points span
+        more than one agg[agg_idx] value.
 
         One figure per metric, laid out by `configs`' per-config axis
         values (self._config_axes, set by resolve_configs_cartesian's agg --
@@ -1731,17 +2161,16 @@ class CrossRunAnalysis:
             vals = self._config_axes.get(label, [])
             return vals[idx] if idx < len(vals) else None
 
-        hue_vals = _ordered_unique(axis_val(label, 0) for label, _ in configs)
-        # bar/col/row (agg[1]/[2]/[3]) sorted numerically-aware -- see the
-        # identical comment in _plot_tpr_fpr_grouped.
-        bar_vals = sorted(_ordered_unique(axis_val(label, 1) for label, _ in configs), key=_token_sort_key)
-        col_vals = sorted(_ordered_unique(axis_val(label, 2) for label, _ in configs), key=_token_sort_key)
-        row_vals = sorted(_ordered_unique(axis_val(label, 3) for label, _ in configs), key=_token_sort_key)
+        hue_vals = self._axis_values(configs, 0)
+        bar_vals = self._axis_values(configs, 1)
+        col_vals = self._axis_values(configs, 2)
+        row_vals = self._axis_values(configs, 3)
         agg_names = self._agg_axis_names.get(configs[0][0], []) if configs else []
         bar_axis_label = _axis_flag_label(agg_names[1]) if len(agg_names) > 1 else ""
 
         hue_idx, bar_idx = 0, 1
-        pooled_legend = hue_vals == ["(none)"] and len(bar_vals) > 1
+        leg_vals = self._axis_values(configs, agg_idx)
+        pooled_legend = leg_vals == ["(none)"] and bar_vals != ["(none)"]
 
         by_key = {}
         for label, dirs in configs:
@@ -1767,7 +2196,13 @@ class CrossRunAnalysis:
             for rv in row_vals for cv in col_vals
         }
 
-        colors = {hv: _config_color(i) for i, hv in enumerate(hue_vals)}
+        colors = {lv: _config_color(i) for i, lv in enumerate(leg_vals)}
+        color_of = {label: colors[axis_val(label, agg_idx)] for label, _ in configs}
+
+        def interp_color(hv, pts):
+            cs = {c for _, _, c in pts}
+            return cs.pop() if len(cs) == 1 else "#888888"
+
         n_rows, n_cols = len(row_vals), len(col_vals)
         bar_width = 0.82 / max(len(hue_vals), 1)
 
@@ -1803,12 +2238,12 @@ class CrossRunAnalysis:
                     if use_logx:
                         ax.set_xscale("log")
                         ax.set_xticks(positions)
-                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", fontsize=7.5)
+                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                         ax.set_xlim(min(positions) / 1.5, max(positions) * 1.5)
                     else:
                         ax.set_xlim(-0.7, len(cell_bar_vals) - 0.3)
                         ax.set_xticks(range(len(cell_bar_vals)))
-                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", fontsize=7.5)
+                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
                     ax.set_axisbelow(True)
                     bounded = False
@@ -1834,34 +2269,36 @@ class CrossRunAnalysis:
                             frac = (hi - (len(hue_vals) - 1) / 2) / max(len(hue_vals), 1)
                             x = pos * (1 + frac * _LOG_SPAN) if use_logx else bi + frac * len(hue_vals) * bar_width
                             w = pos * (_LOG_SPAN / max(len(hue_vals), 1)) if use_logx else bar_width
-                            _assert_single_run(d)
-                            cell_bounds.append(_draw_stat(ax, x, d[this_metric], colors[hv], w, plot_type))
+                            if self._agg_given:
+                                _assert_single_run(d)
+                            cell_bounds.append(_draw_stat(ax, x, d[this_metric], color_of[label], w, plot_type, errorbar))
                             if interp:
                                 mean = d[this_metric].dropna().mean()
                                 if not pd.isna(mean):
-                                    interp_points[hv].append((pos, mean))
+                                    interp_points[hv].append((pos, mean, color_of[label]))
                     if plot_type == "violin" and not bounded:
                         _clip_axis_to_whiskers(ax, cell_bounds)
                     if interp:
                         for hv in hue_vals:
-                            pts = sorted(interp_points[hv])
+                            pts = sorted(interp_points[hv], key=lambda p: p[0])
                             if len(pts) > 1:
-                                xs, ys = zip(*pts)
-                                ax.plot(xs, ys, "-", color=colors[hv], linewidth=1.3, alpha=0.85, zorder=4)
+                                xs, ys, _ = zip(*pts)
+                                ax.plot(xs, ys, "-", color=interp_color(hv, pts), linewidth=1.3, alpha=0.85, zorder=4)
             _suptitle(fig, _compose_title(title_suffix, ""), fontsize=12, y=0.99)
             if bar_axis_label and grid_rows * grid_cols == 1:
                 fig.supxlabel(bar_axis_label, fontsize=9)
-            if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
-                handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in hue_vals]
-                fig.legend(handles, [str(hv) for hv in hue_vals], loc="center left",
-                           bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
+            if pooled_legend or len(leg_vals) > 1 or leg_vals not in ([None], ["(none)"]):
+                handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[lv]) for lv in leg_vals]
+                legend = fig.legend(handles, [str(lv) for lv in leg_vals], loc="center left",
+                                    bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             figs.append(fig)
             return figs
 
         for metric in metrics:
             panel_col = _METRIC_PANEL_COLUMN.get(metric)
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 3.6 * n_rows), squeeze=False)
+            cell_w = min(16.0, max(3.2, 0.07 * len(hue_vals) * max((len(v) for v in local_bar_vals.values()), default=1)))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(cell_w * n_cols, 3.6 * n_rows), squeeze=False)
             for ri, rv in enumerate(row_vals):
                 for ci, cv in enumerate(col_vals):
                     ax = axes[ri][ci]
@@ -1872,12 +2309,12 @@ class CrossRunAnalysis:
                     if use_logx:
                         ax.set_xscale("log")
                         ax.set_xticks(positions)
-                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", fontsize=7.5)
+                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                         ax.set_xlim(min(positions) / 1.5, max(positions) * 1.5)
                     else:
                         ax.set_xlim(-0.7, len(cell_bar_vals) - 0.3)
                         ax.set_xticks(range(len(cell_bar_vals)))
-                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", fontsize=7.5)
+                        ax.set_xticklabels(cell_bar_vals, rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
                     ax.set_axisbelow(True)
                     bounded = False
@@ -1909,43 +2346,45 @@ class CrossRunAnalysis:
                             frac = (hi - (len(hue_vals) - 1) / 2) / max(len(hue_vals), 1)
                             x = pos * (1 + frac * _LOG_SPAN) if use_logx else bi + frac * len(hue_vals) * bar_width
                             w = pos * (_LOG_SPAN / max(len(hue_vals), 1)) if use_logx else bar_width
-                            _assert_single_run(d)
-                            cell_bounds.append(_draw_stat(ax, x, d[metric], colors[hv], w, plot_type))
+                            if self._agg_given:
+                                _assert_single_run(d)
+                            cell_bounds.append(_draw_stat(ax, x, d[metric], color_of[label], w, plot_type, errorbar))
                             if interp:
                                 mean = d[metric].dropna().mean()
                                 if not pd.isna(mean):
-                                    interp_points[hv].append((pos, mean))
+                                    interp_points[hv].append((pos, mean, color_of[label]))
                     if plot_type == "violin" and not bounded:
                         _clip_axis_to_whiskers(ax, cell_bounds)
                     if interp:
                         for hv in hue_vals:
-                            pts = sorted(interp_points[hv])
+                            pts = sorted(interp_points[hv], key=lambda p: p[0])
                             if len(pts) > 1:
-                                xs, ys = zip(*pts)
-                                ax.plot(xs, ys, "-", color=colors[hv], linewidth=1.3, alpha=0.85, zorder=4)
+                                xs, ys, _ = zip(*pts)
+                                ax.plot(xs, ys, "-", color=interp_color(hv, pts), linewidth=1.3, alpha=0.85, zorder=4)
             _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
             # A single subplot's bar categories aren't otherwise labeled
             # anywhere, so the shared axis label carries real information
             # there -- but a multi-subplot grid repeats the same bar
             # categories (and now, since _combo_label_part canonicalizes bool
             # flags to their long form, self-explanatory tick labels like
-            # "ilr"/"no-ilr") in every column, making one more copy centered
+            # "ilr"/"(base)") in every column, making one more copy centered
             # under the whole figure redundant.
             if bar_axis_label and n_rows * n_cols == 1:
                 fig.supxlabel(bar_axis_label, fontsize=9)
             fig.supylabel(metric, fontsize=9)
-            if pooled_legend or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
-                hue_metric_values = self._metric_by_axis_value(configs, hue_idx, metric, panel_col)
-                handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in hue_vals]
+            if pooled_legend or len(leg_vals) > 1 or leg_vals not in ([None], ["(none)"]):
+                hue_metric_values = self._metric_by_axis_value(configs, agg_idx, metric, panel_col)
+                legend_hue_vals = [hv for hv in leg_vals if not pd.isna(hue_metric_values[hv][0])]
+                handles = [plt.Rectangle((0, 0), 1, 1, facecolor=colors[hv]) for hv in legend_hue_vals]
                 if pooled_legend:
                     hue_legend_labels = [
                         f"all ({metric}={hue_metric_values[hv][0]:.4f}±{hue_metric_values[hv][1]:.4f})"
-                        for hv in hue_vals
+                        for hv in legend_hue_vals
                     ]
                 else:
                     hue_legend_labels = [
                         f"{hv} ({metric}={hue_metric_values[hv][0]:.4f}±{hue_metric_values[hv][1]:.4f})"
-                        for hv in hue_vals
+                        for hv in legend_hue_vals
                     ]
                 # Outside the axes to the right, not stacked above them --
                 # a long hue sweep (e.g. every -w value) makes a tall legend
@@ -1955,13 +2394,101 @@ class CrossRunAnalysis:
                 # bbox_inches="tight" by default, so a legend anchored past
                 # the figure's right edge just grows the saved/displayed
                 # canvas sideways instead of colliding with anything.
-                fig.legend(handles, hue_legend_labels, loc="center left",
-                           bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
+                legend = fig.legend(handles, hue_legend_labels, loc="center left",
+                                    bbox_to_anchor=(1.0, _title_bottom(fig) / 2), fontsize=8, framealpha=0.9)
+            _fit_fig_to_axes(fig, axes, cell_w - 0.8, 2.6, rect=[0, 0, 1, 0.95])
+            figs.append(fig)
+        return figs
+
+    def _plot_beta_line(self, configs, metrics, title_suffix="", logx=True, logy=False, errorbar="default", color=None):
+        bi = self._beta_axis_idx
+        if bi is None:
+            raise ValueError('plot_type="line" needs a ("--beta", "--beta-prime") tuple in agg')
+
+        def layout_vals(label):
+            vals = [v for i, v in enumerate(self._config_axes.get(label, [])) if i != bi] + [None] * 3
+            implicit = self._config_implicit.get(label) if bi == 0 else ""
+            if implicit:
+                vals[0] = implicit if vals[0] in (None, "(none)", "(base)") else f"{vals[0]} {implicit}"
+            return tuple(vals[:3])
+
+        layout = {label: layout_vals(label) for label, _ in configs}
+        hue_vals = _ordered_unique(h for h, _, _ in layout.values())
+        col_vals = sorted(_ordered_unique(c for _, c, _ in layout.values()), key=_token_sort_key)
+        row_vals = sorted(_ordered_unique(r for _, _, r in layout.values()), key=_token_sort_key)
+        if color is None:
+            colors = {hv: _config_color(i) for i, hv in enumerate(hue_vals)}
+        else:
+            colors = {hv: _gradient_color(color, i / max(len(hue_vals) - 1, 1)) for i, hv in enumerate(hue_vals)}
+        dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
+
+        figs = []
+        for metric in metrics:
+            assert isinstance(metric, str), f'plot_type="line" takes scalar metrics, got {metric!r}'
+            panel_col = _METRIC_PANEL_COLUMN.get(metric)
+            points, baselines = {}, {}
+            for label, _ in configs:
+                d = dfs[label]
+                if d.empty or metric not in d.columns:
+                    continue
+                if panel_col is not None:
+                    d = d[_is_true(d[panel_col])]
+                if self._agg_given:
+                    _assert_single_run(d)
+                vals = d[metric].dropna()
+                if vals.empty:
+                    continue
+                hv, cv, rv = layout[label]
+                stat = (vals.mean(), 0.0 if errorbar is None else _spread(vals, "sd" if errorbar == "default" else errorbar))
+                beta = self._config_beta.get(label)
+                if beta is None:
+                    baselines[(rv, cv, hv)] = stat
+                else:
+                    points.setdefault((rv, cv, hv), []).append((beta, *stat))
+            n_rows, n_cols = len(row_vals), len(col_vals)
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.6 * n_cols, 3.0 * n_rows), squeeze=False)
+            for ri, rv in enumerate(row_vals):
+                for ci, cv in enumerate(col_vals):
+                    ax = axes[ri][ci]
+                    xs_all = [p[0] for hv in hue_vals for p in points.get((rv, cv, hv), [])]
+                    if logx and xs_all and min(xs_all) > 0:
+                        ax.set_xscale("log")
+                    if _resolve_logy(logy, dfs, metric):
+                        ax.set_yscale("log")
+                    else:
+                        _apply_bounded_yaxis(ax, metric)
+                    ax.grid(True, linestyle="--", alpha=0.4)
+                    ax.set_axisbelow(True)
+                    for hv in hue_vals:
+                        pts = sorted(points.get((rv, cv, hv), []))
+                        if pts:
+                            xs, ys, es = zip(*pts)
+                            ax.errorbar(xs, ys, yerr=None if errorbar is None else es, fmt="-o",
+                                        markersize=2.5, color=colors[hv],
+                                        linewidth=1.3, elinewidth=0.8, capsize=2, zorder=3)
+                        if (rv, cv, hv) in baselines:
+                            ax.axhline(baselines[(rv, cv, hv)][0], color=colors[hv], linestyle=":",
+                                       linewidth=1.2, alpha=0.8, zorder=2)
+                    if ri == 0 and cv not in (None, "(none)"):
+                        ax.set_title(str(cv), fontsize=9)
+                    if ci == 0 and rv not in (None, "(none)"):
+                        ax.set_ylabel(str(rv), fontsize=9)
+            _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
+            fig.supxlabel("beta (raw; beta' x n_windows)", fontsize=9)
+            fig.supylabel(metric, fontsize=9)
+            if len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
+                handles = [matplotlib.lines.Line2D([], [], color=colors[hv]) for hv in hue_vals]
+                labels = [str(hv) for hv in hue_vals]
+                if baselines:
+                    handles.append(matplotlib.lines.Line2D([], [], color="black", linestyle=":"))
+                    labels.append("no prior")
+                fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.0, _title_bottom(fig) / 2),
+                           fontsize=8, framealpha=0.9)
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             figs.append(fig)
         return figs
 
-    def _plot_heatmap(self, configs, metrics, title_suffix=""):
+    def _plot_heatmap(self, configs, metrics, title_suffix="", scale=(False, False)):
         """Cells colored by metric's mean value on an x (agg[0]) by y
         (agg[1]) grid; a 3rd agg axis (agg[2]) splits into subplot columns,
         a 4th (agg[3]) into subplot rows -- same agg[0..3] role layout as
@@ -1981,15 +2508,12 @@ class CrossRunAnalysis:
         shading is comparable across e.g. merged_category columns, or
         across metrics when metrics fills a role.
 
-        x/y share one log-scaled numeric scale (see _axis_edges) -- cell
-        width/height proportional to the actual log-space gap between
-        consecutive values, not a fixed per-category size, e.g. a (window,
-        step) cell with step==window sits on the geometric diagonal -- ONLY
-        when every x and y value parses as a positive float (the -w/-s use
-        case). Otherwise (e.g. em_hd_bin/merged_category values, which are
-        category labels, not numbers) falls back to a plain evenly-spaced
-        categorical grid, one cell per (x, y) pair, same as
-        _plot_heatmap_hd_bin's hd_bin x fraction_bin grid.
+        x and y are scaled independently (see _heatmap_axis): an axis whose
+        tokens all parse as numbers (_token_to_number, e.g. "w50k", "25%")
+        is placed at its real values, cell size proportional to the gap --
+        log when positive and spanning >20x, else linear; scale=(logx, logy)
+        forces either (None = auto). A non-numeric axis (em_hd_bin/
+        merged_category labels) stays an evenly-spaced categorical grid.
 
         A metric name ending in "_signed" (e.g. "f1_signed" for the real
         column "f1" -- see _signed_base_metric) renders that real metric as
@@ -1997,8 +2521,8 @@ class CrossRunAnalysis:
         column's grid, cell by cell, within the same row -- i.e. agg[2]
         (the 3rd agg axis, which this method puts on subplot columns) gets
         treated as "baseline vs. variants": the null/baseline column is
-        whichever col_vals entry is a flag's off/negated ("(none)") or
-        missing ("no-<flag>") display state if one is present, else
+        whichever col_vals entry is a flag's off/negated or missing
+        ("(base)") display state if one is present, else
         col_vals[0] (its first/leftmost value, in whatever order `agg`
         or _discover_flag_tuple_values' sort produced -- e.g. the "no
         special flags" combo for a tuple axis) -- see _null_col_val. The
@@ -2024,6 +2548,13 @@ class CrossRunAnalysis:
         agg_names = self._agg_axis_names.get(configs[0][0], []) if configs else []
         x_axis_label = _axis_flag_label(agg_names[0]) if len(agg_names) > 0 else ""
         y_axis_label = _axis_flag_label(agg_names[1]) if len(agg_names) > 1 else ""
+        vs_window = any("window size" in _axis_flag_label(n) for n in agg_names[:2])
+        x_tick_fmt = _outlier_sites_label if vs_window and agg_names[:1] == ["outlier_pct"] else str
+        y_tick_fmt = _outlier_sites_label if vs_window and agg_names[1:2] == ["outlier_pct"] else str
+        if x_tick_fmt is not str:
+            x_axis_label = "outlier sites (%)"
+        if y_tick_fmt is not str:
+            y_axis_label = "outlier sites (%)"
 
         n_agg_levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
         metric_role = n_agg_levels if len(metrics) > 1 and n_agg_levels in (2, 3) else None
@@ -2039,27 +2570,8 @@ class CrossRunAnalysis:
 
         dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
 
-        numeric = True
-        try:
-            x_nums = [float(v) for v in x_vals]
-            y_nums = [float(v) for v in y_vals]
-            if min(x_nums, default=1.0) <= 0 or min(y_nums, default=1.0) <= 0:
-                numeric = False
-        except (TypeError, ValueError):
-            numeric = False
-        if numeric:
-            x_vals = [v for _, v in sorted(zip(x_nums, x_vals))]
-            y_vals = [v for _, v in sorted(zip(y_nums, y_vals))]
-            x_nums = sorted(x_nums)
-            y_nums = sorted(y_nums)
-            x_edges = _axis_edges(x_nums, log=True)
-            y_edges = _axis_edges(y_nums, log=True)
-            tick_x, tick_y = x_nums, y_nums
-        else:
-            x_vals = sorted(x_vals, key=_token_sort_key)
-            y_vals = sorted(y_vals, key=_token_sort_key)
-            tick_x = [i + 0.5 for i in range(len(x_vals))]
-            tick_y = [i + 0.5 for i in range(len(y_vals))]
+        x_vals, x_edges, tick_x, x_scale = _heatmap_axis(x_vals, scale[0])
+        y_vals, y_edges, tick_y, y_scale = _heatmap_axis(y_vals, scale[1])
 
         n_rows, n_cols = len(row_vals), len(col_vals)
         outer_metrics = [None] if metric_role else metrics
@@ -2157,25 +2669,22 @@ class CrossRunAnalysis:
                         cmap, vmin, vmax = "RdBu", diff_vmin, diff_vmax
                     else:
                         cmap, vmin, vmax = "Blues", raw_vmin, raw_vmax
-                    if numeric:
-                        ax.set_xscale("log")
-                        ax.set_yscale("log")
-                        mesh = ax.pcolormesh(x_edges, y_edges, grid, cmap=cmap, vmin=vmin, vmax=vmax, shading="flat")
-                    else:
-                        mesh = ax.pcolormesh(grid, cmap=cmap, vmin=vmin, vmax=vmax, shading="flat")
+                    ax.set_xscale(x_scale)
+                    ax.set_yscale(y_scale)
+                    mesh = ax.pcolormesh(x_edges, y_edges, grid, cmap=cmap, vmin=vmin, vmax=vmax, shading="flat")
                     if is_diff.get((rv, cv)):
                         diff_mesh = mesh
                     else:
                         raw_mesh = mesh
                     ax.set_xticks(tick_x)
-                    ax.set_xticklabels(x_vals, rotation=30, ha="right", fontsize=7.5)
+                    ax.set_xticklabels([x_tick_fmt(v) for v in x_vals], rotation=30, ha="right", rotation_mode="anchor", fontsize=7.5)
                     ax.set_yticks(tick_y)
                     # Only the leftmost column in each row needs y-tick text --
                     # every subplot got its own labels before, which rendered
                     # on top of the previous (left-neighbor) subplot's data
                     # cells once panels were packed close together.
                     if ci == 0:
-                        ax.set_yticklabels(y_vals, fontsize=7.5)
+                        ax.set_yticklabels([y_tick_fmt(v) for v in y_vals], fontsize=7.5)
                     else:
                         ax.set_yticklabels([])
                     for yi, yn in enumerate(tick_y):
@@ -2202,16 +2711,15 @@ class CrossRunAnalysis:
                 # Ordinary (unsigned) heatmap, or a signed one whose baseline
                 # column is the only thing being shown -- one colorbar, right
                 # side, exactly as before.
+                fig.subplots_adjust(left=max(0.12, 0.9 / fig.get_figwidth()), bottom=0.2, right=0.88, top=_title_bottom(fig, 0.88), wspace=0.3, hspace=0.35)
                 if raw_mesh is not None:
                     fig.colorbar(raw_mesh, ax=all_axes, label=base_label, fraction=0.05, pad=0.02, location="right")
-                fig.subplots_adjust(left=0.12, bottom=0.2, right=0.88, top=_title_bottom(fig, 0.88), wspace=0.3, hspace=0.35)
             else:
                 # Split, rather than stack, when both are present: the diff
                 # colorbar keeps the usual right side (unaffected below), the
                 # raw/baseline one goes on the left -- stacking both on the same
                 # side left no room for the row-label text and y-tick bin
                 # labels between them and the subplot grid.
-                fig.colorbar(diff_mesh, ax=all_axes, label=f"Δ {base_label}", fraction=0.05, pad=0.02, location="right")
                 # A fixed left pad guess doesn't scale to whatever the leftmost
                 # column's y-tick labels actually render as -- a bin-range
                 # label like "(0.833,1.000]" is much wider than a short numeric
@@ -2223,6 +2731,7 @@ class CrossRunAnalysis:
                 # -- unlike ax=/location=, doesn't reflow other axes) snug
                 # against whatever that measured extent turns out to be.
                 fig.subplots_adjust(left=0.32, bottom=0.2, right=0.85, top=_title_bottom(fig, 0.88), wspace=0.3, hspace=0.35)
+                fig.colorbar(diff_mesh, ax=all_axes, label=f"Δ {base_label}", fraction=0.05, pad=0.02, location="right")
                 fig.canvas.draw()
                 renderer = fig.canvas.get_renderer()
                 fig_w, fig_h = fig.bbox.width, fig.bbox.height
@@ -2282,7 +2791,7 @@ class CrossRunAnalysis:
                 ax = axes[0][idx]
                 mesh = ax.pcolormesh(grids[idx], cmap="Blues", vmin=vmin, vmax=vmax, shading="flat")
                 ax.set_xticks([i + 0.5 for i in range(n_cols)])
-                ax.set_xticklabels(hd_bins, rotation=45, ha="right", fontsize=6.5)
+                ax.set_xticklabels(hd_bins, rotation=45, ha="right", rotation_mode="anchor", fontsize=6.5)
                 if idx == 0:
                     ax.set_yticks([i + 0.5 for i in range(n_rows)])
                     ax.set_yticklabels(FRACTION_BINS, fontsize=7.5)
@@ -2331,6 +2840,18 @@ _OUT_GT_STATS_COLUMNS = [
         + [f"within_var_{t}" for t in TOPOLOGY_NAMES]
     )
 ]
+_OUT_TRANSITION_TOTAL_COLUMNS = [f"{prefix}_transition_total" for prefix in ("fitted", "gt", "viterbi")]
+_OUT_RUN_COLUMNS = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_TRANSITION_TOTAL_COLUMNS + _OUT_GT_STATS_COLUMNS
+
+
+def _out_transition_totals(parsed):
+    totals = {"fitted_transition_total": transition_total(parsed)}
+    for prefix in ("gt", "viterbi"):
+        to_alt, to_null = parsed[f"{prefix}_transition_null_to_alt"], parsed[f"{prefix}_transition_alt_to_null"]
+        totals[f"{prefix}_transition_total"] = None if to_alt is None or to_null is None else to_alt + to_null
+    return totals
+
+
 _OUT_SIZE_SEGMENT = re.compile(r"^([wc])\d+[km]?_s\d+[km]?(.*)$", re.IGNORECASE)
 
 
@@ -2471,6 +2992,7 @@ def collect_out_runs(path, exclude_keywords=(), windowless=False):
         parsed = parse_report(report)
         row = {"report_path": str(report), "mode": mode, "window": window, "step": step, "_tokens": [t for t in tokens if t]}
         row.update({col: parsed[key] for col, key in _OUT_RUN_METRIC_KEYS.items()})
+        row.update(_out_transition_totals(parsed))
         if not windowless:
             row.update(_out_gt_stats_columns(report))
         records.append(row)
@@ -2483,7 +3005,7 @@ def collect_out_runs(path, exclude_keywords=(), windowless=False):
     for r in records:
         r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(none)"
     df = pd.DataFrame(records)
-    return df.reindex(columns=OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS)
+    return df.reindex(columns=_OUT_RUN_COLUMNS)
 
 
 def collect_store_runs(rel, root=STORE_ROOT, exclude_keywords=()):
@@ -2510,6 +3032,7 @@ def collect_store_runs(rel, root=STORE_ROOT, exclude_keywords=()):
                "window": args.get("window_size"), "step": args.get("step_size"),
                "_tokens": [p for p in leaf.relative_to(root).parts if not _OUT_SIZE_SEGMENT.match(p)]}
         row.update({col: parsed[key] for col, key in _OUT_RUN_METRIC_KEYS.items()})
+        row.update(_out_transition_totals(parsed))
         runs = pd.read_csv(leaf / "runs.tsv", sep="\t")
         match = runs[(runs["source_leaf"] == source_leaf) & (runs["pattern"].astype(str) == pattern)]
         if not match.empty:
@@ -2525,7 +3048,7 @@ def collect_store_runs(rel, root=STORE_ROOT, exclude_keywords=()):
     for r in records:
         r["config"] = "/".join(r.pop("_tokens")[shared:]) or "(none)"
     df = pd.DataFrame(records)
-    return df.reindex(columns=OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS), recorded
+    return df.reindex(columns=_OUT_RUN_COLUMNS), recorded
 
 
 def _windowless_source_of(d):
@@ -2587,7 +3110,7 @@ def _collect_run_df(axes, path, exclude_keywords=(), dir="out", store_root=STORE
                 d, _ = _filter_out_runs(d, axes)
             d = d.assign(config=[source if c == "(none)" else f"{source}/{c}" for c in d["config"]])
             frames.append(d.dropna(axis=1, how="all"))
-        columns = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_GT_STATS_COLUMNS
+        columns = _OUT_RUN_COLUMNS
         df = pd.concat(frames, ignore_index=True).reindex(columns=columns) if frames else pd.DataFrame()
     if df.empty:
         raise ValueError(f"No report under {path} matches {axes} (phlag={sources})")
@@ -2728,7 +3251,7 @@ def _matches_flags(recorded, flags):
             raise KeyError(f"{flag!r} is not one of benchmark.py's mirrored caster/phlag flags")
         value = _recorded_value(recorded, dest)
         if requirement is None:
-            if value is not None and value is not False:
+            if value is not None and value is not False and value != _RECORDED_DEFAULTS.get(dest):
                 return False
         else:
             typed_requirement = _typed_value(flag, requirement)
@@ -2772,13 +3295,26 @@ def _axis_flag_label(name):
     return _strip_flag(name).replace("-", " ").replace("_", " ")
 
 
-def _pool_axes_label(pool_axes):
+def _tuple_member_label(flag, value):
+    if value is None or value is False:
+        return None
+    name = "beta'" if flag == "--beta-prime" else _strip_flag(_canonical_flag_name(flag))
+    return f"{name}={value:g}" if isinstance(value, (int, float)) and not isinstance(value, bool) else f"{name}={value}"
+
+
+def _pool_axes_label(pool_axes, exclude=()):
     """Display text for resolve_configs_cartesian's pooled (non-agg) axes --
     e.g. {"-w": ["50k"], "-s": ["40k"]} -> "w 50k s 40k" -- used as
     plot's title suffix so a figure states what its configs were
-    restricted to instead of how many there are."""
+    restricted to instead of how many there are. Flags in `exclude`
+    (those still at CrossRunAnalysis.title_base's value) are left out."""
     parts = []
     for flag, spec in pool_axes.items():
+        if flag in exclude:
+            continue
+        dest = _FLAG_TO_DEST.get(flag)
+        if spec is None or spec is False or (dest in _RECORDED_DEFAULTS and spec == _RECORDED_DEFAULTS[dest]):
+            continue
         name = _strip_flag(flag) if flag in _FLAG_TO_DEST else flag
         val_str = ",".join(str(v) for v in spec) if isinstance(spec, list) else str(spec)
         parts.append(f"{name} {val_str}")
@@ -2788,10 +3324,9 @@ def _pool_axes_label(pool_axes):
 def _combo_label_part(flag, requirement):
     """Display text for one axis's state in a suffix combo label: a True value renders as
     its bare value (value flags, e.g. "repulsion" for {"--ap": "repulsion"}) or bare flag
-    name stripped of leading dashes (bool flags, e.g. "annealing"); requirement=None (the
-    flag is missing from args.json) renders as "no-<flag>"; a False value
-    is dropped entirely (returns None) rather than shown with a "!" prefix, since it's
-    the default/off state for a store_true flag. -w/-s
+    name stripped of leading dashes (bool flags, e.g. "annealing"); a False or None (missing
+    from args.json) value is dropped entirely (returns None), since it's the
+    default/off state -- a config with nothing left renders as "(base)". -w/-s
     specifically render as "w"/"s" glued directly onto their value, shortened to a
     k/m suffix like the rest of the codebase (e.g. {"-w": "50000"} -> "w50k"). A
     fractional -s value (e.g. 0.8, meaning 80% of whatever window it ends up
@@ -2800,15 +3335,27 @@ def _combo_label_part(flag, requirement):
     until matched against a specific window."""
     if requirement is True:
         return _strip_flag(_canonical_flag_name(flag))
-    if requirement is False:
+    if requirement is False or requirement is None:
         return None
-    if requirement is None:
-        return f"no-{_strip_flag(_canonical_flag_name(flag))}"
     if flag == "-s" and (frac := _as_step_fraction(requirement)) is not None:
         return f"s{frac:g}"
     if flag in ("-w", "-s"):
         return f"{_strip_flag(flag)}{_format_param_value(_typed_value(flag, requirement))}"
     return str(requirement)
+
+
+def _implicit_flag_part(flag, recorded):
+    dest = _FLAG_TO_DEST[flag]
+    value = recorded.get(dest)
+    if dest == "window_size":
+        return _combo_label_part("-w", value)
+    if dest == "step_size":
+        return None if value is None or value == recorded.get("window_size") else _combo_label_part("-s", value)
+    if value is True:
+        return _strip_flag(flag)
+    if value is None or value is False or value == _PARSER._option_string_actions[flag].default:
+        return None
+    return _tuple_member_label(flag, value)
 
 
 def _combo_label(flags, empty_label):
@@ -2891,9 +3438,16 @@ def _assert_single_run(df):
     )
 
 
-def _draw_stat(ax, pos, vals, color, width, plot_type):
-    """Draws one config's distribution at x=pos: plot_type="bar" is mean+std
-    errorbar (matching production's errorbar="sd"); "violin" is the
+def _spread(vals, errorbar):
+    assert errorbar in ("sd", "sem"), errorbar
+    if len(vals) < 2:
+        return 0.0
+    return vals.std() / np.sqrt(len(vals)) if errorbar == "sem" else vals.std()
+
+
+def _draw_stat(ax, pos, vals, color, width, plot_type, errorbar="default"):
+    """Draws one config's distribution at x=pos: plot_type="bar" is mean+sem
+    errorbar; "violin" is the
     distribution as a standard box-and-whisker would show it -- the body's
     KDE is built only from values inside the Tukey whisker
     [Q1-1.5*IQR, Q3+1.5*IQR] (matplotlib's own showextrema draws the data's
@@ -2901,7 +3455,10 @@ def _draw_stat(ax, pos, vals, color, width, plot_type):
     outliers), with the whisker itself drawn as a line and anything beyond it
     scattered as faint outlier dots so it isn't silently dropped. Falls back
     to a single dot when there's only one value (violinplot's KDE needs at
-    least 2). Returns the (lo, hi) "inlier" range actually worth showing to
+    least 2). errorbar: "default" keeps those (bar: sem; violin: whiskers
+    only); "sd"/"sem" sets the bar's error and overlays mean+-that on violins;
+    None draws neither.
+    Returns the (lo, hi) "inlier" range actually worth showing to
     scale (excludes outlier dots) -- None if nothing was drawn -- so the
     caller can clip the axis to it and mark the break (see
     _clip_axis_to_whiskers)."""
@@ -2910,8 +3467,10 @@ def _draw_stat(ax, pos, vals, color, width, plot_type):
         return None
     if plot_type == "bar":
         mean = vals.mean()
-        err = vals.std() if len(vals) > 1 else 0.0
         ax.bar(pos, mean, width=width * 0.92, color=color, zorder=2)
+        if errorbar is None:
+            return (mean, mean)
+        err = _spread(vals, "sem" if errorbar == "default" else errorbar)
         ax.errorbar(pos, mean, yerr=err, fmt="none", ecolor="black",
                      elinewidth=1.0, capsize=2, zorder=3)
         return (mean - err, mean + err)
@@ -2932,7 +3491,8 @@ def _draw_stat(ax, pos, vals, color, width, plot_type):
                 body.set_alpha(0.65)
             vp["cmeans"].set_edgecolor("black")
             vp["cmeans"].set_linewidth(1.0)
-            ax.plot([pos, pos], [inliers.min(), inliers.max()], color="black", linewidth=1.0, zorder=2.5)
+            if errorbar is not None:
+                ax.plot([pos, pos], [inliers.min(), inliers.max()], color="black", linewidth=1.0, zorder=2.5)
             bounds = (inliers.min(), inliers.max())
         elif not inliers.empty:
             ax.scatter([pos], [inliers.iloc[0]], color=color, s=18, zorder=3)
@@ -2940,7 +3500,12 @@ def _draw_stat(ax, pos, vals, color, width, plot_type):
         if not outliers.empty:
             ax.scatter([pos] * len(outliers), outliers, color=color, s=6, alpha=0.4,
                        edgecolor="none", zorder=2)
-        return bounds
+        if errorbar in (None, "default"):
+            return bounds
+        mean, err = vals.mean(), _spread(vals, errorbar)
+        ax.errorbar(pos, mean, yerr=err, fmt="none", ecolor="black", elinewidth=1.0, capsize=3, zorder=3.5)
+        lo, hi = mean - err, mean + err
+        return (min(bounds[0], lo), max(bounds[1], hi)) if bounds else (lo, hi)
     else:
         v = vals.iloc[0]
         ax.scatter([pos], [v], color=color, s=18, zorder=3)
@@ -3125,6 +3690,17 @@ def _token_to_number(token):
     return value if kind == 0 else None
 
 
+def _heatmap_axis(vals, scaled=False):
+    nums = [_token_to_number(v) for v in vals]
+    if scaled and vals and all(n is not None for n in nums):
+        order = sorted(range(len(vals)), key=lambda i: nums[i])
+        vals, nums = [vals[i] for i in order], [nums[i] for i in order]
+        log = nums[0] > 0 and nums[-1] / nums[0] > 20
+        return vals, _axis_edges(nums, log=log), nums, "log" if log else "linear"
+    vals = sorted(vals, key=_token_sort_key)
+    return vals, list(range(len(vals) + 1)), [i + 0.5 for i in range(len(vals))], "linear"
+
+
 def _axis_edges(nums, log=False):
     """N+1 cell-boundary edges for N sorted numeric axis values, each
     boundary at the midpoint between its neighbors (half the neighbor gap
@@ -3188,6 +3764,8 @@ def _is_true(series):
 def _windowless_runs_df(source):
     from phlag.utils import get_data_dir, get_simulation_categories
 
+    if source == PAPER_SOURCE:
+        return _windowless_runs_df("gtrees")
     root = Path(PHLAG_SOURCE_ROOTS[source])
     stats = BenchmarkStats()
     rows = []
@@ -3238,9 +3816,16 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
         # only reflects what was UNIONED in before filtering.
         frame["_source_dir"] = str(d)
         frames.append(frame)
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True).copy() if frames else pd.DataFrame()
+    if not df.empty and "exclusion" in df.columns:
+        failed = (df["exclusion"] == _NO_METRICS_EXCLUSION) & df["fraction_bin"].notna()
+        df.loc[failed, _FAILED_RUN_ZERO_METRICS] = 0.0
+        df.loc[failed, "in_panel_b"] = True
+        df.loc[failed & df["x_bin"].notna(), "in_panel_a"] = True
     if not df.empty and "category" in df.columns and "subcategory" in df.columns:
         df["merged_category"] = _merged_category(df["category"], df["subcategory"])
+    if not df.empty and "pattern" in df.columns:
+        df["outlier_pct"] = _outlier_pct(df["pattern"])
     if not df.empty and bin_specs:
         for bin_col, (source_col, edges) in bin_specs.items():
             if source_col in df.columns:
@@ -3320,6 +3905,11 @@ def _shade_color(base_color, frac):
     return colorsys.hls_to_rgb(h, l, s)
 
 
+def _gradient_color(base_color, frac):
+    h, _, s = colorsys.rgb_to_hls(*matplotlib.colors.to_rgb(base_color))
+    return colorsys.hls_to_rgb(h, 0.8 - 0.65 * frac, s)
+
+
 def _cross_run_grid(configs, title, cell_plot_fn, categorical_x=True):
     dfs = _load_configs_runs(configs)
     n_rows, n_cols = len(FRACTION_BINS), len(FIGURE_COLUMNS)
@@ -3348,7 +3938,28 @@ def _cross_run_grid(configs, title, cell_plot_fn, categorical_x=True):
 
 def _recorded_value(recorded, dest):
     value = recorded.get(dest)
-    return PHLAG_SEGMENT_DEFAULTS.get(dest) if value is None else value
+    return _RECORDED_DEFAULTS.get(dest) if value is None else value
+
+
+def _hstack_figs(figs):
+    imgs = []
+    for fig in figs:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        buf.seek(0)
+        imgs.append(plt.imread(buf))
+        plt.close(fig)
+    dpi = figs[0].dpi
+    total_w, max_h = sum(img.shape[1] for img in imgs), max(img.shape[0] for img in imgs)
+    out = plt.figure(figsize=(total_w / dpi, max_h / dpi), dpi=dpi)
+    left = 0
+    for img in imgs:
+        h, w = img.shape[:2]
+        ax = out.add_axes([left / total_w, 1 - h / max_h, w / total_w, h / max_h])
+        ax.imshow(img)
+        ax.set_axis_off()
+        left += w
+    return out
 
 
 def _suptitle(fig, text, fontsize=12, **kwargs):
@@ -3357,6 +3968,17 @@ def _suptitle(fig, text, fontsize=12, **kwargs):
     if len(lines) > 1:
         fig.set_figheight(fig.get_figheight() + (len(lines) - 1) * fontsize * 1.2 / 72)
     return fig.suptitle("\n".join(lines), fontsize=fontsize, **kwargs)
+
+
+def _fit_fig_to_axes(fig, axes, ax_w, ax_h, rect, iters=3):
+    n_rows, n_cols = axes.shape
+    fig.set_size_inches(n_cols * ax_w + 40, n_rows * ax_h + 40)
+    for _ in range(iters):
+        fig.tight_layout(rect=rect)
+        pos = axes[0][0].get_position()
+        fig_w, fig_h = fig.get_size_inches()
+        fig.set_size_inches(fig_w + n_cols * (ax_w - pos.width * fig_w), fig_h + n_rows * (ax_h - pos.height * fig_h))
+    fig.tight_layout(rect=rect)
 
 
 def _title_bottom(fig, default=0.95):

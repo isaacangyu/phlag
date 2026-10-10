@@ -531,7 +531,7 @@ _NODE_NAME_PATH_MODIFIERS = {
     "var2x", "repulsion", "annealing",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
-_NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[\d.]+_beta(prime)?[\d.]+$')
+_NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[-\d.eE+]+_beta(prime)?[-\d.eE+]+$')
 _NODE_NAME_LAM_RE = re.compile(r'^lam[\d.]+$')
 
 
@@ -744,14 +744,14 @@ PHLAG_SEGMENT_DEFAULTS = {
     "correct_transition": None,
     "dirichlet_mean": False,
     "prior_init_probs": False,
-    "emission_param": "free",
 }
 PHLAG_SEGMENT_BARE_VALUES = {"correct_transition": "auto"}
 _NAMED_SEGMENTS = {
     "var2x": ("double_variance_init", True),
     "repulsion": ("alt_emission_parameterization", "repulsion"),
     "annealing": ("annealing", True),
-    "zero-alt-anchor": ("emission_param", "zero-alt-anchor"),
+    "null-alt-anchor": ("null_emission_parameterization", "null-alt-anchor"),
+    "snr": ("null_emission_parameterization", "snr"),
 }
 
 
@@ -833,8 +833,8 @@ def get_simulation_categories(sim_name):
       down: '10X_down', '10X/down', 'N109', 'N498', 'N717' -> ('10X', 'down')
 
     recombination:
-      up: 'recombination_up', 'recombination/up' -> ('recombination', 'up')
-      down: 'recombination_down', 'recombination/down', 'N252' -> ('recombination', 'down')
+      up: 'recombination_up', 'recombination/up', 'recombination_increase' -> ('recombination', 'up')
+      down: 'recombination_down', 'recombination/down', 'recombination_suppression', 'N252' -> ('recombination', 'down')
 
     admixture:
       'admixture', or ('rate' and 'time') -> ('admixture', 'low' if time < 3.5 else 'high')
@@ -846,9 +846,9 @@ def get_simulation_categories(sim_name):
         return ("10X", "down")
     elif "10X_up" in s or "10X/up" in s:
         return ("10X", "up")
-    elif "recombination_down" in s or "recombination/down" in s:
+    elif "recombination_down" in s or "recombination/down" in s or "recombination_suppression" in s:
         return ("recombination", "down")
-    elif "recombination_up" in s or "recombination/up" in s:
+    elif "recombination_up" in s or "recombination/up" in s or "recombination_increase" in s:
         return ("recombination", "up")
     elif "admixture" in s or ("rate" in s and "time" in s):
         t_val = get_admixture_divergence_time(s)
@@ -860,9 +860,9 @@ def get_simulation_categories(sim_name):
         if "up" in s or any(k in s for k in ["Nyctibiidae", "N497", "N544", "N554", "N716"]):
             return ("10X", "up")
     elif "recombination" in s:
-        if "down" in s or "N252" in s:
+        if re.search(r'(?<![A-Za-z])down(?![A-Za-z])', s) or "suppression" in s or "N252" in s:
             return ("recombination", "down")
-        if "up" in s:
+        if re.search(r'(?<![A-Za-z])up(?![A-Za-z])', s) or "increase" in s:
             return ("recombination", "up")
     # Check node stubs
     if any(k in s for k in ["Nyctibiidae", "N497", "N544", "N554", "N716"]):

@@ -5,6 +5,7 @@ cd "$(dirname "$self")/../.."
 export PATH="${PHLAG_ENV:-$HOME/.local/share/mamba/envs/phlag}/bin:$PATH"
 
 if [[ -z ${BATCH_INNER:-} ]]; then
+  python -m bench.cli.split_script "${1:-bench/script.sh}" >/dev/null
   if [[ -n ${BATCH_SESSION:-} ]]; then
     SESSION=$BATCH_SESSION
     if tmux has-session -t "=$SESSION" 2>/dev/null; then

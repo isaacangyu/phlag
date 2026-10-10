@@ -7,10 +7,23 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from zoneinfo import ZoneInfo
 
 from tqdm import tqdm
 
+from bench.cli.benchmark import TOTAL_CORE_BUDGET
 from bench.cli.split_script import plan
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total} [{elapsed}<{remaining}{postfix}]"
+
+
+def read_progress(path):
+    try:
+        done, total = map(int, path.read_text().split())
+    except (OSError, ValueError):
+        return 0.0
+    return done / total if total else 0.0
 
 
 def main(argv=None):
@@ -21,38 +34,49 @@ def main(argv=None):
 
     parallel, lines, planned = plan(args.script)
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    (args.log_dir / "runs.tsv").write_text("".join(f"{name}\t{cmd}\n" for _, name, cmd in planned))
+    (args.log_dir / "runs.tsv").write_text("".join(f"{name}\t{cmd}\n" for _, name, cmd, _ in planned))
+    progress_dir = args.log_dir / "progress"
+    progress_dir.mkdir(exist_ok=True)
+    jobserver = args.log_dir / "jobserver"
+    jobserver.unlink(missing_ok=True)
+    os.mkfifo(jobserver)
+    jobserver_fd = os.open(jobserver, os.O_RDWR)
+    os.write(jobserver_fd, b"+" * TOTAL_CORE_BUDGET)
 
-    print(f"{len(planned)} runs from {len(lines)} line(s), {parallel} at a time -- logs in {args.log_dir}/")
-    per_line = collections.Counter(line for line, _, _ in planned)
+    print(f"{len(planned)} runs from {len(lines)} line(s), {parallel} at a time, "
+          f"{TOTAL_CORE_BUDGET} cores shared -- logs in {args.log_dir}/")
+    per_line = collections.Counter(line for line, _, _, _ in planned)
     width = min(60, max(len(text) for text in lines))
     bars = {
         line: tqdm(total=per_line[line], desc=f"{line:02d} {lines[line - 1][:width]:<{width}}",
-                   position=pos, unit="run", leave=True, dynamic_ncols=True)
+                   position=pos, unit="run", leave=True, dynamic_ncols=True, bar_format=BAR_FORMAT)
         for pos, line in enumerate(sorted(per_line))
     }
     running = collections.Counter()
+    finished = collections.Counter()
     failed = collections.Counter()
     failures = []
     lock = threading.Lock()
-    started = datetime.datetime.now()
-    state = {name: "pending" for _, name, _ in planned}
+    acquire_lock = threading.Lock()
+    stop = threading.Event()
+    started = datetime.datetime.now(PACIFIC)
+    state = {name: "pending" for _, name, _, _ in planned}
     summary_path = args.log_dir / "00-summary.txt"
 
     def write_summary(done):
         counts = collections.Counter(state.values())
         head = [f"batch summary ({'finished' if done else 'in progress'})",
                 f"script: {args.script}",
-                f"started: {started:%Y-%m-%d %H:%M:%S}",
-                f"updated: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+                f"started: {started:%Y-%m-%d %H:%M:%S %Z}",
+                f"updated: {datetime.datetime.now(PACIFIC):%Y-%m-%d %H:%M:%S %Z}",
                 f"runs: {len(planned)} total, {counts['done']} done, {counts['failed']} failed, "
                 f"{counts['running']} running, {counts['pending']} pending", ""]
         if done:
-            body = ["commands run:"] + [f"[{state[name]}] {name}\n    {cmd}" for _, name, cmd in planned]
+            body = ["commands run:"] + [f"[{state[name]}] {name}\n    {cmd}" for _, name, cmd, _ in planned]
         else:
-            body = [f"[running] {name}\n    {cmd}" for _, name, cmd in planned if state[name] == "running"]
+            body = [f"[running] {name}\n    {cmd}" for _, name, cmd, _ in planned if state[name] == "running"]
             body = ["running:"] + body if body else []
-            failed_now = [f"[failed] {name}" for _, name, _ in planned if state[name] == "failed"]
+            failed_now = [f"[failed] {name}" for _, name, _, _ in planned if state[name] == "failed"]
             body += (["", "failed so far:"] + failed_now) if failed_now else []
         tmp = summary_path.with_suffix(".tmp")
         tmp.write_text("\n".join(head + body) + "\n")
@@ -61,35 +85,63 @@ def main(argv=None):
     write_summary(False)
 
     def refresh(line):
-        bars[line].set_postfix_str(f"running={running[line]} failed={failed[line]}", refresh=True)
+        bars[line].set_postfix_str(f"runs={finished[line]}/{per_line[line]} running={running[line]} "
+                                   f"failed={failed[line]}", refresh=False)
+        frac = sum(1.0 if state[name] in ("done", "failed") else
+                   read_progress(progress_dir / name) if state[name] == "running" else 0.0
+                   for l, name, _, _ in planned if l == line)
+        bars[line].update(frac - bars[line].n)
+        bars[line].refresh()
+
+    def poll():
+        while not stop.wait(2):
+            with lock:
+                for line in bars:
+                    refresh(line)
 
     def run(item):
-        line, name, cmd = item
+        line, name, cmd, tokens = item
+        with acquire_lock:
+            got = 0
+            while got < tokens:
+                got += len(os.read(jobserver_fd, tokens - got))
         with lock:
             running[line] += 1
             state[name] = "running"
             write_summary(False)
             refresh(line)
         log_path = args.log_dir / f"{name}.log"
-        with open(log_path, "w") as log:
-            code = subprocess.run(cmd, shell=True, executable="/bin/bash", stdout=log, stderr=subprocess.STDOUT).returncode
+        env = {**os.environ, "PHLAG_JOBSERVER": str(jobserver), "PHLAG_PROGRESS_FILE": str(progress_dir / name)}
+        try:
+            with open(log_path, "w") as log:
+                code = subprocess.run(cmd, shell=True, executable="/bin/bash", stdout=log,
+                                      stderr=subprocess.STDOUT, env=env).returncode
+        finally:
+            if tokens:
+                os.write(jobserver_fd, b"+" * tokens)
         with lock:
             running[line] -= 1
+            finished[line] += 1
             state[name] = "failed" if code else "done"
             if code:
                 failed[line] += 1
                 failures.append((name, code, log_path))
-            bars[line].update(1)
             write_summary(False)
             refresh(line)
 
     for line in bars:
         refresh(line)
+    poller = threading.Thread(target=poll, daemon=True)
+    poller.start()
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         list(pool.map(run, planned))
+    stop.set()
+    poller.join()
     write_summary(True)
     for bar in bars.values():
         bar.close()
+    os.close(jobserver_fd)
+    jobserver.unlink(missing_ok=True)
 
     if failures:
         print(f"\n{len(failures)} run(s) failed:")

@@ -135,6 +135,41 @@ def substitute_ws_in_path(path, new_val, new_step):
     return None
 
 
+VARIANT_MARKERS = ("site", "ilr", "normalize", "norm-eps", "exp-minus")
+
+
+def variant_of_path(path):
+    ws = parse_ws_from_path(path)
+    if ws is None:
+        return None
+    mode, _, _, site, zscale, ilr, normalize, norm_eps = ws
+    normalize = normalize and not ilr
+    return {
+        "pair": mode == "c" and not site, "site": site, "zscale": zscale, "ilr": ilr,
+        "normalize": normalize, "norm_eps": norm_eps and normalize, "exp_minus": "exp-minus" in path.parts,
+    }
+
+
+def substitute_variant_in_path(path, variant):
+    parts = path.parts
+    for i, part in enumerate(parts):
+        m = re.match(r'^[wc](\d+[km]?_s\d+[km]?)', part, re.IGNORECASE)
+        if m:
+            size = ("c" if variant["pair"] or variant["site"] else "w") + m.group(1) + ("_z" if variant["zscale"] else "")
+            j = i + 1
+            while j < len(parts) and parts[j] in VARIANT_MARKERS:
+                j += 1
+            nested = ["site"] if variant["site"] else []
+            if variant["ilr"]:
+                nested.append("ilr")
+            elif variant["normalize"]:
+                nested += ["normalize", "norm-eps"] if variant["norm_eps"] else ["normalize"]
+            if variant["exp_minus"]:
+                nested.append("exp-minus")
+            return pathlib.Path(*parts[:i], size, *nested, *parts[j:])
+    return None
+
+
 def adhoc_scores_path(repo_root, args, cats, node_rel, normalize_flag, ilr_flag):
     """
     Standalone scores.tsv path: out/[<category>/<subcategory>/]<node>/<pattern>/<size>/[variant/]scores.tsv,

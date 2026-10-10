@@ -465,6 +465,8 @@ class ParamsGaussianHMMEmissions(NamedTuple):
 class EmissionParam(Enum):
     FREE = "free"
     REPULSION = "repulsion"
+    NULL_ALT_ANCHOR = "null-alt-anchor"
+    SNR = "snr"
 
 
 class PhlagHMMEmissions(HMMEmissions):
@@ -781,14 +783,19 @@ class PhlagHMMEmissions(HMMEmissions):
                 Sxx_s = sum_xxT[s]
                 mode = EmissionParam(self.parameterization[s])
 
-                if mode is EmissionParam.FREE:
+                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ANCHOR, EmissionParam.SNR):
                     mu_s = xbar_s
-                    if self.anchor_dims:
+                    if mode is EmissionParam.NULL_ALT_ANCHOR:
                         free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
                         mu_s = jnp.where(free, xbar_s, 0.0)
-                    Sigma_s = Sxx_s / (n_s + 1e-12) - jnp.outer(mu_s, mu_s) + 1e-5 * jnp.eye(self.emission_dim)
-                    if self.anchor_dims:
-                        Sigma_s = jnp.where(jnp.outer(free, free), Sigma_s, 0.0)
+                    elif mode is EmissionParam.SNR:
+                        anchor = jnp.array(self.anchor_dims)
+                        ils = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
+                        var_ils = Sxx_s[ils, ils] / (n_s + 1e-12) - xbar_s[ils] ** 2
+                        ceiling = xbar_s[ils] / (var_ils + 1e-12)
+                        mu_s = xbar_s.at[anchor].set(jnp.minimum(jnp.mean(xbar_s[anchor]), ceiling))
+                    Sigma_s = (Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, mu_s) - jnp.outer(mu_s, xbar_s)
+                               + jnp.outer(mu_s, mu_s) + 1e-5 * jnp.eye(self.emission_dim))
                 elif mode is EmissionParam.REPULSION:
                     other = 1 - s # assumes 2 states
                     mu_s, Sigma_s, clip_count_s, clip_attempts_s = self.map_estimate_repulsion(
@@ -841,6 +848,10 @@ class PhlagHMMEmissions(HMMEmissions):
                 total_distance += dist
                 num_pairs += 1
         return total_distance / num_pairs
+
+
+def params_all_finite(params):
+    return jnp.all(jnp.array([jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree_util.tree_leaves(params)]))
 
 
 class ParamsPhlagHMM(NamedTuple):
@@ -1082,9 +1093,13 @@ class PhlagHMM(HMM):
             tm_init_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm_init.tolist())
             print(f"Initial Transition matrix: {tm_init_str}")
 
+        last_finite_params, last_finite_lp = params, jnp.nan
         for step in range(num_iters):
             params, m_step_state, marginal_loglik = em_step(params, m_step_state)
             log_probs.append(marginal_loglik)
+            finite = params_all_finite(params)
+            last_finite_params = jax.tree_util.tree_map(lambda new, old: jnp.where(finite, new, old), params, last_finite_params)
+            last_finite_lp = jnp.where(jnp.isfinite(marginal_loglik), marginal_loglik, last_finite_lp)
 
             if verbose:
                 tm = params.transitions.transition_matrix
@@ -1101,4 +1116,4 @@ class PhlagHMM(HMM):
         else:
             clip_count, clip_attempts = 0, 0
 
-        return params, jnp.array(log_probs), clip_count, clip_attempts
+        return params, jnp.array(log_probs), clip_count, clip_attempts, last_finite_params, last_finite_lp

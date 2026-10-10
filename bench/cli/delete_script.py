@@ -4,6 +4,7 @@ import datetime
 import functools
 import io
 import itertools
+import json
 import pathlib
 import shutil
 import subprocess
@@ -23,17 +24,19 @@ def benchmark_targets(argv):
 
 
 @functools.lru_cache(maxsize=None)
-def resolve_phlag_input(spec):
+def resolve_phlag_input(spec, variant_tokens=()):
     from phlag.phlag import parse_arguments
     with contextlib.redirect_stdout(io.StringIO()):
-        return pathlib.Path(parse_arguments([spec]).caster_scores)
+        return pathlib.Path(parse_arguments([spec, *variant_tokens]).caster_scores)
 
 
 def phlag_targets(argv):
     from phlag.phlag import Phlag, build_parser
     from phlag.caster import substitute_ws_in_path
     args = build_parser().parse_args(argv)
-    base = resolve_phlag_input(str(args.caster_scores[0]))
+    variant_flags = {"pair": "--pair", "site": "--site", "zscale": "-z", "normalize": "-n",
+                     "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus"}
+    base = resolve_phlag_input(str(args.caster_scores[0]), tuple(f for d, f in variant_flags.items() if getattr(args, d)))
     if args.window_size is None:
         ws_paths = [base]
     else:
@@ -48,6 +51,39 @@ def phlag_targets(argv):
         run_args.caster_scores, run_args.rho, run_args.beta, run_args.beta_prime = path, rho, beta, beta_prime
         dirs.append(args.output_file.parent if args.output_file else Phlag.get_default_out_dir(argparse.Namespace(args=run_args)))
     return dirs, ()
+
+
+WHERE_IGNORED_DESTS = ("output_base", "bench", "no_plots", "recompute", "plot")
+
+
+def where_matches(record, wanted, defaults):
+    def value(dest):
+        return record.get(dest, defaults.get(dest))
+    for dest, want in wanted.items():
+        if dest == "step_size":
+            steps = {s if isinstance(s, int) else max(1, round(s * value("window_size"))) for s in want}
+            if value("step_size") not in steps:
+                return False
+        elif value(dest) not in (want if isinstance(want, list) else [want]):
+            return False
+    return True
+
+
+def where_targets(argv):
+    from bench.cli.benchmark import _explicit_dests
+    from bench.cli.phlagster import build_parser
+    from phlag.utils import PHLAG_SEGMENT_DEFAULTS, get_repo_root
+    parser = build_parser(input_file=False)
+    ns = parser.parse_args(argv)
+    explicit = _explicit_dests(argv, parser)
+    if explicit & set(WHERE_IGNORED_DESTS):
+        sys.exit(f"delete: --where can't filter on {', '.join(sorted(explicit & set(WHERE_IGNORED_DESTS)))}")
+    wanted = {d: getattr(ns, d) for d in explicit}
+    wanted.setdefault("step_size", [1.0])
+    defaults = {a.dest: a.default for a in parser._actions} | PHLAG_SEGMENT_DEFAULTS
+    root = get_repo_root() / "store" / "phlag"
+    dirs = sorted(f.parent for f in root.rglob("args.json") if where_matches(json.loads(f.read_text()), wanted, defaults))
+    return dirs, wanted
 
 
 TARGETS = {"benchmark": benchmark_targets, "phlag": phlag_targets}
@@ -70,11 +106,23 @@ def main(argv=None):
     ap.add_argument("script", nargs="?", default="bench/script.sh")
     ap.add_argument("-y", "--yes", action="store_true", help="Don't ask for confirmation.")
     ap.add_argument("-n", "--dry-run", action="store_true", help="Only log what would be deleted.")
-    args = ap.parse_args(argv)
+    ap.add_argument("--where", action="store_true",
+                    help="Everything after --where is phlagster flags (same defaults, so -s 1.0): delete every store/phlag "
+                         "run whose args.json matches all of them, instead of reading script.")
+    argv = sys.argv[1:] if argv is None else argv
+    where_argv = argv[argv.index("--where") + 1:] if "--where" in argv else None
+    args = ap.parse_args(argv if where_argv is None else argv[:argv.index("--where") + 1])
 
-    log = [f"script: {args.script}"]
     targets = {}
-    for tokens in read_commands(args.script):
+    if where_argv is None:
+        log = [f"script: {args.script}"]
+        commands = read_commands(args.script)
+    else:
+        dirs, wanted = where_targets(where_argv)
+        log = [f"where: {wanted}"]
+        targets = {d: own_outputs(d, BENCHMARK_OWN_DIRS) for d in dirs}
+        commands = []
+    for tokens in commands:
         for name, run_argv in split_command(tokens):
             if run_argv[0] not in TARGETS:
                 log.append(f"[keep] {name}: delete only handles {'/'.join(TARGETS)} runs")

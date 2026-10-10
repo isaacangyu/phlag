@@ -910,6 +910,8 @@ class Phlag:
         # once against the pre-EM initial transition matrix (always finite,
         # see fit_em) instead of crashing on paths[0]; the fitted emissions
         # are unaffected; note this fallback in the report so it's visible.
+        # run() already rolls a diverged fit back to its last finite params,
+        # so this only triggers for a .fit.pkl saved before that rollback.
         viterbi_fallback_used = False
         if not paths:
             print(
@@ -1097,6 +1099,11 @@ class Phlag:
         if hasattr(self, "initial_transition_matrix") and self.initial_transition_matrix is not None:
             _append_transition_rows("Initial transition matrix (before EM)", self.initial_transition_matrix.tolist())
         _append_transition_rows("Final transition matrix (after EM)", transition_matrix_np.tolist())
+        occ = self.state_occupancy()
+        occ_null, occ_alt = (occ[1], occ[0]) if flipped_for_eval else (occ[0], occ[1])
+        headers.append(f"State occupancy (posterior, windows): Null {occ_null:.1f}, Alt {occ_alt:.1f}")
+        if getattr(self, "em_diverged_at", None) is not None:
+            headers.append(f"EM diverged to NaN: True (outer iteration {self.em_diverged_at}/{self.n_iters}; reporting the last finite parameters)")
         if viterbi_fallback_used:
             headers.append(
                 "Viterbi decoding: EM's final transition matrix diverged to NaN -- "
@@ -1110,8 +1117,7 @@ class Phlag:
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         if getattr(self, "anchor_dims", ()):
-            d, f = self.Y.shape[-1], self.Y.shape[-1] - len(self.anchor_dims)
-            k_params -= NUM_STATES * (d * d - f * f + d - f)
+            k_params -= len(self.anchor_dims) - (self.args.null_emission_parameterization == "snr")
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1441,9 +1447,9 @@ class Phlag:
         )
 
         self.anchor_dims = ()
-        if self.args.emission_param == "zero-alt-anchor":
-            if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3 or "repulsion" in self.emission_parameterization:
-                raise ValueError("--emission-param zero-alt-anchor needs -d gaussian, 3 topology columns, and free --np/--ap")
+        if self.args.null_emission_parameterization in ("null-alt-anchor", "snr"):
+            if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
+                raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
             self.anchor_dims = (0, 1)
 
         self.hmm = hmm.PhlagHMM(
@@ -1470,10 +1476,13 @@ class Phlag:
         data_mean = jnp.mean(self.Y, axis=0)
         data_cov = jnp.cov(self.Y, rowvar=False)
         data_var = jnp.diag(data_cov)
-        if self.anchor_dims:
-            anchored = jnp.zeros(self.Y.shape[-1], dtype=bool).at[jnp.array(self.anchor_dims)].set(True)
-            data_cov = jnp.where(jnp.outer(~anchored, ~anchored), data_cov, 0.0)
-            data_mean = jnp.where(anchored, 0.0, data_mean)
+        null_mean = data_mean
+        if self.anchor_dims and self.args.null_emission_parameterization == "snr":
+            ceiling = data_mean[2] / (data_var[2] + 1e-12)
+            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(
+                jnp.minimum(jnp.mean(data_mean[jnp.array(self.anchor_dims)]), ceiling))
+        elif self.anchor_dims:
+            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(0.0)
 
         # alt variance = double null variance if --double-variance-init, else same as null
         alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
@@ -1512,7 +1521,7 @@ class Phlag:
             # Shape: [num_states, emission_dim, 2] where column 0 is the mean and
             # column 1 is the variance -- hmm.py's initialize() builds the actual
             # (diagonal) covariance matrix from this itself.
-            state0_init = jnp.concatenate([data_mean[:, None], data_cov], axis=-1) # CHANGED FROM data_cov and data_mean[:,None]
+            state0_init = jnp.concatenate([null_mean[:, None], data_cov], axis=-1) # CHANGED FROM data_cov and data_mean[:,None]
             state1_init = jnp.concatenate([data_mean[:, None], alt_variance_mult * data_cov], axis=-1)
             init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
@@ -1542,9 +1551,11 @@ class Phlag:
         cumulative_inner_steps = 0
         self.clip_activation_count = 0
         self.clip_activation_attempts = 0
+        self.final_em_log_prob = float("nan")
+        self.em_diverged_at = None
         for i in tqdm(range(self.n_iters)):
             num_inner = (i + 1) * self.increment_steps
-            self.params, log_probs, clip_count, clip_attempts = self.hmm.fit_em(
+            self.params, log_probs, clip_count, clip_attempts, last_finite_params, last_finite_lp = self.hmm.fit_em(
                 self.params,
                 self.props,
                 self.Y,
@@ -1560,20 +1571,34 @@ class Phlag:
             cumulative_inner_steps += num_inner
             self.clip_activation_count += clip_count
             self.clip_activation_attempts += clip_attempts
+            # log_probs is dynamax's own "joint log probability" trace for this fit_em call
+            # (log_prior(params) + sum of per-step data log-likelihoods); its last finite
+            # entry is the final joint log-likelihood EM converged to.
+            if np.isfinite(last_finite_lp):
+                self.final_em_log_prob = float(last_finite_lp)
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
-            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str} - {hmm.emission_norm_str(self.params)}")
-        # log_probs is dynamax's own "joint log probability" trace for this fit_em call
-        # (log_prior(params) + sum of per-step data log-likelihoods); its last entry is
-        # the final joint log-likelihood EM converged to.
-        self.final_em_log_prob = float(log_probs[-1])
+            occ = self.state_occupancy()
+            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str} - {hmm.emission_norm_str(self.params)} - Occupancy: Null {occ[0]:.1f}, Alt {occ[1]:.1f}")
+            # Once NaN, every later EM step stays NaN -- roll back to the last
+            # finite params and stop, so decoding/metrics see a real fit.
+            if not bool(hmm.params_all_finite(self.params)):
+                self.params = last_finite_params
+                self.em_diverged_at = i + 1
+                tqdm.write(f"Warning: EM diverged to NaN in outer iteration {i + 1} -- keeping the last finite parameters.")
+                break
         self.fit_state = {
             "params": jax.tree_util.tree_map(np.asarray, self.params),
             "final_em_log_prob": self.final_em_log_prob,
             "clip_activation_count": self.clip_activation_count,
             "clip_activation_attempts": self.clip_activation_attempts,
+            "em_diverged_at": self.em_diverged_at,
         }
         self.compute_output()
+
+    def state_occupancy(self):
+        inference_args = self.hmm._inference_args(self.params, self.Y, None)
+        return np.asarray(hmm.hmm_two_filter_smoother(*inference_args).smoothed_probs.sum(axis=0))
 
     def load_fit(self, fit_path):
         import pickle
@@ -1583,6 +1608,7 @@ class Phlag:
         self.final_em_log_prob = self.fit_state["final_em_log_prob"]
         self.clip_activation_count = self.fit_state["clip_activation_count"]
         self.clip_activation_attempts = self.fit_state["clip_activation_attempts"]
+        self.em_diverged_at = self.fit_state.get("em_diverged_at")
         self.compute_output()
 
     def save_fit(self, fit_path):
@@ -2291,7 +2317,7 @@ def build_parser():
         required=False,
         default=None,
         help="Genomic step size (in rows/positions), matching caster.py's own "
-             "-s (default: inferred from caster_scores' path). Used, like -w, "
+             "-s (default: unset -- caster_scores used as given). Used, like -w, "
              "to substitute into caster_scores' path segment when explicitly "
              "passed. A value with a decimal point (e.g. 1.0) is a ratio of "
              "each combo's -w value, resolved per-combo like caster.py's own "
@@ -2301,6 +2327,21 @@ def build_parser():
              "if it also has multiple values); omitted -w keeps "
              "caster_scores' own window."
     )
+
+    variant_group = parser.add_argument_group(
+        "Caster scores variant",
+        "Same flags as caster.py: select which caster output to read. Any of "
+        "these set -> the scores.tsv for exactly that flag combination (unset "
+        "ones off); none set -> caster_scores as given (a FASTA/locus spec "
+        "prefers the plain sibling)."
+    )
+    variant_group.add_argument("--pair", dest="pair", action="store_true")
+    variant_group.add_argument("--site", dest="site", action="store_true")
+    variant_group.add_argument("-z", "--zscale", dest="zscale", action="store_true")
+    variant_group.add_argument("-n", dest="normalize", action="store_true")
+    variant_group.add_argument("--norm-eps", dest="norm_eps", action="store_true")
+    variant_group.add_argument("-i", "--ilr", dest="ilr", action="store_true")
+    variant_group.add_argument("--exp-minus", dest="exp_minus", action="store_true")
 
     parser.add_argument(
         "--agg",
@@ -2319,10 +2360,13 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion"],
+        choices=["free", "repulsion", "null-alt-anchor", "snr"],
         help="""Parameterization of the null (background) state's emission distribution
-                    (default: free): free (unconstrained MLE) or repulsion (pushed away
-                    from the alt state's currently fitted distribution).""",
+                    (default: free): free (unconstrained MLE), repulsion (pushed away
+                    from the alt state's currently fitted distribution),
+                    null-alt-anchor (free, but the alternative topologies' (ABBA, BABA)
+                    means fixed at 0), or snr (ABBA and BABA means tied to their average,
+                    capped each EM iteration at the null state's AABB mean / AABB variance).""",
     )
     hmm_group.add_argument(
         "--ap",
@@ -2334,16 +2378,6 @@ def build_parser():
                     (default: free): free (unconstrained MLE) or repulsion (pushed
                     away from the null state's currently fitted distribution).""",
     ) 
-    hmm_group.add_argument(
-        "--emission-param",
-        dest="emission_param",
-        type=str.lower,
-        default="free",
-        choices=["free", "zero-alt-anchor"],
-        help="Gaussian emission constraint shared by both states (default: free): "
-             "zero-alt-anchor fixes the alternative topologies' (ABBA, BABA) means, "
-             "variances and covariances at 0.",
-    )
     hmm_group.add_argument(
         "--lam",
         dest="emission_lambda",
@@ -2465,8 +2499,7 @@ def build_parser():
                     matrix's sticky Dirichlet prior -- scaled by the run's window
                     count and combined with --beta into per-row pseudocounts added
                     to the EM M-step's expected transition counts. Must be set
-                    together with --beta; omitting both disables the transition
-                    prior entirely (default: unset, no prior). Multiple
+                    together with --beta (default: unset -- no transition prior). Multiple
                     space-separated values run one phlag run per value
                     (cartesian product with --beta/--beta-prime and -w/-s).""",
     )
@@ -2479,9 +2512,8 @@ def build_parser():
         help="""Expected number of state-to-state transitions each way (e.g.
                     null->alt, alt->null) -- used directly as the off-diagonal
                     pseudocounts of the transition matrix's sticky Dirichlet prior,
-                    see --rho. Must be set together with --rho; omitting both
-                    disables the transition prior entirely (default: unset,
-                    no prior). Accepts multiple values, see --rho.""",
+                    see --rho (default: unset -- no transition prior).
+                    Accepts multiple values, see --rho.""",
     )
     hmm_group.add_argument(
         "--beta-prime",
@@ -2526,6 +2558,16 @@ def parse_arguments(argv=None):
         if len(args.caster_scores) > 1:
             parser.error("parse_arguments takes a single caster_scores; use main() for multiple")
         args.caster_scores = args.caster_scores[0] if args.caster_scores else None
+    if args.pair and args.site:
+        parser.error("--pair and --site are mutually exclusive")
+    if args.ilr and args.zscale:
+        parser.error("-i/--ilr and -z/--zscale are mutually exclusive")
+    if args.norm_eps and not args.normalize:
+        parser.error("--norm-eps requires -n")
+    variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus")
+    variant = {d: getattr(args, d) for d in variant_dests} if any(getattr(args, d) for d in variant_dests) else None
+    if variant and variant["ilr"]:
+        variant["normalize"] = variant["norm_eps"] = False
 
     report_arg = args.caster_scores
     if (report_arg is not None and not report_arg.is_absolute()
@@ -2660,7 +2702,7 @@ def parse_arguments(argv=None):
                     return candidates[0].resolve()
         return all_matches if return_all else None
 
-    def resolve_sibling_scores(fasta_path):
+    def resolve_sibling_scores(fasta_path, variant=None):
         """
         Given a raw source FASTA (not caster's own scores.tsv/chunk_scores.tsv
         output), locates the scores.tsv caster.py already produced from it --
@@ -2687,7 +2729,7 @@ def parse_arguments(argv=None):
         else:
             node_name = get_simulation_node_name(fasta_path) or fasta_path.stem
 
-        from .caster import parse_ws_from_path
+        from .caster import parse_ws_from_path, variant_of_path
 
         # The newest verified sibling picks the window config (its
         # w<...>_s<...> segment); within that config, prefer caster's plain
@@ -2712,6 +2754,8 @@ def parse_arguments(argv=None):
 
         fasta_resolved = fasta_path.resolve()
         candidates = resolve_model_scores(target_name=node_name, return_all=True)
+        if variant is not None:
+            candidates = [c for c in candidates if variant_of_path(c) == variant]
         newest = next((c for c in candidates if matches_fasta(c)), None)
         if newest is None:
             return None
@@ -2745,27 +2789,24 @@ def parse_arguments(argv=None):
             # it already produced (see resolve_sibling_scores) instead of
             # erroring out later at -w/-s substitution (which needs an
             # existing 'w<...>_s<...>' path segment a raw FASTA never has).
-            sibling = resolve_sibling_scores(resolved)
+            sibling = resolve_sibling_scores(resolved, variant)
             if sibling is None:
-                sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv found for it yet -- run caster.py on it first.")
+                which = f" matching {[d for d, v in variant.items() if v]}" if variant else ""
+                sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv{which} found for it yet -- run caster.py on it first.")
             print(f"'{resolved}' is a FASTA file -- using its sibling scores: {sibling}")
             args.caster_scores = sibling
         elif resolved.exists() and resolved.is_file():
             args.caster_scores = resolved
+            if variant is not None:
+                from .caster import substitute_variant_in_path
+                swapped = substitute_variant_in_path(resolved, variant)
+                if swapped is None:
+                    sys.exit(f"Error: caster variant flags need a 'w<...>_s<...>'/'c<...>_s<...>' segment in '{resolved}'.")
+                if not swapped.exists():
+                    sys.exit(f"Error: no scores file at '{swapped}' for the given caster variant flags.")
+                args.caster_scores = swapped
         else:
             sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
-
-    if args.step_size is None:
-        import re as _re
-        for part in pathlib.Path(args.caster_scores).parts:
-            # Non-greedy prefix + digit-only step group: a plain \w+ greedily
-            # over-matches into any trailing _n/_site suffix (e.g. captures
-            # 'ite' out of 'c50k_s1k_site' instead of '1k') since it prefers
-            # the last '_s' in the string.
-            m = _re.match(r'^[cw]\w+?_s(\d+[km]?)(?:_|$)', part)
-            if m:
-                args.step_size = int_or_abbrev(m.group(1))
-                break
 
     return args
 

@@ -8,21 +8,22 @@ CASTER_PLOTS = ["scatter", "dist", "correlation", "topology_pairs", "quartet_cou
 PHLAG_PLOTS = ["em", "states", "relerr", "correlations", "topologies_3d"]
 
 
-def parse_arguments(argv=None):
+def build_parser(input_file=True):
     parser = argparse.ArgumentParser(
         description="Phlagster: Run caster then phlag end-to-end from a FASTA or an existing caster scores.tsv."
     )
-    parser.add_argument(
-        "input_file",
-        type=pathlib.Path,
-        nargs="+",
-        help="Input FASTA(s), locus spec(s) (e.g. 10X/down/N109/37-62), or existing caster "
-             "scores.tsv(s); multiple values run phlagster once per value with the same flags. "
-             "For a scores.tsv, its source FASTA is recovered "
-             "from the 'file' column). With a scores.tsv and no -w/-s, caster is skipped "
-             "and phlag runs on that file as-is; with -w/-s, caster recomputes from the "
-             "source FASTA at each new window/step."
-    )
+    if input_file:
+        parser.add_argument(
+            "input_file",
+            type=pathlib.Path,
+            nargs="+",
+            help="Input FASTA(s), locus spec(s) (e.g. 10X/down/N109/37-62), or existing caster "
+                 "scores.tsv(s); multiple values run phlagster once per value with the same flags. "
+                 "For a scores.tsv, its source FASTA is recovered "
+                 "from the 'file' column). With a scores.tsv and no -w/-s, caster is skipped "
+                 "and phlag runs on that file as-is; with -w/-s, caster recomputes from the "
+                 "source FASTA at each new window/step."
+        )
     parser.add_argument(
         "-d",
         "--dist-type",
@@ -162,7 +163,7 @@ def parse_arguments(argv=None):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion"],
+        choices=["free", "repulsion", "null-alt-anchor", "snr"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -246,14 +247,6 @@ def parse_arguments(argv=None):
         help="Forwarded to phlag's --dirichlet-mean.",
     )
     parser.add_argument(
-        "--emission-param",
-        dest="emission_param",
-        type=str.lower,
-        default=None,
-        choices=["free", "zero-alt-anchor"],
-        help="Forwarded to phlag's --emission-param (default: whatever phlag's own default is).",
-    )
-    parser.add_argument(
         "--prior-init-probs",
         dest="prior_init_probs",
         action="store_true",
@@ -291,7 +284,11 @@ def parse_arguments(argv=None):
         default=None,
         help="Forwarded to phlag's --beta-prime (default: whatever phlag's own default is).",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_arguments(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def main(argv=None):
@@ -390,8 +387,6 @@ def main(argv=None):
         phlag_extra_args += ["--correct-transition", args.correct_transition]
     if args.dirichlet_mean:
         phlag_extra_args += ["--dirichlet-mean"]
-    if args.emission_param is not None:
-        phlag_extra_args += ["--emission-param", args.emission_param]
     if args.prior_init_probs:
         phlag_extra_args += ["--prior-init-probs"]
     if args.rho is not None:
