@@ -2055,7 +2055,7 @@ def build_parser():
              "phlag/phlagster; has no effect on scores.tsv's location when set "
              "(stays in the canonical shared tree, same as always: "
              "store/caster/w<W>_s<S>/...). When NOT set (standalone use, the "
-             "default), scores go to <repo_root>/out/msa/<category>/<subcategory>/"
+             "default), scores go to <repo_root>/store/out/msa/<category>/<subcategory>/"
              "w<W>_s<S>[/variant]/<node_name>/<pattern>/scores.tsv instead of the "
              "shared canonical tree."
     )

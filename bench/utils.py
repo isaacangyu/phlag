@@ -52,8 +52,12 @@ from phlag.utils import (
 STORE_ROOT = "store/phlag"
 
 
+def _phlag_orig_root():
+    return get_repo_root() / "store" / "phlag_orig"
+
+
 def _latest_phlag_orig_dir():
-    root = get_repo_root() / "store" / "phlag_orig"
+    root = _phlag_orig_root()
     dirs = [d for d in root.glob("*/") if next(d.glob("*/*/*/*/report.tsv"), None)]
     return max(dirs, key=lambda d: d.stat().st_mtime, default=root)
 
@@ -62,6 +66,26 @@ PHLAG_SOURCE_ROOTS = {"gtrees": str(_latest_phlag_orig_dir()), "msa": str(get_ou
 PAPER_SOURCE = "paper"
 PHLAG_SOURCE_ROOTS[PAPER_SOURCE] = PHLAG_SOURCE_ROOTS["gtrees"]
 WINDOWLESS_PHLAG_SOURCES = {"gtrees", PAPER_SOURCE}
+
+
+def _register_phlag_sources(sources):
+    sources = [sources] if isinstance(sources, str) else list(sources)
+    for source in sources:
+        if source in PHLAG_SOURCE_ROOTS:
+            continue
+        d = _phlag_orig_root() / source
+        if not d.is_dir():
+            raise FileNotFoundError(f"phlag source {source!r} is not one of {sorted(PHLAG_SOURCE_ROOTS)} or a dir under {_phlag_orig_root()}")
+        PHLAG_SOURCE_ROOTS[source] = str(d)
+        WINDOWLESS_PHLAG_SOURCES.add(source)
+    return sources
+
+
+def _phlag_orig_rel(d):
+    try:
+        return Path(d).relative_to(_phlag_orig_root()).as_posix()
+    except ValueError:
+        return None
 _GT_STATS_COLUMN = re.compile(r"^(null|alt|pooled)_(mean|cov|var|within)_")
 
 SWEEP_METRICS = ["em_hd", "roc_auc", "f1"]
@@ -737,8 +761,8 @@ class CrossRunAnalysis:
         agg_set = set(agg_seq)
         sources = axes.pop("phlag", None)
         if sources is None:
-            sources = [x for x in PHLAG_SOURCE_ROOTS if x != PAPER_SOURCE] if "phlag" in agg_seq else ["msa"]
-        sources = [sources] if isinstance(sources, str) else list(sources)
+            sources = ["gtrees", "msa"] if "phlag" in agg_seq else ["msa"]
+        sources = _register_phlag_sources(sources)
 
         unagged = [n for n in axes if (n in _DATA_COLUMN_AXES or n in _DYNAMIC_ROW_AXES) and n not in agg_set]
         if unagged:
@@ -1980,7 +2004,10 @@ class CrossRunAnalysis:
         if not labels:
             return ""
         restriction = self._restrictions.get(labels[0], "")
-        return f" — {restriction}" if restriction else ""
+        orig = _ordered_unique(rel for label, dirs in configs if not label.startswith(PAPER_SOURCE)
+                               for d in dirs if (rel := _phlag_orig_rel(d)) is not None)
+        text = " — ".join(part for part in [restriction, ", ".join(orig)] if part)
+        return f" — {text}" if text else ""
 
     def _group_configs_by_axis(self, configs, axis_name):
         """Splits `configs` into ordered groups by axis_name's own per-config
@@ -2421,6 +2448,18 @@ class CrossRunAnalysis:
         else:
             colors = {hv: _gradient_color(color, i / max(len(hue_vals) - 1, 1)) for i, hv in enumerate(hue_vals)}
         dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args)
+        windowless_roots = {PHLAG_SOURCE_ROOTS[x] for x in WINDOWLESS_PHLAG_SOURCES}
+        is_dm = {
+            label: bool(dirs) and all(
+                str(d) not in windowless_roots and bool(self._get_args(d).get("dirichlet_mean")) for d in dirs
+            )
+            for label, dirs in configs
+        }
+        dm_vals = sorted(set(is_dm.values()))
+        split_dm = len(dm_vals) > 1
+
+        def line_color(hv, dm):
+            return _shade_color(colors[hv], 0.7 if dm else 0.1) if split_dm else colors[hv]
 
         figs = []
         for metric in metrics:
@@ -2439,6 +2478,7 @@ class CrossRunAnalysis:
                 if vals.empty:
                     continue
                 hv, cv, rv = layout[label]
+                hv = (hv, is_dm[label])
                 stat = (vals.mean(), 0.0 if errorbar is None else _spread(vals, "sd" if errorbar == "default" else errorbar))
                 beta = self._config_beta.get(label)
                 if beta is None:
@@ -2450,7 +2490,8 @@ class CrossRunAnalysis:
             for ri, rv in enumerate(row_vals):
                 for ci, cv in enumerate(col_vals):
                     ax = axes[ri][ci]
-                    xs_all = [p[0] for hv in hue_vals for p in points.get((rv, cv, hv), [])]
+                    line_keys = [(hv, dm) for hv in hue_vals for dm in dm_vals]
+                    xs_all = [p[0] for hv in line_keys for p in points.get((rv, cv, hv), [])]
                     if logx and xs_all and min(xs_all) > 0:
                         ax.set_xscale("log")
                     if _resolve_logy(logy, dfs, metric):
@@ -2459,15 +2500,15 @@ class CrossRunAnalysis:
                         _apply_bounded_yaxis(ax, metric)
                     ax.grid(True, linestyle="--", alpha=0.4)
                     ax.set_axisbelow(True)
-                    for hv in hue_vals:
+                    for hv in line_keys:
                         pts = sorted(points.get((rv, cv, hv), []))
                         if pts:
                             xs, ys, es = zip(*pts)
                             ax.errorbar(xs, ys, yerr=None if errorbar is None else es, fmt="-o",
-                                        markersize=2.5, color=colors[hv],
+                                        markersize=2.5, color=line_color(*hv),
                                         linewidth=1.3, elinewidth=0.8, capsize=2, zorder=3)
                         if (rv, cv, hv) in baselines:
-                            ax.axhline(baselines[(rv, cv, hv)][0], color=colors[hv], linestyle=":",
+                            ax.axhline(baselines[(rv, cv, hv)][0], color=line_color(*hv), linestyle=":",
                                        linewidth=1.2, alpha=0.8, zorder=2)
                     if ri == 0 and cv not in (None, "(none)"):
                         ax.set_title(str(cv), fontsize=9)
@@ -2476,9 +2517,12 @@ class CrossRunAnalysis:
             _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
             fig.supxlabel("beta (raw; beta' x n_windows)", fontsize=9)
             fig.supylabel(metric, fontsize=9)
-            if len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
+            if split_dm or len(hue_vals) > 1 or hue_vals not in ([None], ["(none)"]):
                 handles = [matplotlib.lines.Line2D([], [], color=colors[hv]) for hv in hue_vals]
                 labels = [str(hv) for hv in hue_vals]
+                if split_dm:
+                    handles += [matplotlib.lines.Line2D([], [], color=_shade_color("#808080", f)) for f in (0.7, 0.1)]
+                    labels += ["dirichlet-mean", "dirichlet-mode"]
                 if baselines:
                     handles.append(matplotlib.lines.Line2D([], [], color="black", linestyle=":"))
                     labels.append("no prior")
@@ -3101,7 +3145,7 @@ def _collect_run_df(axes, path, exclude_keywords=(), dir="out", store_root=STORE
     else:
         rel = _path_below_source_root(path)
         frames = []
-        for source in [sources] if isinstance(sources, str) else sources:
+        for source in _register_phlag_sources(sources):
             windowless = source in WINDOWLESS_PHLAG_SOURCES
             d = collect_out_runs(Path(PHLAG_SOURCE_ROOTS[source]) / rel, exclude_keywords, windowless=windowless)
             if d.empty:

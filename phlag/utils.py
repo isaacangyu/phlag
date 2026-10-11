@@ -1092,7 +1092,7 @@ def get_repo_root():
 
 
 def get_out_root():
-    return get_repo_root() / "out" / "msa"
+    return get_repo_root() / "store" / "out" / "msa"
 
 
 def get_out_relative_parts(parts):

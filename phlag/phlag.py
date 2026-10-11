@@ -2457,7 +2457,7 @@ def build_parser():
              "not meant to be passed by hand. When set, report.tsv is written as a "
              "flat '<output-base>/<pattern>.tsv' file instead of the default "
              "'<pattern>/report.tsv', and the output root is the shared canonical "
-             "tree (default: off, writes report.tsv + plots to <repo_root>/out/msa/"
+             "tree (default: off, writes report.tsv + plots to <repo_root>/store/out/msa/"
              "<category>/<subcategory>/<node_name>/<pattern>/w<W>_s<S>[/variant]/<dist_type>"
              "[/rho..._beta.../var2x/repulsion/annealing/lam...]/ instead of the "
              "shared tree, for standalone use).",
