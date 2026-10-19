@@ -752,6 +752,7 @@ _NAMED_SEGMENTS = {
     "annealing": ("annealing", True),
     "null-alt-anchor": ("null_emission_parameterization", "null-alt-anchor"),
     "snr": ("null_emission_parameterization", "snr"),
+    "bl-anchor": ("null_emission_parameterization", "bl-anchor"),
 }
 
 
@@ -1363,7 +1364,17 @@ def _locus_node_dirs(cat, sub, node):
 def expand_node_spec(spec):
     import pathlib
     parts = pathlib.PurePath(str(spec)).parts
-    if len(parts) != 3 or pathlib.Path(spec).is_file():
+    if pathlib.Path(spec).exists():
+        return None
+    if len(parts) == 1:
+        expanded = [s for cat, sub in sorted(SIM_CATEGORY_PAIRS)
+                    for s in (expand_node_spec(pathlib.PurePath(cat, sub, parts[0])) or [])]
+        return expanded or None
+    if len(parts) == 2:
+        expanded = [str(pathlib.PurePath(cat, sub, *parts)) for cat, sub in sorted(SIM_CATEGORY_PAIRS)
+                    if resolve_locus_spec(pathlib.PurePath(cat, sub, *parts)) is not None]
+        return expanded or None
+    if len(parts) != 3:
         return None
     for d in _locus_node_dirs(*parts):
         patterns = sorted({f.name[:-len(ext)] for ext in FASTA_EXTS for f in (d / "concat").glob(f"*{ext}")})

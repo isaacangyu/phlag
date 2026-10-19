@@ -10,14 +10,17 @@ PHLAG_PLOTS = ["em", "states", "relerr", "correlations", "topologies_3d"]
 
 def build_parser(input_file=True):
     parser = argparse.ArgumentParser(
-        description="Phlagster: Run caster then phlag end-to-end from a FASTA or an existing caster scores.tsv."
+        description="Phlagster: Run caster then phlag end-to-end from a FASTA or an existing caster scores.tsv.",
+        epilog="-b <flag> <value> (or -b <on/off flag>...): run both without and with it, "
+               "computing caster scores once (e.g. '-b --np null-alt-anchor').",
     )
     if input_file:
         parser.add_argument(
             "input_file",
             type=pathlib.Path,
             nargs="+",
-            help="Input FASTA(s), locus spec(s) (e.g. 10X/down/N109/37-62), or existing caster "
+            help="Input FASTA(s), locus spec(s) (e.g. 10X/down/N109/37-62; N228 or N228/45-55 "
+                 "expand to every matching experiment), or existing caster "
                  "scores.tsv(s); multiple values run phlagster once per value with the same flags. "
                  "For a scores.tsv, its source FASTA is recovered "
                  "from the 'file' column). With a scores.tsv and no -w/-s, caster is skipped "
@@ -82,7 +85,8 @@ def build_parser(input_file=True):
     parser.add_argument(
         "--site",
         dest="site",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Forwarded to caster's --site (caster-site quartet-scoring mode instead of dstar).",
     )
     parser.add_argument(
@@ -163,7 +167,7 @@ def build_parser(input_file=True):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion", "null-alt-anchor", "snr"],
+        choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -291,8 +295,20 @@ def parse_arguments(argv=None):
     return build_parser().parse_args(argv)
 
 
+_CASTER_RESULTS = {}
+
+
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    from phlag.phlag import split_toggles, TOGGLE_FLAG
+    untoggled, toggles = split_toggles(raw_argv, build_parser())
+    if toggles:
+        import itertools
+        for states in itertools.product((False, True), repeat=len(toggles)):
+            on = [tok for t, state in zip(toggles, states) if state for tok in t]
+            print(f"[phlagster] {TOGGLE_FLAG} -- running {' '.join(on) or 'baseline'}...")
+            main(untoggled + on)
+        return
     args = parse_arguments(raw_argv)
     from phlag.utils import expand_node_specs
     inputs = expand_node_specs(args.input_file)
@@ -323,8 +339,8 @@ def main(argv=None):
         caster_extra_args += ["--shift-caster"]
     if args.pair:
         caster_extra_args += ["--pair"]
-    if args.site:
-        caster_extra_args += ["--site"]
+    if args.site is not None:
+        caster_extra_args += ["--site" if args.site else "--no-site"]
     if args.zscale:
         caster_extra_args += ["-z"]
     if args.ilr:
@@ -351,14 +367,18 @@ def main(argv=None):
             sys.exit(f"Error: scores file '{args.input_file}' does not exist.")
         scores_paths = [args.input_file]
     else:
-        print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
-        result = caster.main(
-            [str(args.input_file), "-d", args.dist_type]
-            + caster_extra_args + output_base_args + bench_args + caster_plot_args
-        )
-        scores_paths = result if isinstance(result, list) else [result]
-        if not scores_paths or any(p is None for p in scores_paths):
-            sys.exit("Error: caster did not produce a scores file.")
+        caster_argv = ([str(args.input_file), "-d", args.dist_type]
+                       + caster_extra_args + output_base_args + bench_args + caster_plot_args)
+        if tuple(caster_argv) in _CASTER_RESULTS:
+            scores_paths = _CASTER_RESULTS[tuple(caster_argv)]
+            print(f"[phlagster] Reusing this run's caster scores for '{args.input_file}'.")
+        else:
+            print(f"[phlagster] Running caster on '{args.input_file}' (-d {args.dist_type})...")
+            result = caster.main(caster_argv)
+            scores_paths = result if isinstance(result, list) else [result]
+            if not scores_paths or any(p is None for p in scores_paths):
+                sys.exit("Error: caster did not produce a scores file.")
+            _CASTER_RESULTS[tuple(caster_argv)] = scores_paths
 
     phlag_extra_args = []
     if args.null_emission_parameterization is not None:

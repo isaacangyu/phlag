@@ -467,6 +467,7 @@ class EmissionParam(Enum):
     REPULSION = "repulsion"
     NULL_ALT_ANCHOR = "null-alt-anchor"
     SNR = "snr"
+    BL_ANCHOR = "bl-anchor"
 
 
 class PhlagHMMEmissions(HMMEmissions):
@@ -484,11 +485,13 @@ class PhlagHMMEmissions(HMMEmissions):
         increment_steps: int = 5,
         sigma_min: float = 1e-2,
         anchor_dims: Tuple[int, ...] = (),
+        anchor_value: float = 0.0,
     ):
         self.num_states = num_states
         self.emission_dim = emission_dim
         self.penalty_lambda = penalty_lambda
         self.anchor_dims = tuple(anchor_dims)
+        self.anchor_value = anchor_value
         self.parameterization = parameterization
         self.lm_damping = lm_damping
         self.repulsion_optimizer = repulsion_optimizer
@@ -783,11 +786,11 @@ class PhlagHMMEmissions(HMMEmissions):
                 Sxx_s = sum_xxT[s]
                 mode = EmissionParam(self.parameterization[s])
 
-                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ANCHOR, EmissionParam.SNR):
+                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ANCHOR, EmissionParam.SNR, EmissionParam.BL_ANCHOR):
                     mu_s = xbar_s
-                    if mode is EmissionParam.NULL_ALT_ANCHOR:
+                    if mode in (EmissionParam.NULL_ALT_ANCHOR, EmissionParam.BL_ANCHOR):
                         free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
-                        mu_s = jnp.where(free, xbar_s, 0.0)
+                        mu_s = jnp.where(free, xbar_s, self.anchor_value)
                     elif mode is EmissionParam.SNR:
                         anchor = jnp.array(self.anchor_dims)
                         ils = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
@@ -920,6 +923,7 @@ class PhlagHMM(HMM):
                 increment_steps=kwargs.get("increment_steps", 5),
                 sigma_min=kwargs.get("sigma_min", 1e-2),
                 anchor_dims=kwargs.get("anchor_dims", ()),
+                anchor_value=kwargs.get("anchor_value", 0.0),
             )
         super().__init__(
             num_states=self.num_states,

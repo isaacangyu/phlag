@@ -513,6 +513,13 @@ class Phlag:
                     get_out_root() / pathlib.Path(*parts[prefix_start:variant_end])
                     / segments
                 )
+            if size_dir_idx is not None:
+                variant_end = size_dir_idx + 1
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+                    variant_end += 1
+                locus = parts[variant_end:-1]
+                if len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS:
+                    return get_out_root() / pathlib.Path(*locus, *parts[size_dir_idx:variant_end]) / segments
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
             elif "caster" in input_path.parts:
@@ -939,11 +946,8 @@ class Phlag:
             metrics_str = "N/A (Viterbi decoding failed -- no valid path found)"
         elif self.has_ground_truth:
             y_pred = np.array(paths[0])
-            # Flip the state assignments according to whichever has smaller hamming distance
-            hamming_dist = np.sum(y_pred != y_true)
-            hamming_dist_flipped = np.sum((1 - y_pred) != y_true)
-
-            if hamming_dist_flipped < hamming_dist:
+            # Null = whichever state the Viterbi path occupies more often
+            if np.sum(y_pred == 1) > np.sum(y_pred == 0):
                 y_pred = 1 - y_pred
                 flipped_for_eval = True
             self.flipped_for_eval = flipped_for_eval
@@ -1447,10 +1451,19 @@ class Phlag:
         )
 
         self.anchor_dims = ()
-        if self.args.null_emission_parameterization in ("null-alt-anchor", "snr"):
+        self.anchor_value = 0.0
+        if self.args.null_emission_parameterization in ("null-alt-anchor", "snr", "bl-anchor"):
             if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
                 raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
             self.anchor_dims = (0, 1)
+        if self.args.null_emission_parameterization == "bl-anchor":
+            from .utils import get_simulation_clade, get_cu_branch_length_from_population_info
+            _, clade_name, _ = get_simulation_clade(self.args.caster_scores)
+            branch_len = get_cu_branch_length_from_population_info(clade_name) if clade_name else None
+            if branch_len is None:
+                raise ValueError(f"--np bl-anchor needs a CU branch length, none found for clade '{clade_name}' ({self.args.caster_scores})")
+            self.anchor_value = float(np.exp(-branch_len) / 3)
+            print(f"bl-anchor: null ABBA/BABA means fixed at exp(-{branch_len:.4g})/3 = {self.anchor_value:.4g} (node '{clade_name}')")
 
         self.hmm = hmm.PhlagHMM(
             NUM_STATES,
@@ -1468,6 +1481,7 @@ class Phlag:
             n_iters=self.args.n_iters,
             increment_steps=self.args.increment_steps,
             anchor_dims=self.anchor_dims,
+            anchor_value=self.anchor_value,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1482,7 +1496,7 @@ class Phlag:
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(
                 jnp.minimum(jnp.mean(data_mean[jnp.array(self.anchor_dims)]), ceiling))
         elif self.anchor_dims:
-            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(0.0)
+            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(self.anchor_value)
 
         # alt variance = double null variance if --double-variance-init, else same as null
         alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
@@ -1716,9 +1730,10 @@ class PhlagPlotter:
     of standard multi-species coalescent (MSC) background (State 0, Null) vs.
     alternative/anomalous (State 1, Alternative) states.
 
-    Row 0 shows empirical KDEs: ground-truth split (dashed, light) and HMM-assigned
-    split (solid, dark). Row 1 shows fitted curves: ground-truth Null/Alt gaussian fits
-    (or the GMM seed) dashed/light, and EM-fitted emission curves solid/dark.
+    Row 0 shows empirical CDFs: ground-truth split (dashed, light) and HMM-assigned
+    split (solid, dark). Row 1 shows QQ curves of each split against its own fit:
+    ground-truth split vs ground-truth Null/Alt gaussian fits (or the GMM seed)
+    dashed/light, HMM-assigned split vs EM-fitted emissions solid/dark.
     """
     def __init__(self, phlag):
         self.phlag = phlag
@@ -1773,18 +1788,11 @@ class PhlagPlotter:
         if self.emission_dim == 1:
             axes = np.array([[axes[0]], [axes[1]]])
 
-        # Determine consistent coordinate limits across both rows
-        ranges = {}
-        for d in range(self.emission_dim):
-            ymin, ymax = float(np.min(self.phlag.Y[:, d])), float(np.max(self.phlag.Y[:, d]))
-            ypad = (ymax - ymin) * 0.20 or 0.1
-            ranges[d] = np.linspace(ymin - ypad, ymax + ypad, 300)
-
-        # Row 0: KDEs (ground truth vs HMM-assigned); Row 1: fitted curves (ground truth/GMM seed vs EM)
-        self._plot_kde_row(axes[0], ranges)
-        self._plot_fit_row(axes[1], ranges)
-        self._apply_log_scales(axes)
-        for ax in np.array(axes).flat:
+        # Row 0: ECDFs (ground truth vs HMM-assigned); Row 1: QQ of each split against its fit (ground truth/GMM seed vs EM)
+        self._plot_ecdf_row(axes[0])
+        self._plot_qq_row(axes[1])
+        self._apply_log_scales(axes[0])
+        for ax in axes[1]:
             self._separate_overlapping_lines(ax)
 
         legend = self._finalize_legend(fig, axes, ncol=2)
@@ -1816,7 +1824,7 @@ class PhlagPlotter:
 
     def _finalize_legend(self, fig, axes, ncol=1):
         """Collects de-duplicated handles/labels across every axis in the figure (both
-        rows share the same Null/Alt Fit/KDE labeling) and places a single legend
+        rows share the same Null/Alt labeling) and places a single legend
         in the figure's upper-right corner."""
         unique = {}
         for ax in np.array(axes).flat:
@@ -1832,77 +1840,102 @@ class PhlagPlotter:
             )
         return None
 
-    def _plot_kde(self, ax, vals, state, x_range, ground_truth):
-        if len(vals) < 2 or np.ptp(vals) == 0:
-            return
-        cfg = self.colors[state]
-        sns.kdeplot(
-            vals, ax=ax, color=cfg['kde'] if ground_truth else cfg['line'], fill=True, alpha=0.2,
-            linewidth=1.8, linestyle='--' if ground_truth else '-', clip=(x_range[0], x_range[-1]),
-            label=f"{cfg['label']} {'GT' if ground_truth else 'EM'} KDE"
-        )
+    QQ_PROBS = np.linspace(0.005, 0.995, 199)
 
-    def _style_axis(self, ax, title, d, ylabel):
+    def _style_axis(self, ax, title, d, xlabel, ylabel):
         ax.set_title(f"{title} | Topology: {self.topology_names[d]}", fontsize=11, fontweight='bold', pad=8)
-        ax.set_xlabel("Topology Score", fontsize=9, labelpad=4)
+        ax.set_xlabel(xlabel, fontsize=9, labelpad=4)
         ax.set_ylabel(ylabel if d == 0 else "", fontsize=9, labelpad=4)
         ax.tick_params(axis='both', which='major', labelsize=8)
 
-    def _plot_kde_row(self, row_axes, ranges):
-        """Plots empirical KDEs: ground-truth split (dashed, light) and HMM-assigned split (solid, dark)."""
-        Y_np = np.array(self.phlag.Y)
-        most_likely_states = np.array(self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y))
+    def _split_groups(self, vals):
+        """Yields (state, ground_truth, values) for the ground-truth split (if available) then the HMM-assigned split."""
+        if self.phlag.has_ground_truth:
+            y_true = np.array(self.phlag.y_true)
+            for state in [0, 1]:
+                yield state, True, vals[y_true == state]
         param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
+        for state in [0, 1]:
+            yield state, False, vals[self.most_likely_states == param_states[state]]
+
+    def _line_style(self, state, ground_truth):
+        cfg = self.colors[state]
+        return dict(color=cfg['kde'] if ground_truth else cfg['line'], linestyle='--' if ground_truth else '-')
+
+    def _plot_ecdf_row(self, row_axes):
+        """Plots empirical CDFs: ground-truth split (dashed, light) and HMM-assigned split (solid, dark)."""
+        Y_np = np.array(self.phlag.Y, dtype=np.float64)
+        self.most_likely_states = np.array(self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y))
 
         for d in range(self.emission_dim):
             ax = row_axes[d]
-            vals = Y_np[:, d]
-            if self.phlag.has_ground_truth:
-                y_true = np.array(self.phlag.y_true)
-                for state in [0, 1]:
-                    self._plot_kde(ax, vals[y_true == state], state, ranges[d], True)
-            for state in [0, 1]:
-                self._plot_kde(ax, vals[most_likely_states == param_states[state]], state, ranges[d], False)
-            self._style_axis(ax, "KDE", d, "Density")
+            for state, ground_truth, vals in self._split_groups(Y_np[:, d]):
+                vals = np.sort(vals[np.isfinite(vals)])
+                if len(vals) == 0:
+                    continue
+                ax.step(
+                    vals, np.arange(1, len(vals) + 1) / len(vals), where='post', linewidth=1.8,
+                    label=f"{self.colors[state]['label']} {'GT' if ground_truth else 'EM'} ECDF",
+                    **self._line_style(state, ground_truth)
+                )
+            self._style_axis(ax, "ECDF", d, "Topology Score", "Proportion")
 
-    def _draw_fit(self, ax, x_vals, state, pdf_vals, tag, ground_truth):
-        cfg = self.colors[state]
-        ax.plot(
-            x_vals, pdf_vals, color=cfg['kde'] if ground_truth else cfg['line'], linewidth=2.2,
-            linestyle='--' if ground_truth else '-', label=f"{cfg['label']} {tag} Fit"
-        )
-        ax.fill_between(x_vals, pdf_vals, alpha=0.05, color=cfg['fill'])
+    def _mixture_components(self, weights, means, covariances, state, d):
+        w = np.array(weights[state])
+        m_means = np.array(means[state, :, d])
+        m_stds = np.sqrt(np.clip(np.array(covariances[state, :, d, d]), 1e-6, None))
+        return list(zip(w, m_means, m_stds))
 
-    def _plot_fit_row(self, row_axes, ranges):
-        """Plots fitted curves: ground-truth (or GMM seed) fit dashed/light, EM fit solid/dark."""
+    def _qq_z(self, sample_q, components):
+        """Maps sample quantiles to N(0,1) scores under the fitted model: (q - mu) / sigma for a
+        single Gaussian, Phi^-1(F_mix(q)) for a mixture -- y = x means the fit matches the sample."""
+        if len(components) == 1:
+            _, mu, sigma = components[0]
+            return (sample_q - mu) / sigma
+        cdf = sum(w * stats.norm.cdf(sample_q, mu, sigma) for w, mu, sigma in components)
+        return stats.norm.ppf(np.clip(cdf, 1e-12, 1 - 1e-12))
+
+    def _plot_qq_row(self, row_axes):
+        """Plots QQ curves of each split's sample against its own fit: ground-truth split vs
+        ground-truth (or GMM seed) fit dashed/light, HMM-assigned split vs EM fit solid/dark."""
         params = self.phlag.params
         param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
         is_gmm = self.phlag.args.model_design == "gmm"
+        Y_np = np.array(self.phlag.Y, dtype=np.float64)
+        theo = stats.norm.ppf(self.QQ_PROBS)
 
         for d in range(self.emission_dim):
             ax = row_axes[d]
-            x_vals = ranges[d]
+            ax.plot(theo, theo, color="black", linewidth=1, label="y = x", gid="qq_ref")
+            for state, ground_truth, vals in self._split_groups(Y_np[:, d]):
+                vals = vals[np.isfinite(vals)]
+                if len(vals) < 2:
+                    continue
+                if not ground_truth:
+                    tag = "EM"
+                    if is_gmm:
+                        e = params.emissions
+                        components = self._mixture_components(e.mixture_weights, e.means, e.covariances, param_states[state], d)
+                    else:
+                        mu, sigma, _ = get_state_mu_sigma_pdf(params, self.phlag.args.model_design, param_states[state], d, theo)
+                        components = [(1.0, mu, sigma)]
+                elif is_gmm:
+                    tag = "Init"
+                    components = self._mixture_components(*self.phlag.gmm_init_params, state, d)
+                elif self.phlag.ground_truth_fits:
+                    tag = "GT"
+                    mu_null, std_null, mu_alt, std_alt = self.phlag.ground_truth_fits[d]
+                    components = [(1.0, *((mu_null, std_null), (mu_alt, std_alt))[state])]
+                else:
+                    continue
+                if not all(sigma > 0 for _, _, sigma in components):
+                    continue
+                ax.plot(
+                    theo, self._qq_z(np.quantile(vals, self.QQ_PROBS), components), linewidth=2.2,
+                    label=f"{self.colors[state]['label']} {tag} QQ", **self._line_style(state, ground_truth)
+                )
 
-            if is_gmm:
-                init_weights, init_means, init_covariances = self.phlag.gmm_init_params
-                for state in [0, 1]:
-                    w = np.array(init_weights[state])
-                    m_means = np.array(init_means[state, :, d])
-                    m_stds = np.sqrt(np.clip(np.array(init_covariances[state, :, d, d]), 1e-6, None))
-                    pdf_vals = np.zeros_like(x_vals)
-                    for m in range(len(w)):
-                        pdf_vals += w[m] * stats.norm.pdf(x_vals, m_means[m], m_stds[m])
-                    self._draw_fit(ax, x_vals, state, pdf_vals, "Init", True)
-            elif self.phlag.ground_truth_fits:
-                mu_null, std_null, mu_alt, std_alt = self.phlag.ground_truth_fits[d]
-                for state, (mu, sigma) in enumerate([(mu_null, std_null), (mu_alt, std_alt)]):
-                    self._draw_fit(ax, x_vals, state, stats.norm.pdf(x_vals, mu, sigma), "GT", True)
-
-            for state in [0, 1]:
-                _, _, pdf_vals = get_state_mu_sigma_pdf(params, self.phlag.args.model_design, param_states[state], d, x_vals)
-                self._draw_fit(ax, x_vals, state, pdf_vals, "EM", False)
-
-            self._style_axis(ax, "Fit", d, "Probability Density")
+            self._style_axis(ax, "QQ", d, "Gaussian(0,1) quantile", "Sample quantile under fit (z)")
             em_hd = getattr(self.phlag, "em_hellinger2", None)
             if em_hd is not None and d == 0:
                 gt_hd = getattr(self.phlag, "gt_hellinger2", None)
@@ -1910,46 +1943,24 @@ class PhlagPlotter:
                 ax.text(0.02, 0.98, f"$H_d^2$ = {hd_str}", transform=ax.transAxes, ha="left", va="top", fontsize=9,
                         bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#cccccc", alpha=0.9))
 
-    # 10x CasterPlotter._needs_log_scale's own 100x default -- em.png's axes
-    # (topology scores clustered tight around a window-size-dependent mean,
-    # densities that taper over many decades at the KDE/fit tails) tripped
-    # the 100x default on nearly every column, and the resulting log/symlog
-    # ticks over a 1e-9 linthresh were too cluttered to read; a plain linear
-    # axis is fine until the spread is genuinely extreme.
     LOG_SCALE_RATIO_THRESHOLD = 1000.0
     X_LINTHRESH_PERCENTILE = 90
 
-    def _apply_log_scales(self, axes):
-        """Auto-detects log/symlog scaling per topology column, reusing
+    def _apply_log_scales(self, row_axes):
+        """Auto-detects log/symlog x scaling per ECDF panel, reusing
         CasterPlotter._needs_log_scale (same percentile-ratio heuristic as
-        scatter.png/dist plots, just a higher threshold -- see
-        LOG_SCALE_RATIO_THRESHOLD) independently on each axis: x off the raw
-        topology scores shared by both rows in that column, y off the
-        density/PDF curve heights the two rows actually drew. Symlog (not
+        scatter.png/dist plots, just a 10x higher threshold). Symlog (not
         plain log) whenever negatives are present -- topology scores can be
-        genuinely negative (raw c*ABBA/c*BABA sums, ILR coords), and density
-        values can dip slightly negative from KDE boundary artifacts -- with
-        the same 1e-9 linthresh used in plot_topology_scatter.
+        genuinely negative (raw c*ABBA/c*BABA sums, ILR coords).
         """
         Y_np = np.array(self.phlag.Y)
         for d in range(self.emission_dim):
-            col_axes = [axes[0][d], axes[1][d]]
-
             x_vals = Y_np[:, d]
             x_vals = x_vals[np.isfinite(x_vals)]
             if CasterPlotter._needs_log_scale(np.abs(x_vals), ratio_threshold=self.LOG_SCALE_RATIO_THRESHOLD):
                 linthresh = 10 ** np.ceil(np.log10(max(float(np.percentile(np.abs(x_vals), self.X_LINTHRESH_PERCENTILE)), 1e-9)))
                 scale, kwargs = ('symlog', {'linthresh': linthresh}) if (x_vals < 0).any() else ('log', {})
-                for ax in col_axes:
-                    ax.set_xscale(scale, **kwargs)
-
-            y_vals = np.concatenate([line.get_ydata() for ax in col_axes for line in ax.get_lines()]) \
-                if any(ax.get_lines() for ax in col_axes) else np.array([])
-            y_vals = y_vals[np.isfinite(y_vals)]
-            if CasterPlotter._needs_log_scale(np.abs(y_vals), ratio_threshold=self.LOG_SCALE_RATIO_THRESHOLD):
-                scale, kwargs = ('symlog', {'linthresh': 1e-9}) if (y_vals < 0).any() else ('log', {})
-                for ax in col_axes:
-                    ax.set_yscale(scale, **kwargs)
+                row_axes[d].set_xscale(scale, **kwargs)
 
     def _separate_overlapping_lines(self, ax, decade_tol=1.0, rel_tol=1e-2, offset_frac=0.02):
         """When two curves on the same axis coincide almost exactly, the
@@ -1963,7 +1974,7 @@ class PhlagPlotter:
         both remain visible; only a cosmetic shift, the later line still
         carries the real values.
 
-        Must run after the axis' final scale is set (_apply_log_scales).
+        Must run after the axis' final scale is set.
         "Coincide" is judged in the axis' own displayed units: on a log/
         symlog axis that means the two curves stay within `decade_tol`
         decades of each other everywhere, NOT within `rel_tol` in linear
@@ -1976,7 +1987,7 @@ class PhlagPlotter:
         of each line's own value, so a fixed percent-of-value shift doesn't
         end up sub-pixel on a wide-range panel or overshoot on a narrow one.
         """
-        lines = [ln for ln in ax.get_lines() if len(ln.get_xdata()) > 1]
+        lines = [ln for ln in ax.get_lines() if len(ln.get_xdata()) > 1 and ln.get_gid() != "qq_ref"]
         if not lines:
             return
         is_log = ax.get_yscale() in ('log', 'symlog')
@@ -2002,8 +2013,8 @@ class PhlagPlotter:
                 if len(xi) == len(xj) and np.allclose(xi, xj):
                     yi_cmp, yj_cmp = yi, yj
                 else:
-                    # KDE curves each carry their own evaluation grid (sns.kdeplot
-                    # fits per-subset), so exact-grid lines (the Fit row) compare
+                    # ECDF curves each carry their own x grid (one point per
+                    # window in the subset), so exact-grid lines (the QQ row) compare
                     # directly above, but here two lines must be resampled onto
                     # their shared x-overlap before their heights are comparable.
                     x_lo, x_hi = max(xi.min(), xj.min()), min(xi.max(), xj.max())
@@ -2229,7 +2240,10 @@ def int_or_abbrev(val_str):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER"
+        description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER",
+        epilog="-b <flag> <value>: run both without and with that flag (e.g. "
+               "'-b --np null-alt-anchor'; flags after the value are not toggled). "
+               "-b <on/off flag>...: every on/off combination of those flags.",
     )
     parser.add_argument(
         "-d",
@@ -2251,7 +2265,10 @@ def build_parser():
         default=None,
         help="Path(s) to CASTER scores TSV(s) or locus specs (e.g. "
              "10X/down/N109/37-62). Multiple values run phlag once per value "
-             "with the same flags."
+             "with the same flags. A <category>/<sub>/<node> spec expands to "
+             "all its patterns; a bare node (e.g. N228) to every experiment "
+             "on that focal branch, <node>/<pattern> to that pattern in every "
+             "category, skipping ones without scores."
     )
     parser.add_argument(
         "-r",
@@ -2336,7 +2353,7 @@ def build_parser():
         "prefers the plain sibling)."
     )
     variant_group.add_argument("--pair", dest="pair", action="store_true")
-    variant_group.add_argument("--site", dest="site", action="store_true")
+    variant_group.add_argument("--site", dest="site", action=argparse.BooleanOptionalAction, default=None)
     variant_group.add_argument("-z", "--zscale", dest="zscale", action="store_true")
     variant_group.add_argument("-n", dest="normalize", action="store_true")
     variant_group.add_argument("--norm-eps", dest="norm_eps", action="store_true")
@@ -2360,13 +2377,16 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion", "null-alt-anchor", "snr"],
+        choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
         help="""Parameterization of the null (background) state's emission distribution
                     (default: free): free (unconstrained MLE), repulsion (pushed away
                     from the alt state's currently fitted distribution),
                     null-alt-anchor (free, but the alternative topologies' (ABBA, BABA)
-                    means fixed at 0), or snr (ABBA and BABA means tied to their average,
-                    capped each EM iteration at the null state's AABB mean / AABB variance).""",
+                    means fixed at 0), snr (ABBA and BABA means tied to their average,
+                    capped each EM iteration at the null state's AABB mean / AABB variance),
+                    or bl-anchor (like null-alt-anchor, but fixed at exp(-t)/3, t = the
+                    clade's branch length in coalescent units; admixture uses the
+                    first node in the simulation name).""",
     )
     hmm_group.add_argument(
         "--ap",
@@ -2551,6 +2571,9 @@ def build_parser():
     return parser
 
 
+_TARGET_DIRS_CACHE = {}
+
+
 def parse_arguments(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2565,7 +2588,11 @@ def parse_arguments(argv=None):
     if args.norm_eps and not args.normalize:
         parser.error("--norm-eps requires -n")
     variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus")
-    variant = {d: getattr(args, d) for d in variant_dests} if any(getattr(args, d) for d in variant_dests) else None
+    explicit_variant = args.site is not None or any(getattr(args, d) for d in variant_dests)
+    if args.site is None:
+        args.site = not args.pair
+    variant = {d: bool(getattr(args, d)) for d in variant_dests} if explicit_variant else None
+    default_variant = {d: d == "site" for d in variant_dests}
     if variant and variant["ilr"]:
         variant["normalize"] = variant["norm_eps"] = False
 
@@ -2625,10 +2652,10 @@ def parse_arguments(argv=None):
         # caster.py). The flat 'out/' base is caster.py's standalone scratch
         # tree (see caster.py) -- everything under it is ours, no 'caster'
         # ancestor to filter on.
-        canonical_bases = [
+        canonical_bases = list(dict.fromkeys(b.resolve() for b in (
             data_dir / "caster",
             repo_root / "store" / "caster",
-        ]
+        )))
         from .utils import get_out_root
         flat_bases = [get_out_root()]
 
@@ -2662,7 +2689,9 @@ def parse_arguments(argv=None):
                 # the canonical caster/ layout that's always somewhere below
                 # a caster/ ancestor, not a sibling/child of one, so there's
                 # no separate '**/caster'-anchored search needed any more.
-                target_dirs = [td for td in b.glob(f"**/{target_name}") if td.is_dir()]
+                if (b, target_name) not in _TARGET_DIRS_CACHE:
+                    _TARGET_DIRS_CACHE[(b, target_name)] = [td for td in b.glob(f"**/{target_name}") if td.is_dir()]
+                target_dirs = _TARGET_DIRS_CACHE[(b, target_name)]
                 for td in target_dirs:
                     for sfile in td.rglob("scores.tsv"):
                         if "caster" in sfile.parts:
@@ -2756,6 +2785,8 @@ def parse_arguments(argv=None):
         candidates = resolve_model_scores(target_name=node_name, return_all=True)
         if variant is not None:
             candidates = [c for c in candidates if variant_of_path(c) == variant]
+        elif args.window_size is not None or args.step_size is not None:
+            candidates = sorted(candidates, key=lambda c: any((variant_of_path(c) or {"": True}).values()))
         newest = next((c for c in candidates if matches_fasta(c)), None)
         if newest is None:
             return None
@@ -2789,9 +2820,9 @@ def parse_arguments(argv=None):
             # it already produced (see resolve_sibling_scores) instead of
             # erroring out later at -w/-s substitution (which needs an
             # existing 'w<...>_s<...>' path segment a raw FASTA never has).
-            sibling = resolve_sibling_scores(resolved, variant)
+            sibling = resolve_sibling_scores(resolved, variant or default_variant)
             if sibling is None:
-                which = f" matching {[d for d, v in variant.items() if v]}" if variant else ""
+                which = f" matching {[d for d, v in (variant or default_variant).items() if v]}"
                 sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv{which} found for it yet -- run caster.py on it first.")
             print(f"'{resolved}' is a FASTA file -- using its sibling scores: {sibling}")
             args.caster_scores = sibling
@@ -2908,18 +2939,82 @@ def _run_single(args):
     return phlag.output_file
 
 
+TOGGLE_FLAG = "-b"
+
+
+def split_toggles(raw_argv, parser):
+    options = parser._option_string_actions
+    rest, toggles = [], []
+    i = 0
+    while i < len(raw_argv):
+        if raw_argv[i] != TOGGLE_FLAG:
+            rest.append(raw_argv[i])
+            i += 1
+            continue
+        i += 1
+        start = len(toggles)
+        while i < len(raw_argv):
+            tok = raw_argv[i]
+            opt = tok if tok.startswith("-") else f"--{tok}"
+            act = options.get(opt)
+            if act is None:
+                break
+            if act.nargs == 0:
+                toggles.append([opt])
+                i += 1
+                continue
+            if len(toggles) > start or tok != opt:
+                break
+            j = i + 1
+            while j < len(raw_argv) and raw_argv[j] not in options and raw_argv[j] != TOGGLE_FLAG:
+                j += 1
+                if act.nargs is None:
+                    break
+            if j == i + 1:
+                parser.error(f"{TOGGLE_FLAG} {tok}: missing value")
+            toggles.append(raw_argv[i:j])
+            i = j
+            break
+        if len(toggles) == start:
+            parser.error(f"{TOGGLE_FLAG} must be followed by the flag(s) to run both with and without")
+    return rest, toggles
+
+
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    rest, toggles = split_toggles(raw_argv, build_parser())
+    if toggles:
+        import itertools
+        results = []
+        for states in itertools.product((False, True), repeat=len(toggles)):
+            on = [tok for t, state in zip(toggles, states) if state for tok in t]
+            run_argv = list(rest)
+            if on and "-o" in run_argv[:-1]:
+                o_idx = run_argv.index("-o") + 1
+                out = pathlib.Path(run_argv[o_idx])
+                run_argv[o_idx] = str(out.parent / "_".join(tok.lstrip("-") for tok in on) / out.name)
+            print(f"[phlag] {TOGGLE_FLAG} -- running {' '.join(on) or 'baseline'}...")
+            results.append(main(run_argv + on))
+        return results
+
     from .utils import expand_node_specs
     raw_specs = build_parser().parse_args(raw_argv).caster_scores or []
     specs = expand_node_specs(raw_specs)
     if len(specs) > 1 or [str(s) for s in raw_specs] != specs:
         spec_paths = {pathlib.Path(spec) for spec in raw_specs}
         rest = [t for t in raw_argv if pathlib.Path(t) not in spec_paths]
-        results = []
+        results, skipped = [], []
         for spec in specs:
             print(f"[phlag] multi-input -- running {spec}...")
-            results.append(main([str(spec)] + rest))
+            try:
+                results.append(main([str(spec)] + rest))
+            except SystemExit as e:
+                if not isinstance(e.code, str):
+                    raise
+                print(f"[phlag] multi-input -- skipped {spec}: {e.code}")
+                skipped.append(spec)
+        if skipped:
+            print(f"[phlag] multi-input -- skipped {len(skipped)}/{len(specs)}: {' '.join(skipped)}")
         return results
 
     args = parse_arguments(raw_argv)

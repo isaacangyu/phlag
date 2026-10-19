@@ -34,9 +34,12 @@ def phlag_targets(argv):
     from phlag.phlag import Phlag, build_parser
     from phlag.caster import substitute_ws_in_path
     args = build_parser().parse_args(argv)
-    variant_flags = {"pair": "--pair", "site": "--site", "zscale": "-z", "normalize": "-n",
+    variant_flags = {"pair": "--pair", "zscale": "-z", "normalize": "-n",
                      "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus"}
-    base = resolve_phlag_input(str(args.caster_scores[0]), tuple(f for d, f in variant_flags.items() if getattr(args, d)))
+    variant_tokens = tuple(f for d, f in variant_flags.items() if getattr(args, d))
+    if args.site is not None:
+        variant_tokens += ("--site" if args.site else "--no-site",)
+    base = resolve_phlag_input(str(args.caster_scores[0]), variant_tokens)
     if args.window_size is None:
         ws_paths = [base]
     else:

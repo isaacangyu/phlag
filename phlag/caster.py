@@ -2094,8 +2094,8 @@ def build_parser():
     parser.add_argument(
         "--site",
         dest="site",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Run ./caster/bin/caster-site (auto-(re)compiling from "
              "caster/caster-site.cpp if missing/stale) instead of dstar -- scores one "
              "fixed quartet branch's CASTER-site topology per genomic chunk, instead of "
@@ -2564,6 +2564,8 @@ def main(argv=None):
 
     if args.pair and args.site:
         sys.exit("Error: --pair and --site are mutually exclusive.")
+    if args.site is None:
+        args.site = not args.pair
 
     if args.ilr and args.zscale:
         sys.exit("Error: --ilr and --zscale are mutually exclusive.")

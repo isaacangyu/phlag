@@ -285,7 +285,7 @@ struct Workflow {
         for (size_t a = 0; a < quad.genes.size(); a++){
             array<score_t, 3> s = quad.genes[a].scoreCnt();
             array<score_t, 3> &acc = chunkScores[make_pair(geneLocus[a], geneChunk[a])];
-            acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2];
+            acc[0] += s[2]; acc[1] += s[1]; acc[2] += s[0];
         }
 
         // Column names/positions mirror dstar's scores.tsv (pos, c*ABBA, c*BABA,
@@ -296,9 +296,9 @@ struct Workflow {
         // here -- they're just the 3 possible resolutions of this branch's
         // quartet, in a fixed order; the actual group identities are logged below.
         long long chunkSizeArg = ARG.getIntArg("chunk");
-        cerr << "c*ABBA = " << groupOrder[0] << groupOrder[1] << "|" << groupOrder[2] << groupOrder[3]
+        cerr << "c*ABBA = " << groupOrder[0] << groupOrder[3] << "|" << groupOrder[1] << groupOrder[2]
              << ", c*BABA = " << groupOrder[0] << groupOrder[2] << "|" << groupOrder[1] << groupOrder[3]
-             << ", c*AABB = " << groupOrder[0] << groupOrder[3] << "|" << groupOrder[1] << groupOrder[2] << "\n";
+             << ", c*AABB = " << groupOrder[0] << groupOrder[1] << "|" << groupOrder[2] << groupOrder[3] << "\n";
 
         ofstream fout(outFile);
         if (!fout){

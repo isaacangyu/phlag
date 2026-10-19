@@ -255,11 +255,11 @@ struct Workflow {
             array<array<long long, 3>, 3> sc = quad.genes[a].signCounts();
             pair<int, int> key = make_pair(geneLocus[a], geneChunk[a]);
             array<score_t, 3> &acc = chunkScores[key];
-            acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2];
+            acc[0] += s[2]; acc[1] += s[1]; acc[2] += s[0];
             array<array<long long, 3>, 3> &accSc = chunkSignCounts[key];
             for (int t = 0; t < 3; t++)
                 for (int c = 0; c < 3; c++)
-                    accSc[t][c] += sc[t][c];
+                    accSc[t][c] += sc[2 - t][c];
             chunkSiteCount[key] += quad.genes[a].nSite;
             chunkQuartetCnt[key] += quad.genes[a].quartetCount();
             locusChunks[geneLocus[a]].push_back(geneChunk[a]);
@@ -277,9 +277,9 @@ struct Workflow {
         // read_caster_scores must not mistake this for a --pair file and
         // z-score it -- that detection keys off q1/q2/q3's presence alone.
         long long chunkSizeArg = ARG.getIntArg("chunk");
-        cerr << "c*ABBA = " << groupOrder[0] << groupOrder[1] << "|" << groupOrder[2] << groupOrder[3]
+        cerr << "c*ABBA = " << groupOrder[0] << groupOrder[3] << "|" << groupOrder[1] << groupOrder[2]
              << ", c*BABA = " << groupOrder[0] << groupOrder[2] << "|" << groupOrder[1] << groupOrder[3]
-             << ", c*AABB = " << groupOrder[0] << groupOrder[3] << "|" << groupOrder[1] << groupOrder[2] << "\n";
+             << ", c*AABB = " << groupOrder[0] << groupOrder[1] << "|" << groupOrder[2] << groupOrder[3] << "\n";
 
         ofstream fout(outFile);
         if (!fout){

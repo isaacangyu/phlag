@@ -11,12 +11,15 @@ from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy import optimize, stats
 
 from bench.cli.benchmark import (
     ADMIXTURE_BINS,
+    BRANCH_LENGTH_BIN_EDGES,
     BRANCH_LENGTH_BINS,
     CASTER_ARG_SPECS,
     CATEGORY_TO_COLUMN,
@@ -28,10 +31,12 @@ from bench.cli.benchmark import (
     PHLAG_ARG_SPECS,
     TOPOLOGY_NAMES,
     BenchmarkStats,
+    _RE_STATE_PATH,
     _build_parser,
     _read_args_json,
     assign_bin,
     discover_leaf_dirs,
+    get_expected_scores_path,
     nominal_anomaly_fraction,
     parse_report,
     transition_total,
@@ -45,6 +50,7 @@ from phlag.utils import (
     get_out_root,
     get_repo_root,
     get_simulation_clade,
+    parse_pattern_string,
     parse_phlag_param_segment,
     read_gt_stats_file,
 )
@@ -66,6 +72,7 @@ PHLAG_SOURCE_ROOTS = {"gtrees": str(_latest_phlag_orig_dir()), "msa": str(get_ou
 PAPER_SOURCE = "paper"
 PHLAG_SOURCE_ROOTS[PAPER_SOURCE] = PHLAG_SOURCE_ROOTS["gtrees"]
 WINDOWLESS_PHLAG_SOURCES = {"gtrees", PAPER_SOURCE}
+BRANCH_LENGTH_SCALE = 1.0
 
 
 def _register_phlag_sources(sources):
@@ -218,6 +225,22 @@ PHLAG_PAPER_F1 = {
         "10X up": {"(0,0.1]": (0.06, 0.01), "(0.1,1]": (0.69, 0.015), "(1,5]": (0.98, 0.005)},
         "10X down": {"(0,0.1]": (0.46, 0.02), "(0.1,1]": (0.85, 0.01), "(1,5]": (0.09, 0.005)},
         "admixture": {"low": (0.16, 0.07), "high": (0.97, 0.01)},
+    },
+}
+PHLAG_PAPER_REPLICATE_F1 = {
+    "(0,0.1]": {
+        "recombination up": {"(0,0.1]": (0.25, 0.105), "(0.1,1]": (0.275, 0.095), "(1,5]": (0.66, 0.10)},
+        "recombination down": {"(0,0.1]": (0.205, 0.095), "(0.1,1]": (0.40, 0.10), "(1,5]": (0.455, 0.08)},
+        "10X up": {"(0,0.1]": (0.065, 0.05), "(0.1,1]": (0.03, 0.03), "(1,5]": (0.645, 0.08)},
+        "10X down": {"(0,0.1]": (0.135, 0.075), "(0.1,1]": (0.305, 0.09), "(1,5]": (0.075, 0.015)},
+        "admixture": PHLAG_PAPER_F1["(0,0.1]"]["admixture"],
+    },
+    "(0.1,0.25]": {
+        "recombination up": {"(0,0.1]": (0.51, 0.125), "(0.1,1]": (0.50, 0.11), "(1,5]": (0.96, 0.03)},
+        "recombination down": {"(0,0.1]": (0.46, 0.10), "(0.1,1]": (0.66, 0.095), "(1,5]": (0.85, 0.055)},
+        "10X up": {"(0,0.1]": (0.155, 0.085), "(0.1,1]": (0.38, 0.10), "(1,5]": (0.955, 0.035)},
+        "10X down": {"(0,0.1]": (0.60, 0.105), "(0.1,1]": (0.615, 0.115), "(1,5]": (0.225, 0.03)},
+        "admixture": PHLAG_PAPER_F1["(0.1,0.25]"]["admixture"],
     },
 }
 PHLAG_PAPER_FPR_TPR = {
@@ -1344,7 +1367,7 @@ class CrossRunAnalysis:
             handles += [plt.Line2D([], [], color="0.3", marker=markers[mi % len(markers)], linestyle=("-", "--", ":")[mi % 3],
                                    markersize=4) for mi in range(len(widest))]
             labels += list(widest)
-        _suptitle(fig, title or _path_after_out(path), fontsize=9)
+        _suptitle(fig, title or f"{_path_after_out(path)} ({_branch_length_label(df, path)})", fontsize=9)
         if len(handles) > 1:
             _legend_below_axes(fig, handles, labels, ncol=min(len(handles), 4), fontsize=7)
         else:
@@ -1417,6 +1440,570 @@ class CrossRunAnalysis:
         plt.show()
         return fig
 
+    def _ecdf_entries(self, axes, path, exclude_keywords, dir):
+        rel = Path(_path_after_out(path))
+        if dir is None:
+            dests = {_FLAG_TO_DEST.get(k): v for k, v in axes.items()}
+            windows = axes.get("-w", axes.get("--window-size"))
+            if windows is None:
+                raise ValueError("ecdf needs a '-w' axis")
+            variants = {d: bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
+            is_node = len(rel.parts) == 3
+            node_rel = rel if is_node else rel.parent
+            entries = []
+            for w in windows if isinstance(windows, (list, tuple)) else [windows]:
+                w = _typed_value("-w", w)
+                node_dir = get_expected_scores_path(Path("simulations", *node_rel.parts, "concat", "_.fa"), node_rel,
+                                                    window_size=w, step_size=w, **variants).parent.parent
+                size = next(part for part in node_dir.parts if _OUT_SIZE_SEGMENT.match(part))
+                patterns = sorted(d.name for d in node_dir.glob("*") if (d / "scores.tsv").exists()) if is_node else [rel.name]
+                for pattern in patterns:
+                    entries.append((size, (pattern,) if is_node else (), {"window_size": w, "step_size": w, **variants}, None,
+                                    node_dir / pattern / "scores.tsv", pattern))
+            return entries, pd.DataFrame({"branch_length": []})
+        if dir == "store":
+            rel = _path_below_source_root(path)
+            df, recorded = collect_store_runs(rel, self.root, exclude_keywords)
+            if df.empty:
+                raise FileNotFoundError(f"No store report found for {path} under {self.root}")
+            keep = _filter_out_runs(df.assign(_i=range(len(df))), axes, recorded)[0]["_i"]
+            entries = []
+            for i in keep:
+                report, args = Path(df["report_path"][i]), recorded[i]
+                leaf_parts = report.parts[:report.parts.index("reports")]
+                size = next(part for part in leaf_parts if _OUT_SIZE_SEGMENT.match(part))
+                fasta = Path("simulations", *rel.parts[:-1], "concat", f"{rel.name}.fa")
+                scores_path = get_expected_scores_path(
+                    fasta, Path(*rel.parts[:-1]), window_size=args.get("window_size"), step_size=args.get("step_size"),
+                    **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
+                entries.append((size, tuple(df["config"][i].split("/")), args, report, scores_path, rel.name))
+            return entries, df
+        df = _collect_run_df(axes, path, exclude_keywords)
+        entries = []
+        for report in df["report_path"]:
+            parts = Path(report).parent.parts
+            size_idx = next(i for i, part in enumerate(parts) if _OUT_SIZE_SEGMENT.match(part))
+            entries.append((parts[size_idx], parts[size_idx + 1:], _recorded_from_report_path(report), report, None,
+                            parts[size_idx - 1]))
+        return entries, df
+
+    def _score_dist_cells(self, metric, axes, runs, agg, exclude_keywords, dir, pattern, by_em):
+        assert "phlag" not in axes, f"{metric} doesn't take a 'phlag' source axis"
+        assert dir in ("out", "store")
+        rest = [a for a in agg if a not in ("em", "gt", "topology")]
+        if len(rest) > 1:
+            raise ValueError(f"{metric} agg takes 'em' and at most one row flag, got {agg}")
+        windows = axes.get("-w", axes.get("--window-size"))
+        row_flag = rest[0] if rest else "-w" if isinstance(windows, (list, tuple)) and len(windows) > 1 else None
+        source = dir if by_em else None
+        row_dest = _FLAG_TO_DEST.get(row_flag)
+        if row_flag is not None and row_dest is None:
+            raise KeyError(f"{row_flag!r} is not one of benchmark.py's mirrored caster/phlag flags")
+
+        figures, col_titles = {}, []
+        for ci, (label, path) in enumerate(runs):
+            entries, df = self._ecdf_entries(axes, path, exclude_keywords, source)
+            rel = Path(_path_after_out(path))
+            category = rel.parts[0] if rel.parts[0] == "admixture" else " ".join(rel.parts[:2])
+            col_titles.append(label or f"{category}\n{rel.parts[2]} | {_branch_length_label(df, entries[0][4].parent if source is None and entries else path)}")
+            for size, config, recorded, report, scores_path, entry_pattern in entries:
+                if pattern is not None and str(entry_pattern) != str(pattern):
+                    continue
+                if row_dest is not None and row_dest not in recorded:
+                    raise ValueError(f"{row_flag} isn't recorded for {report or scores_path}")
+                m = _OUT_SIZE_SEGMENT.match(size)
+                size_key = m.group(2) if row_dest in ("window_size", "step_size") else size
+                tail = tuple(p for p in config if row_dest is None or row_dest not in (parse_phlag_param_segment(p) or {}))
+                figures.setdefault((size_key, tail), {})[(recorded.get(row_dest), ci)] = (report, scores_path, entry_pattern)
+        return row_flag, row_dest, figures, col_titles
+
+    def _plot_score_dist(self, metric, axes, runs, agg=(), exclude_keywords=(), title="", dir="out", logx=None,
+                         normalize=False, topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
+        by_em = "em" in agg
+        row_flag, row_dest, figures, col_titles = self._score_dist_cells(metric, axes, runs, agg, exclude_keywords, dir,
+                                                                         pattern, by_em)
+        panel, what, xlabel, ylabel, legend_items = _SCORE_DIST_METRICS[metric]
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        figs = []
+        for (size_key, tail), cells in figures.items():
+            rows = sorted({v for v, _ in cells}, key=lambda v: (v != _RECORDED_DEFAULTS.get(row_dest),
+                                                               not isinstance(v, (int, float)), v if isinstance(v, (int, float)) else str(v)))
+            fig, axs = plt.subplots(len(rows), len(runs), figsize=(5 * len(runs), 4.0 * len(rows) + 1.0), squeeze=False)
+            drawn = False
+            for ri, value in enumerate(rows):
+                for ci in range(len(runs)):
+                    ax = axs[ri][ci]
+                    cell = cells.get((value, ci))
+                    try:
+                        if cell is None:
+                            raise ValueError("no matching report/scores")
+                        if cell[0] is None:
+                            scores, y_true = _scores_with_truth(*cell[1:])
+                            y_pred = None
+                        else:
+                            scores, y_true, y_pred, _ = _report_window_labels(*cell)
+                    except ValueError as e:
+                        ax.text(0.5, 0.5, f"missing:\n{e}", transform=ax.transAxes, ha="center", va="center", fontsize=7, wrap=True)
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                        scores = None
+                    if scores is not None:
+                        drawn = True
+                        if normalize:
+                            scores = _minmax_normalize(scores, normalize)
+                        panel(ax, scores, y_pred if by_em else y_true, topologies, normalize, logx)
+                        if not legend:
+                            for text in list(ax.texts):
+                                text.remove()
+                        if logx and ax.get_xscale() == "linear" and metric in ("ecdf", "fit"):
+                            ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                        ax.grid(alpha=0.25)
+                        ax.set_xlabel(f"normalized {xlabel}" if normalize and "score" in xlabel else xlabel)
+                    if ri == 0:
+                        ax.set_title(col_titles[ci], fontsize=10)
+                    if ci == 0:
+                        row_label = "" if row_flag is None else f"w{format_val(value)}\n" if row_dest == "window_size" \
+                            else f"{_strip_flag(row_flag)} = {value}\n"
+                        ax.set_ylabel(f"{row_label}{ylabel}")
+            if not drawn:
+                plt.close(fig)
+                continue
+            source = "EM state path" if by_em else "GT"
+            suffix = "/".join(([size_key] if size_key else []) + list(tail))
+            _suptitle(fig, title or f"{source} Null (dashed) vs Outlier (solid) {what}"
+                      + (f" — {suffix}" if suffix else "") + (f" — {pattern}" if pattern is not None else ""), fontsize=10)
+            items = legend_items(topologies)
+            _legend_below_axes(fig, [h for h, _ in items], [l for _, l in items], ncol=min(len(items), 6), fontsize=8)
+            figs.append(fig)
+        if not figs:
+            raise ValueError(f"No {metric} could be drawn for {[p for _, p in runs]} with {axes}")
+        plt.show()
+        return figs[0] if len(figs) == 1 else figs
+
+    def _plot_ecdf_hmm(self, axes, runs, agg=(), exclude_keywords=(), title="", dir="out", logx=None, normalize=False,
+                      topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
+        row_flag, row_dest, figures, _ = self._score_dist_cells("ecdf_hmm", axes, runs, agg, exclude_keywords, dir, pattern, True)
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        cols = [TOPOLOGY_NAMES.index(t) for t in topologies]
+        figs = []
+        for (size_key, tail), cells in figures.items():
+            rows = sorted({v for v, _ in cells}, key=lambda v: (v != _RECORDED_DEFAULTS.get(row_dest),
+                                                               not isinstance(v, (int, float)), v if isinstance(v, (int, float)) else str(v)))
+            for ci, (label, path) in enumerate(runs):
+                patterns = sorted({cell[2] for (v, c), cell in cells.items() if c == ci}, key=str)
+                for entry_pattern in patterns:
+                    fig, axs = plt.subplots(len(rows), len(cols), figsize=(3.8 * len(cols), 3.2 * len(rows) + 1.0), squeeze=False)
+                    drawn, bl_label = False, None
+                    for ri, value in enumerate(rows):
+                        cell = cells.get((value, ci))
+                        try:
+                            if cell is None or cell[2] != entry_pattern:
+                                raise ValueError("no matching report/scores")
+                            scores, _, y_pred, _ = _report_window_labels(*cell)
+                        except ValueError as e:
+                            scores, err = None, e
+                        if scores is not None and normalize:
+                            scores = _minmax_normalize(scores, normalize)
+                        if scores is not None and bl_label is None:
+                            bl_label = _branch_length_label(pd.DataFrame({"branch_length": []}), Path(cell[1] or path).parent
+                                                            if cell[1] else path)
+                        for ci2, col in enumerate(cols):
+                            ax = axs[ri][ci2]
+                            if scores is None:
+                                ax.text(0.5, 0.5, f"missing:\n{err}", transform=ax.transAxes, ha="center", va="center",
+                                        fontsize=7, wrap=True)
+                                ax.set_xticks([])
+                                ax.set_yticks([])
+                            else:
+                                drawn = True
+                                means = []
+                                for state, color in enumerate(_HMM_STATE_COLORS):
+                                    mean, _ = _draw_ecdf(ax, scores[y_pred == state, col], color=color, linewidth=1.6)
+                                    means.append(mean)
+                                    if mean is not None:
+                                        ax.axvline(mean, color=color, linewidth=1.0, alpha=0.7)
+                                if legend:
+                                    _text_box(ax, ["Mean"] + [f"{name} HMM: {'n/a' if m is None else f'{m:.3g}'}"
+                                                              for name, m in zip(("Null", "Outlier"), means)])
+                                _score_xaxis(ax, scores, [topologies[ci2]], normalize, logx)
+                                if logx and ax.get_xscale() == "linear":
+                                    ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                                ax.grid(alpha=0.25)
+                                if ri == len(rows) - 1:
+                                    ax.set_xlabel("normalized topology score" if normalize else "topology score")
+                            if ri == 0:
+                                ax.set_title(topologies[ci2], fontsize=10)
+                            if ci2 == 0:
+                                row_label = "" if row_flag is None else f"w{format_val(value)}\n" if row_dest == "window_size" \
+                                    else f"{_strip_flag(row_flag)} = {value}\n"
+                                ax.set_ylabel(f"{row_label}proportion")
+                    if not drawn:
+                        plt.close(fig)
+                        continue
+                    rel = _path_after_out(path)
+                    if not rel.endswith(f"/{entry_pattern}"):
+                        rel = f"{rel}/{entry_pattern}"
+                    head = label or f"{rel} ({bl_label})"
+                    suffix = " — ".join(x for x in (_size_label(size_key), "/".join(tail)) if x)
+                    _suptitle(fig, title or f"{head}" + (f" — {suffix}" if suffix else ""), fontsize=10)
+                    _legend_below_axes(fig, [matplotlib.lines.Line2D([], [], color=c, linewidth=1.6) for c in _HMM_STATE_COLORS],
+                                       ["Null HMM", "Outlier HMM"], ncol=2, fontsize=8)
+                    figs.append(fig)
+        if not figs:
+            raise ValueError(f"No ecdf_hmm could be drawn for {[p for _, p in runs]} with {axes}")
+        plt.show()
+        return figs[0] if len(figs) == 1 else figs
+
+    def _plot_score_dist_pooled(self, metric, axes, agg=(), exclude_keywords=(), title="", logx=None, normalize=False,
+                                topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
+        agg = [a for a in agg if a and a != "gt"] or ["topology"]
+        if agg[0] != "topology":
+            raise ValueError(f"{metric} without run= overlays topologies: agg is ['topology', cols, rows], got {agg}")
+        unknown = [a for a in agg[1:] if a not in _POOLED_SCORE_AXES]
+        if unknown or len(agg) > 3:
+            raise ValueError(f"{metric} without run= takes agg ['topology', cols, rows] from {sorted(_POOLED_SCORE_AXES)}, got {agg}")
+        windows = self._caster_window_roots(axes)
+        if "-w" not in agg and len(windows) > 1:
+            if len(agg) == 3:
+                raise ValueError(f"{metric}: several -w values but no agg slot left for '-w'")
+            agg = agg + ["-w"]
+        col_axis, row_axis = (agg[1:] + [None, None])[:2]
+        panel, what, xlabel, ylabel, legend_items = _SCORE_DIST_METRICS[metric]
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        cells = {}
+        for w, root in windows:
+            for parts, null, alt in _caster_scores_by_run(root, tuple(exclude_keywords), pattern):
+                key = tuple(None if a is None else _POOLED_SCORE_AXES[a](w, parts) for a in (col_axis, row_axis))
+                cell = cells.setdefault(key, ([], [], set()))
+                cell[0].append(null)
+                cell[1].append(alt)
+                cell[2].add(parts)
+        if not cells:
+            raise ValueError(f"No {metric} could be drawn: no caster scores for {axes}")
+        col_vals = _pooled_axis_values(col_axis, {k[0] for k in cells})
+        row_vals = _pooled_axis_values(row_axis, {k[1] for k in cells})
+        fig, axs = plt.subplots(len(row_vals), len(col_vals), figsize=(max(9, 5 * len(col_vals)), 4.0 * len(row_vals) + 1.0),
+                                squeeze=False)
+        for ri, rv in enumerate(row_vals):
+            for ci, cv in enumerate(col_vals):
+                ax = axs[ri][ci]
+                cell = cells.get((cv, rv))
+                if cell is None:
+                    ax.set_visible(False)
+                    continue
+                null, alt = np.concatenate(cell[0]), np.concatenate(cell[1])
+                scores = np.concatenate([null, alt])
+                labels = np.r_[np.zeros(len(null), dtype=int), np.ones(len(alt), dtype=int)]
+                if normalize:
+                    scores = _minmax_normalize(scores, normalize)
+                panel(ax, scores, labels, topologies, normalize, logx)
+                if not legend:
+                    for text in list(ax.texts):
+                        text.remove()
+                if logx and ax.get_xscale() == "linear" and metric in ("ecdf", "fit"):
+                    ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.grid(alpha=0.25)
+                ax.set_xlabel(f"normalized {xlabel}" if normalize and "score" in xlabel else xlabel)
+                head = " ".join(_gt_mean_axis_label(a, v) for a, v in ((col_axis, cv), (row_axis, rv)) if a is not None)
+                ax.set_title(f"{head} (n runs = {len(cell[2])})".strip(), fontsize=10)
+                if ci == 0:
+                    ax.set_ylabel(f"{_gt_mean_axis_label(row_axis, rv)}\n{ylabel}" if row_axis else ylabel)
+        _suptitle(fig, title or f"GT Null (dashed) vs Outlier (solid) {what}, pooled over all runs"
+                  + (f" — {pattern}" if pattern is not None else ""), fontsize=10)
+        items = legend_items(topologies)
+        _legend_below_axes(fig, [h for h, _ in items], [l for _, l in items], ncol=min(len(items), 6), fontsize=8)
+        plt.show()
+        return fig
+
+    def _plot_window_ecdf(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
+                          logx=None, linthresh=None, normalize=False, legend=True, color=None):
+        if color not in (None, "bl"):
+            raise ValueError(f"window_ecdf: color must be None or 'bl', got {color!r}")
+        if color == "bl" and runs is not None:
+            raise ValueError("window_ecdf: color='bl' needs the pooled form (no run=)")
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        cols = [TOPOLOGY_NAMES.index(t) for t in topologies]
+        figs = []
+        if runs is None and color == "bl":
+            series = []
+            for w, root in self._caster_window_roots(axes):
+                runs_w = _caster_scores_by_run(root, tuple(exclude_keywords), pattern)
+                if not runs_w:
+                    continue
+                bls = [_sim_cu_branch_length(str(root / Path(*parts[:3]))) or np.nan for parts, _, _ in runs_w]
+                series.append((w, np.concatenate([r[1] for r in runs_w]), np.concatenate([r[2] for r in runs_w]), len(runs_w),
+                               *(np.concatenate([np.full(len(r[i]), bl) for r, bl in zip(runs_w, bls)]) for i in (1, 2))))
+            if series:
+                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean",
+                                                title or f"GT window-mean ECDFs pooled over all runs by window size, points colored by CU branch length "
+                                                f"(n runs = {series[0][3]})" + (f" — {pattern}" if pattern is not None else ""),
+                                                symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
+                                                legend=legend, color_by_bl=True))
+        elif runs is None:
+            series = []
+            for w, root in self._caster_window_roots(axes):
+                pooled = _pooled_caster_scores(root, tuple(exclude_keywords), pattern)
+                if pooled[0] is not None:
+                    series.append((w, *pooled))
+            if series:
+                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean",
+                                                title or f"GT window-mean ECDFs pooled over all runs by window size (n runs = {series[0][3]})"
+                                                + (f" — {pattern}" if pattern is not None else ""),
+                                                symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
+                                                legend=legend))
+        for label, path in runs or ():
+            entries, df = self._ecdf_entries(axes, path, exclude_keywords, None)
+            by_pattern = {}
+            for _, tail, recorded, _, scores_path, entry_pattern in entries:
+                if pattern is None or str(entry_pattern) == str(pattern):
+                    by_pattern.setdefault(tail, []).append((recorded["window_size"], scores_path, entry_pattern))
+            for tail, windows in by_pattern.items():
+                series = []
+                for w, scores_path, entry_pattern in sorted(windows, key=lambda w: w[0]):
+                    try:
+                        scores, y_true = _scores_with_truth(scores_path, entry_pattern)
+                    except ValueError as e:
+                        print(f"Skipping w{format_val(w)}: {e}")
+                        continue
+                    series.append((w, scores[y_true == 0], scores[y_true == 1]))
+                if not series:
+                    continue
+                rel = "/".join((_path_after_out(path),) + tuple(tail))
+                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean", title or
+                                                f"{label or rel} ({_branch_length_label(df, windows[0][1].parent)}): GT window-mean ECDFs by window size",
+                                                symlog=bool(logx), linthresh=linthresh, normalize=normalize, legend=legend))
+        if not figs:
+            raise ValueError(f"No window_ecdf could be drawn for {runs and [p for _, p in runs]} with {axes}")
+        plt.show()
+        return figs[0] if len(figs) == 1 else figs
+
+    def _plot_ecdf_all(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
+                       logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99), vs_bl=False):
+        prefixes = [Path(p).parts for p in runs or ()]
+        figs = []
+        for w, root in self._caster_window_roots(axes):
+            branches = {}
+            for parts, null, alt in _caster_scores_by_run(root, tuple(exclude_keywords), pattern):
+                if prefixes and not any(parts[:len(p)] == p for p in prefixes):
+                    continue
+                branch = branches.setdefault(parts[:3], ([], []))
+                branch[0].append(null)
+                branch[1].append(alt)
+            if not branches:
+                continue
+            bls = {k: _sim_cu_branch_length(str(root / Path(*k))) for k in branches}
+            scope = ", ".join("/".join(p) for p in prefixes) or "all runs"
+            figs.append((_mean_vs_bl_all_figure if vs_bl else _ecdf_all_figure)(
+                branches, bls, topologies, ("Null", "Outlier"), normalize, logx, linthresh, legend, percentile,
+                lambda n: title or f"w{format_val(w)} GT {'per-branch window-mean mean vs CU branch length' if vs_bl else 'window-mean ECDFs per branch'}, {scope} (n experiments = {n}, "
+                f"branches = {len(branches)}, x = p{format_val(percentile[0])}–p{format_val(percentile[1])})"
+                + (f" — {pattern}" if pattern is not None else "")))
+        if not figs:
+            raise ValueError(f"No {'mean_all_vs_bl' if vs_bl else 'ecdf_all'} could be drawn for {runs} with {axes}")
+        plt.show()
+        return figs[0] if len(figs) == 1 else figs
+
+    def _plot_ecdf_all_hmm(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
+                          logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99)):
+        prefixes = [Path(p).parts for p in runs or ()]
+        dirs = sorted({d for _, ds in self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords) for d in ds})
+        figs = []
+        for leaf in dirs:
+            leaf = Path(leaf)
+            args = self._get_args(leaf)
+            branches, bls, skipped = {}, {}, 0
+            for report in sorted((leaf / "reports").glob("*/*/*/*.tsv")):
+                parts = report.relative_to(leaf / "reports").with_suffix("").parts
+                if prefixes and not any(parts[:len(p)] == p for p in prefixes):
+                    continue
+                if (pattern is not None and parts[3] != str(pattern)) or any(k in str(report) for k in exclude_keywords):
+                    continue
+                scores_path = get_expected_scores_path(
+                    Path("simulations", *parts[:3], "concat", f"{parts[3]}.fa"), Path(*parts[:3]),
+                    window_size=args.get("window_size"), step_size=args.get("step_size"),
+                    **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
+                try:
+                    scores, _, y_pred, _ = _report_window_labels(report, scores_path, parts[3])
+                except ValueError:
+                    skipped += 1
+                    continue
+                branch = branches.setdefault(parts[:3], ([], []))
+                branch[0].append(scores[y_pred == 0])
+                branch[1].append(scores[y_pred == 1])
+                bls.setdefault(parts[:3], _sim_cu_branch_length(str(scores_path.parent.parent)))
+            if skipped:
+                print(f"{leaf}: skipped {skipped} reports without a usable state path/scores")
+            if not branches:
+                continue
+            scope = ", ".join("/".join(p) for p in prefixes) or "all runs"
+            config = str(leaf.relative_to(self.root)) if leaf.is_relative_to(self.root) else str(leaf)
+            figs.append(_ecdf_all_figure(
+                branches, bls, topologies, ("Null HMM", "Outlier HMM"), normalize, logx, linthresh, legend, percentile,
+                lambda n: title or f"{_size_label(config)} HMM (Viterbi) window-mean ECDFs per branch, {scope} (n experiments = {n}, "
+                f"branches = {len(branches)}, x = p{format_val(percentile[0])}–p{format_val(percentile[1])})"
+                + (f" — {pattern}" if pattern is not None else "")))
+        if not figs:
+            raise ValueError(f"No ecdf_all_hmm could be drawn for {runs} with {axes}")
+        plt.show()
+        return figs[0] if len(figs) == 1 else figs
+
+    def _plot_gt_mean_ecdf(self, metric, axes, agg=(), pattern=None, exclude_keywords=(), title="",
+                           topologies=TOPOLOGY_NAMES, logx=None, linthresh=None, normalize=False, legend=True,
+                           per_window=False):
+        logx = (not normalize) if logx is None else logx
+        linthresh = linthresh or 1e-2
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        if per_window:
+            long = self._gt_window_gaps(axes, topologies, exclude_keywords, pattern, normalize)
+        else:
+            dirs = [d for _, ds in self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords) for d in ds]
+            df = _load_raw_config_df(dirs, self._get_args)
+            if df.empty:
+                raise ValueError(f"No runs.tsv found for {axes}")
+            if pattern is not None:
+                df = df[df["pattern"].astype(str) == str(pattern)]
+            df = df.drop_duplicates(["run_id", "_window_size"]).copy()
+            df["_cu"] = _cu_branch_lengths(df)
+            df["branch_length"] = df["_cu"].apply(lambda v: None if pd.isna(v) else assign_bin(v, BRANCH_LENGTH_BIN_EDGES))
+            parts = []
+            for t in topologies:
+                null_alt = df[[f"null_mean_{t}", f"alt_mean_{t}"]].to_numpy(dtype=float)
+                if normalize:
+                    null_alt = _minmax_normalize(null_alt, normalize)
+                parts.append(df.assign(topology=t, _null=null_alt[:, 0], _alt=null_alt[:, 1]))
+            long = pd.concat(parts, ignore_index=True)
+            long["_gap"] = long["_alt"] - long["_null"]
+
+        scatter = metric.endswith("_vs_bl")
+        value = "_gap" if metric.startswith("gap") else None
+        agg = [a for a in agg if a] or (["topology", "branch_length"] if metric == "mean_ecdf" else ["topology", "merged_category"])
+        if len(agg) > 3:
+            raise ValueError(f"{metric} agg is [curves, cols, rows], got {agg}")
+        if "-w" not in agg and long["_window_size"].nunique() > 1:
+            if len(agg) == 3:
+                raise ValueError(f"{metric}: several -w values but no agg slot left for '-w'")
+            agg = agg + ["-w"]
+        cols = [{"-w": "_window_size"}.get(a, a) for a in agg]
+        for a, c in zip(agg, cols):
+            if c not in long.columns:
+                raise KeyError(f"{metric}: unknown agg axis {a!r}")
+        long = long.dropna(subset=cols + (["_cu"] if scatter else []))
+        curve_col, col_col, row_col = (cols + [None, None])[:3]
+        curve_vals = _gt_mean_axis_values(long, curve_col)
+        col_vals = _gt_mean_axis_values(long, col_col) if col_col else [None]
+        row_vals = _gt_mean_axis_values(long, row_col) if row_col else [None]
+        colors = {v: _ECDF_TOPO_COLORS[v] if curve_col == "topology" else f"C{i % 10}" for i, v in enumerate(curve_vals)}
+
+        fig, axs = plt.subplots(len(row_vals), len(col_vals), figsize=(4 * len(col_vals), 3.2 * len(row_vals) + 1.0),
+                                sharey=True, squeeze=False)
+        for ri, rv in enumerate(row_vals):
+            for ci, cv in enumerate(col_vals):
+                ax = axs[ri][ci]
+                mask = pd.Series(True, index=long.index)
+                if col_col:
+                    mask &= long[col_col] == cv
+                if row_col:
+                    mask &= long[row_col] == rv
+                cell = long[mask]
+                entries = []
+                for v in curve_vals:
+                    sub = cell[cell[curve_col] == v]
+                    if not len(sub):
+                        continue
+                    label = _gt_mean_axis_label(agg[0], v)
+                    entries.append((plt.Line2D([], [], color=colors[v], linewidth=1.6),
+                                    f"{label}: μ={sub['_gap'].mean():+.3g}" if value else
+                                    f"{label}: N {sub['_null'].mean():.3g} / O {sub['_alt'].mean():.3g}"))
+                    if scatter:
+                        for _, state, _ in _STATE_STYLES if value is None else [(None, None, None)]:
+                            y = sub[value or ("_alt" if state else "_null")]
+                            ax.scatter(sub["_cu"], y, s=18, linewidths=1, edgecolors=colors[v],
+                                       facecolors="none" if state == 0 else colors[v], alpha=0.8)
+                    elif metric == "gap_ecdf":
+                        mean, _ = _draw_ecdf(ax, sub["_gap"].to_numpy(dtype=float), color=colors[v], linewidth=1.6)
+                        if mean is not None:
+                            ax.axvline(mean, color=colors[v], linestyle="--", linewidth=1)
+                    else:
+                        for _, state, linestyle in _STATE_STYLES:
+                            _draw_ecdf(ax, sub["_alt" if state else "_null"].to_numpy(dtype=float), color=colors[v],
+                                       linestyle=linestyle, linewidth=1.6)
+                if scatter:
+                    ax.set_xscale("log")
+                    if value:
+                        ax.axhline(0, color="gray", linewidth=0.5)
+                    if logx:
+                        ax.set_yscale("symlog", linthresh=linthresh)
+                elif metric == "gap_ecdf":
+                    ax.axvline(0, color="gray", linewidth=0.5)
+                if logx and not scatter:
+                    ax.set_xscale("symlog", linthresh=linthresh)
+                ax.grid(alpha=0.25)
+                if legend and entries:
+                    ax.legend([h for h, _ in entries], [l for _, l in entries], fontsize=6, loc="best")
+                if ri == 0:
+                    ax.set_title(f"{_gt_mean_axis_label(agg[1], cv) if col_col else ''} (n={cell['run_id'].nunique()})", fontsize=10)
+                quantity = ("normalized " if normalize else "") + (("Outlier window − Null GT mean" if per_window else
+                                                                     "Outlier − Null GT mean") if value else "GT mean")
+                if ri == len(row_vals) - 1:
+                    ax.set_xlabel("branch length (CU)" if scatter else quantity)
+                if ci == 0:
+                    ylabel = quantity if scatter else "proportion"
+                    ax.set_ylabel(f"{_gt_mean_axis_label(agg[2], rv)}\n{ylabel}" if row_col else ylabel)
+        what = {"gap_ecdf": "Outlier window − run Null mean gap ECDFs (dashed = mean)" if per_window else
+                "Outlier − Null mean gap ECDFs (dashed = mean)",
+                "mean_ecdf": "Null (dashed) vs Outlier (solid) mean ECDFs",
+                "gap_vs_bl": "Outlier − Null mean gap vs CU branch length",
+                "mean_vs_bl": "Null (hollow) vs Outlier (filled) mean vs CU branch length"}[metric]
+        _suptitle(fig, title or f"GT {'per-window' if per_window else 'per-run'} {what}"
+                  + (f" — {pattern}" if pattern is not None else ""), fontsize=10)
+        if not legend:
+            labels = [_gt_mean_axis_label(agg[0], v) for v in curve_vals]
+            handles = [plt.Line2D([], [], color=colors[v], linewidth=1.6) for v in curve_vals]
+            _legend_below_axes(fig, handles, labels, ncol=min(len(labels), 8), fontsize=8)
+        plt.show()
+        return fig
+
+    def _gt_window_gaps(self, axes, topologies, exclude_keywords=(), pattern=None, normalize=False):
+        rows, ranges = [], {}
+        for w, root in self._caster_window_roots(axes):
+            for parts, null, alt in _caster_scores_by_run(root, tuple(exclude_keywords), pattern):
+                if not len(null) or not len(alt):
+                    continue
+                cu = _sim_cu_branch_length(str(root / Path(*parts[:3])))
+                meta = {"_window_size": w, "category": parts[0], "subcategory": parts[1],
+                        "merged_category": _POOLED_SCORE_AXES["merged_category"](w, parts), "pattern": parts[3],
+                        "run_id": "/".join(parts), "_cu": cu,
+                        "branch_length": None if cu is None else assign_bin(cu, BRANCH_LENGTH_BIN_EDGES)}
+                for t in topologies:
+                    col = TOPOLOGY_NAMES.index(t)
+                    vals = np.concatenate([null[:, col], alt[:, col]])
+                    vals = vals[np.isfinite(vals)]
+                    if len(vals):
+                        lo, hi = ranges.get(t, (np.inf, -np.inf))
+                        ranges[t] = (min(lo, vals.min()), max(hi, vals.max()))
+                    rows.append(pd.DataFrame({**meta, "topology": t, "_gap": alt[:, col] - np.nanmean(null[:, col])}))
+        if not rows:
+            raise ValueError(f"No caster scores for {axes}")
+        long = pd.concat(rows, ignore_index=True)
+        if normalize:
+            span = long["topology"].map({t: (hi - lo if hi > lo else 1.0) for t, (lo, hi) in ranges.items()})
+            long["_gap"] = (1 if normalize == "0-1" else 2) * long["_gap"] / span
+        return long
+
+    def _caster_window_roots(self, axes):
+        windows = axes.get("-w", axes.get("--window-size"))
+        if windows is None:
+            raise ValueError("window_ecdf needs a '-w' axis")
+        dests = {_FLAG_TO_DEST.get(k): v for k, v in axes.items()}
+        variants = {d: bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
+        roots = []
+        for w in windows if isinstance(windows, (list, tuple)) else [windows]:
+            w = _typed_value("-w", w)
+            scores = get_expected_scores_path(Path("simulations", "10X", "down", "N0", "concat", "_.fa"), Path("10X", "down", "N0"),
+                                              window_size=w, step_size=w, **variants)
+            roots.append((w, scores.parents[4]))
+        return sorted(roots, key=lambda r: r[0])
+
     def plot(self, *args, show_axes=True, legend=None, gtrees=False, **kwargs):
         if legend not in (None, "hide", "values"):
             raise ValueError(f"legend must be None, 'hide', or 'values', got {legend!r}")
@@ -1436,6 +2023,8 @@ class CrossRunAnalysis:
                         text.set_text(re.sub(r"\s*\([^()]*±[^()]*\)$", "", text.get_text()))
                     if all(text.get_text() == "all" for text in leg.get_texts()):
                         leg.remove()
+                if getattr(fig, "_legend_params", "") and fig.legends:
+                    fig.legends[0].set_title(fig._legend_params, prop={"size": 8})
             if not show_axes:
                 if fig._suptitle is not None:
                     fig._suptitle.set_text("")
@@ -1478,7 +2067,7 @@ class CrossRunAnalysis:
         from matplotlib.colors import to_hex
         if metric == "f1":
             agg = agg or [("phlag", "-w"), "x_bin", "merged_category", "fraction_bin"]
-            paper_of = lambda row, col, label: PHLAG_PAPER_F1[row][col].get(label, (0.0, 0.0))
+            paper_of = lambda row, col, label: PHLAG_PAPER_REPLICATE_F1[row][col].get(label, (0.0, 0.0))
         else:
             agg = agg or [("phlag", "-w"), "", "merged_category", "fraction_bin"]
             paper_of = lambda row, col, label: (PHLAG_PAPER_FPR_TPR[row][col][1 if metric == "tpr" else 0], 0.0)
@@ -1500,6 +2089,19 @@ class CrossRunAnalysis:
             if err and errorbar is not None:
                 ax.errorbar(pos, mean, yerr=err, fmt="none", ecolor="black", elinewidth=1.0, capsize=2, zorder=3)
         legend.get_texts()[paper_idx].set_text("Phlag (paper)")
+        spread = {"default": "SEM", "sem": "SEM", "sd": "SD"}.get(errorbar)
+        if plot_type == "violin":
+            note = ("Violin: KDE of values inside 1.5·IQR, truncated at their min/max; "
+                    "dots = outliers beyond it.")
+            if errorbar not in (None, "default"):
+                note += f" Middle tick = mean, capped ticks = mean ± {spread}."
+            else:
+                note += " Tick = mean."
+        else:
+            note = f"Bars: mean ± {spread}." if spread else "Bars: mean."
+        if errorbar is not None:
+            note += "  Phlag (paper): published mean ± paper's SEM."
+        fig.text(0.01, 0.005, note, ha="left", va="bottom", fontsize=7, color="gray")
         return fig
 
     def _tpr_fpr_vs_paper(self, config, agg=None, **kwargs):
@@ -1546,7 +2148,50 @@ class CrossRunAnalysis:
         (label = the dir minus its trailing <node>/<pattern>) plots one
         column per run instead.
         `exclude_keywords` drops report paths containing any keyword; `logy`
-        log-scales y; agg/grid_by/plot_type don't apply. dir="store" reads
+        log-scales y; agg/grid_by/plot_type don't apply, except
+        metrics=["ecdf"] (or "qq": QQ vs Laplace(median, mean abs dev),
+        "fit": ECDF vs Gaussian/Laplace MLE CDFs, "fit_qq": QQ vs the
+        Laplace fit with the Gaussian fit's curve, each with KS D boxes;
+        option "topologies" limits the drawn ones): `run` is one run, a list, or a {label: run} dict
+        (one column each, titled category / node / branch length unless
+        labeled); a run without a pattern (category/sub/node) draws one
+        figure per pattern. Null (dashed) vs Outlier (solid), all
+        topologies overlaid, a Delta(O-N) mean box per panel; rows = the
+        "-w" values when several, or agg's row flag. By default windows are
+        split by ground truth, read straight from store/caster for each
+        "-w" (step = window, variant flags from axes, `dir` unused);
+        agg=["em"] splits by the EM state path of out/ (or dir="store")
+        reports instead. Every distribution metric (window_ecdf, ecdf/qq/
+        fit/fit_qq, gap_ecdf/mean_ecdf/*_vs_bl) takes the same options:
+        "pattern" (only that pattern), "topologies", "logx" (log when
+        all-positive, else symlog at "linthresh"; per-metric default),
+        "normalize" (default False: min-max maps each panel's/series'
+        values to [-1, 1]; gap/mean metrics map each topology's Null+Outlier
+        means jointly, then take the gap; logx then defaults off), "legend"
+        (default True: per-subplot legend / box of each curve's mean;
+        False = one shared legend, no means). metrics=["window_ecdf"]:
+        every "-w" value overlaid (gray, light = small), cols = topologies,
+        rows = GT Null/Outlier; with `run`, one figure per run/pattern of
+        its window scores, without, one figure of every store/caster run's
+        GT mean (gt_stats.txt) for each window; color="bl" (pooled only)
+        colors each ECDF's points by their run's CU branch length (linear
+        rainbow; window lines + mean vlines stay gray on top). metrics=["ecdf_all"]: one
+        figure per "-w", one thin GT window-score ECDF per branch (sim,
+        patterns pooled) colored by CU branch length, cols = topologies,
+        rows = Null/Outlier; `run` (e.g. "10X/down", a list of them)
+        restricts branches by store/caster path prefix; option
+        "percentile" (default (1, 99)) sets each column's x range from the
+        pooled values. metrics=["mean_all_vs_bl"]: same branches, clipping
+        and normalize as ecdf_all, but one point per branch = its clipped
+        mean vs CU branch length (log x; logx=False = linear) with a fitted
+        y = a + b·e^(−kx). normalize="0-1" (any dist metric) min-max
+        normalizes to [0, 1] instead of [-1, 1].
+        metrics=["ecdf_all_hmm"]: ecdf_all split by each
+        report's Viterbi state path instead of GT, one figure per store run
+        dir matching `axes`. metrics=["ecdf_hmm"]: one figure per run/pattern
+        (store/out reports as agg=["em"]), cols = topologies, rows = agg's
+        row flag (e.g. ["--np"]) or "-w", Null EM vs Outlier EM ECDFs split
+        by the Viterbi path, vlines/box = state means. dir="store" reads
         the same run's reports from self.root's leaf dirs instead of out/
         (reports/<run>.tsv, filtered by each leaf's args.json, config = leaf
         path minus its size segment -- see collect_store_runs). Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
@@ -1704,6 +2349,39 @@ class CrossRunAnalysis:
         by caster/benchmark before phlag's EM ever runs) so the title
         doesn't imply a dependency that isn't there."""
         assert metrics is not None, "metrics is required"
+        dist_metric = next((m for m in metrics if m in _DIST_METRICS), None)
+        if dist_metric is not None:
+            if len(metrics) != 1:
+                raise ValueError(f"pass metrics=[{dist_metric!r}] on its own")
+            unknown = set(options or {}) - _DIST_OPTIONS - ({"percentile"} if dist_metric in ("ecdf_all", "ecdf_all_hmm", "mean_all_vs_bl") else set()) \
+                - ({"per_window"} if dist_metric == "gap_ecdf" else set())
+            if unknown:
+                raise ValueError(f"{dist_metric}: unknown options {sorted(unknown)} (takes {sorted(_DIST_OPTIONS)})")
+            opts = {"pattern": None, "topologies": TOPOLOGY_NAMES, "logx": None, "linthresh": None, "normalize": False,
+                    "legend": True, **(options or {})}
+            runs = None if run is None else list(run.items()) if isinstance(run, dict) else [(None, p) for p in run] if isinstance(run, (list, tuple)) else [(None, run)]
+            runs = runs and [(label, _resolve_run_path(p)) for label, p in runs]
+            if dist_metric in ("ecdf_all", "mean_all_vs_bl"):
+                return self._plot_ecdf_all(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
+                                           title=title, vs_bl=dist_metric == "mean_all_vs_bl", **opts)
+            if dist_metric == "ecdf_all_hmm":
+                return self._plot_ecdf_all_hmm(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
+                                              title=title, **opts)
+            if dist_metric == "ecdf_hmm":
+                if run is None:
+                    raise ValueError("ecdf_hmm needs run=")
+                return self._plot_ecdf_hmm(axes, runs, agg=agg, exclude_keywords=exclude_keywords, title=title, dir=dir, **opts)
+            if dist_metric == "window_ecdf":
+                return self._plot_window_ecdf(axes, runs, exclude_keywords=exclude_keywords, title=title, color=color, **opts)
+            if dist_metric in _SCORE_DIST_METRICS:
+                if run is None:
+                    return self._plot_score_dist_pooled(dist_metric, axes, agg=agg, exclude_keywords=exclude_keywords,
+                                                        title=title, **opts)
+                return self._plot_score_dist(dist_metric, axes, runs, agg=agg, exclude_keywords=exclude_keywords,
+                                             title=title, dir=dir, **opts)
+            if run is not None:
+                raise ValueError(f"{dist_metric!r} takes no run=")
+            return self._plot_gt_mean_ecdf(dist_metric, axes, agg=agg, exclude_keywords=exclude_keywords, title=title, **opts)
         if isinstance(run, (list, tuple)):
             run = {"/".join(Path(p).parts[:-2]) or str(p): p for p in run}
         if isinstance(run, dict):
@@ -1725,11 +2403,12 @@ class CrossRunAnalysis:
             configs = self._shared_configs(configs, 1 if shared is True else shared)
         self._last_configs = configs
         suffix = self._title_suffix(configs) if show_config_suffix else ""
+        params, suffix = (_compose_title(suffix), "") if title else ("", suffix)
         kw = dict(plot_type=plot_type, grid_by=grid_by, title=title, options=options, logx=logx, logy=logy,
                   interp=interp, agg_idx=agg_idx, errorbar=errorbar, color=color, scalex=scalex, scaley=scaley)
         levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
         if levels <= 4:
-            return self._plot_resolved(configs, metrics, suffix, **kw)
+            return _tag_legend_params(self._plot_resolved(configs, metrics, suffix, **kw), params)
         split_idx = min(range(levels), key=lambda i: (len(self._axis_values(configs, i)), -i))
         split_name = _axis_flag_label(self._agg_axis_names[configs[0][0]][split_idx])
         order = self._axis_values(configs, split_idx)
@@ -1741,7 +2420,7 @@ class CrossRunAnalysis:
         kw["agg_idx"] = agg_idx - (agg_idx > split_idx)
         per_group = [self._plot_resolved(groups[value], metrics, f"{suffix} — {split_name}={value}", **kw)
                      for value in order]
-        return [list(row) for row in zip(*per_group)]
+        return _tag_legend_params([list(row) for row in zip(*per_group)], params)
 
     def _plot_resolved(self, configs, metrics, suffix, plot_type, grid_by, title, options, logx, logy, interp,
                        agg_idx, errorbar, color, scalex, scaley):
@@ -1781,7 +2460,7 @@ class CrossRunAnalysis:
             return figs
 
         if levels >= 2 and grid_by is None:
-            figs.extend(self._plot_grouped(configs, metrics, plot_type, title_suffix=suffix,
+            figs.extend(self._plot_grouped(configs, metrics, plot_type, title_suffix=suffix, title=title,
                                             logx=logx, logy=logy, interp=interp, agg_idx=agg_idx,
                                             errorbar=errorbar))
             return figs
@@ -2131,7 +2810,7 @@ class CrossRunAnalysis:
                 values[target] = (window_means.mean(), window_stds.mean())
         return values
 
-    def _plot_grouped(self, configs, metrics, plot_type, title_suffix="", logx=False, logy=False, interp=False,
+    def _plot_grouped(self, configs, metrics, plot_type, title_suffix="", title="", logx=False, logy=False, interp=False,
                       agg_idx=0, errorbar="default"):
         """logx/logy/interp: see plot()'s options= docstring -- applied per
         subplot here, since each (row, col) cell can have its own
@@ -2311,7 +2990,7 @@ class CrossRunAnalysis:
                             if len(pts) > 1:
                                 xs, ys, _ = zip(*pts)
                                 ax.plot(xs, ys, "-", color=interp_color(hv, pts), linewidth=1.3, alpha=0.85, zorder=4)
-            _suptitle(fig, _compose_title(title_suffix, ""), fontsize=12, y=0.99)
+            _suptitle(fig, _compose_title(title_suffix, title), fontsize=12, y=0.99)
             if bar_axis_label and grid_rows * grid_cols == 1:
                 fig.supxlabel(bar_axis_label, fontsize=9)
             if pooled_legend or len(leg_vals) > 1 or leg_vals not in ([None], ["(none)"]):
@@ -2388,7 +3067,7 @@ class CrossRunAnalysis:
                             if len(pts) > 1:
                                 xs, ys, _ = zip(*pts)
                                 ax.plot(xs, ys, "-", color=interp_color(hv, pts), linewidth=1.3, alpha=0.85, zorder=4)
-            _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
+            _suptitle(fig, _compose_title(title_suffix, title, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
             # A single subplot's bar categories aren't otherwise labeled
             # anywhere, so the shared axis label carries real information
             # there -- but a multi-subplot grid repeats the same bar
@@ -2888,6 +3567,452 @@ _OUT_TRANSITION_TOTAL_COLUMNS = [f"{prefix}_transition_total" for prefix in ("fi
 _OUT_RUN_COLUMNS = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_TRANSITION_TOTAL_COLUMNS + _OUT_GT_STATS_COLUMNS
 
 
+_ECDF_TOPO_COLORS = {"ABBA": "#1F77B4", "BABA": "#D62728", "AABB": "#2CA02C"}
+_ECDF_MAX_POINTS = 2000
+_RE_STATE_OCCUPANCY = re.compile(r"^State occupancy \(posterior, windows\): Null ([-\d.eE+na]+), Alt ([-\d.eE+na]+)")
+
+
+_SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus")
+
+
+def _scores_with_truth(scores_path, pattern):
+    if scores_path is None or not Path(scores_path).exists():
+        raise ValueError(f"no scores.tsv ({scores_path or 'above the report'})")
+    scores_path = Path(scores_path)
+    df = pd.read_csv(scores_path, sep="\t").drop_duplicates("pos").sort_values("pos")
+    columns = [next((c for c in df.columns if t.lower() in c.lower()), None) for t in TOPOLOGY_NAMES]
+    if None in columns:
+        raise ValueError(f"{scores_path.name} lacks the {'/'.join(TOPOLOGY_NAMES)} columns")
+    positions = df["pos"].to_numpy()
+    _, anomaly_intervals, _ = parse_pattern_string(pattern, block_size_bp=500000, total_span=positions.max())
+    y_true = np.zeros(len(positions), dtype=int)
+    for start_bp, end_bp in anomaly_intervals:
+        y_true[(positions >= start_bp) & (positions <= end_bp)] = 1
+    return df[columns].to_numpy(dtype=float), y_true
+
+
+def _report_window_labels(report, scores_path, pattern):
+    report = Path(report)
+    for d in report.parents if scores_path is None else ():
+        if (d / "scores.tsv").exists():
+            scores_path = d / "scores.tsv"
+            break
+        if _OUT_SIZE_SEGMENT.match(d.name):
+            break
+    scores, y_true = _scores_with_truth(scores_path, pattern)
+    occupancy = path_line = None
+    with open(report) as handle:
+        for line in handle:
+            m = _RE_STATE_OCCUPANCY.match(line)
+            if m:
+                occupancy = (float(m.group(1)), float(m.group(2)))
+            if _RE_STATE_PATH.match(line.strip()):
+                path_line = line.strip()
+                break
+    if path_line is None:
+        raise ValueError("no state path in the report")
+    y_pred = np.array(path_line.split(","), dtype=int)
+    if len(y_pred) != len(y_true):
+        raise ValueError(f"state path has {len(y_pred)} windows, scores.tsv {len(y_true)}")
+    return scores, y_true, y_pred, occupancy
+
+
+_CASTER_VARIANT_DIRS = {"site", "pair", "ilr", "normalize", "norm-eps", "exp-minus"}
+_WINDOW_ECDF_LINTHRESH = 1e-2
+
+
+def _minmax_normalize(values, mode=True):
+    finite = values[np.isfinite(values)]
+    if not len(finite):
+        return values
+    lo, hi = finite.min(), finite.max()
+    unit = (values - lo) / (hi - lo if hi > lo else 1.0)
+    return unit if mode == "0-1" else 2 * unit - 1
+
+
+@functools.lru_cache(maxsize=32)
+def _caster_scores_by_run(root, exclude_keywords=(), pattern=None):
+    runs = []
+    for scores_path in sorted(root.glob("*/*/*/*/scores.tsv")):
+        if scores_path.relative_to(root).parts[0] in _CASTER_VARIANT_DIRS or any(k in str(scores_path) for k in exclude_keywords):
+            continue
+        if pattern is not None and scores_path.parent.name != str(pattern):
+            continue
+        try:
+            scores, y_true = _scores_with_truth(scores_path, scores_path.parent.name)
+        except ValueError:
+            continue
+        runs.append((scores_path.relative_to(root).parts[:4], scores[y_true == 0], scores[y_true == 1]))
+    return tuple(runs)
+
+
+def _pooled_caster_scores(root, exclude_keywords=(), pattern=None):
+    runs = _caster_scores_by_run(root, exclude_keywords, pattern)
+    if not runs:
+        return None, None, 0
+    return np.concatenate([r[1] for r in runs]), np.concatenate([r[2] for r in runs]), len(runs)
+
+
+def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, linthresh=None, normalize=False, legend=True,
+                        color_by_bl=False):
+    if normalize:
+        series = [(w, *np.split(_minmax_normalize(np.concatenate([null, alt]), normalize), [len(null)]), *rest)
+                  for w, null, alt, *rest in series]
+        xlabel = f"normalized {xlabel}"
+    colors = plt.cm.Greys(np.linspace(0.35, 1.0, len(series)))
+    norm = None
+    if color_by_bl:
+        known = np.concatenate([b for s in series for b in s[4:6]])
+        known = known[np.isfinite(known) & (known > 0)]
+        norm = matplotlib.colors.Normalize(known.min(), known.max()) if len(known) else None
+    fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols), 6.5), sharey=True, squeeze=False)
+    handles, entries = [], {}
+    for (w, null, alt, *_), color in zip(series, colors):
+        handles.append(matplotlib.lines.Line2D([], [], color=color, linewidth=1.6))
+        for state, vals in enumerate((null, alt)):
+            for ci, col in enumerate(cols):
+                mean, _ = _draw_ecdf(axs[state][ci], vals[:, col], color=color, linewidth=0.6 if norm else 1.3, zorder=4 if norm else 2)
+                if mean is not None:
+                    entries.setdefault((state, ci), []).append((handles[-1], f"w{format_val(w)}: μ={mean:.3g}"))
+                    if norm is not None:
+                        axs[state][ci].axvline(mean, color=color, linewidth=1.0, linestyle="--", zorder=5)
+                if norm is not None:
+                    _scatter_ecdf_by_bl(axs[state][ci], vals[:, col], series[[s[0] for s in series].index(w)][4 + state], norm)
+    for ci, col in enumerate(cols):
+        pooled = np.concatenate([v[:, col] for _, null, alt, *_ in series for v in (null, alt)])
+        pooled = pooled[np.isfinite(pooled)]
+        lo, hi = np.percentile(pooled, [0.5, 99.5] if symlog else [1, 99]) if len(pooled) else (0, 0)
+        for state, state_label in enumerate(("Null", "Outlier")):
+            ax = axs[state][ci]
+            if symlog:
+                ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.tick_params(axis="x", labelsize=6)
+            if hi > lo:
+                ax.set_xlim(lo, hi)
+            ax.set_ylim(0, 1)
+            ax.grid(alpha=0.25)
+            ax.set_title(f"{topologies[ci]} ({state_label})", fontsize=9)
+            if state == 1:
+                ax.set_xlabel(xlabel)
+            if ci == 0:
+                ax.set_ylabel("proportion")
+            if legend and (state, ci) in entries:
+                ax.legend(*zip(*entries[state, ci]), fontsize=6, loc="best")
+    _suptitle(fig, title, fontsize=10)
+    if norm is not None:
+        fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=_BL_POINT_CMAP), ax=axs, label="branch length (CU)",
+                     fraction=0.025, pad=0.02)
+    if not legend:
+        _legend_below_axes(fig, handles, [f"w{format_val(s[0])}" for s in series], ncol=min(len(series), 10), fontsize=8)
+    return fig
+
+
+_HMM_STATE_COLORS = ("#1F3B73", "#E4573D")
+
+
+_BL_POINT_CMAP = "rainbow"
+
+
+def _scatter_ecdf_by_bl(ax, vals, bls, norm):
+    keep = np.isfinite(vals)
+    order = np.argsort(vals[keep], kind="stable")
+    vals, bls = vals[keep][order], bls[keep][order]
+    if not len(vals):
+        return
+    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), _ECDF_MAX_POINTS)).astype(int))
+    known = np.isfinite(bls[idx]) & (bls[idx] > 0)
+    ax.scatter(vals[idx][known], (idx[known] + 1) / len(vals), c=bls[idx][known], cmap=_BL_POINT_CMAP, norm=norm, s=8,
+               linewidths=0, zorder=3, rasterized=True)
+
+
+def _size_label(text):
+    return re.sub(r"\b([wc])(\d+[km]?)_s(\d+[km]?)\b", lambda m: f"{m[1]}{m[2]}" if m[2] == m[3] else m[0], str(text))
+
+
+def _ecdf_all_series(branches, topologies, normalize, percentile):
+    topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+    cols = [TOPOLOGY_NAMES.index(t) for t in topologies]
+    series = {k: [np.concatenate(v) for v in vals] for k, vals in branches.items()}
+    if normalize:
+        series = {k: np.split(_minmax_normalize(np.concatenate(v), normalize), [len(v[0])]) for k, v in series.items()}
+    ranges, means = [], {}
+    for ci, col in enumerate(cols):
+        pooled = np.concatenate([v[:, col] for null, alt in series.values() for v in (null, alt)])
+        pooled = pooled[np.isfinite(pooled)]
+        lo, hi = np.percentile(pooled, percentile) if len(pooled) else (0, 0)
+        ranges.append((lo, hi))
+        for key, states in series.items():
+            for state in (0, 1):
+                x = states[state][:, col]
+                x = x[(x >= lo) & (x <= hi)] if hi > lo else x
+                means[key, state, ci] = np.nanmean(x) if len(x) else np.nan
+    return topologies, cols, series, ranges, means
+
+
+def _mean_vs_bl_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title):
+    topologies, cols, series, ranges, means = _ecdf_all_series(branches, topologies, normalize, percentile)
+    n_experiments = sum(len(null) for null, _ in branches.values())
+    keys = [k for k in series if bls[k]]
+    x = np.array([bls[k] for k in keys], dtype=float)
+    grid = np.geomspace(x.min(), x.max(), 200) if logx is not False else np.linspace(0, x.max(), 200)
+    fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols) + 1.2, 6.5), sharex=True, sharey="col", squeeze=False)
+    for ci in range(len(cols)):
+        for state, state_label in enumerate(state_labels):
+            ax = axs[state][ci]
+            y = np.array([means[k, state, ci] for k in keys], dtype=float)
+            ok = np.isfinite(y)
+            ax.scatter(x[ok], y[ok], s=14, color="C0", alpha=0.6, linewidths=0)
+            fit = _fit_exp_decay(x[ok], y[ok])
+            if fit is not None:
+                a, b, k = fit
+                ax.plot(grid, a + b * np.exp(-k * grid), color="black", linewidth=1.4)
+                ax.text(0.98, 0.98, f"y = {a:.3g} {'+' if b >= 0 else '−'} {abs(b):.3g}·e^(−{k:.3g}x)",
+                        transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
+            if logx is not False:
+                ax.set_xscale("log")
+            ax.grid(alpha=0.25)
+            ax.set_title(f"{topologies[ci]} ({state_label})", fontsize=9)
+            if state == 1:
+                ax.set_xlabel("branch length (CU)")
+            if ci == 0:
+                ax.set_ylabel("normalized mean" if normalize else "mean")
+    _suptitle(fig, title(n_experiments), fontsize=10)
+    return fig
+
+
+def _fit_exp_decay(x, y):
+    if len(x) < 4:
+        return None
+    try:
+        params, _ = optimize.curve_fit(lambda t, a, b, k: a + b * np.exp(-k * t), x, y,
+                                             p0=(y[np.argmax(x)], y[np.argmin(x)] - y[np.argmax(x)], 1.0), maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None
+    return params
+
+
+def _ecdf_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title):
+    topologies, cols, series, ranges, means = _ecdf_all_series(branches, topologies, normalize, percentile)
+    n_experiments = sum(len(null) for null, _ in branches.values())
+    known = [v for v in bls.values() if v]
+    norm = matplotlib.colors.LogNorm(min(known), max(known)) if known else None
+    fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols) + 1.2, 6.5), sharey=True, squeeze=False)
+    for key in sorted(series, key=lambda k: bls[k] or np.inf):
+        color = plt.cm.viridis(norm(bls[key])) if bls[key] and norm else "gray"
+        for state in (0, 1):
+            for ci, col in enumerate(cols):
+                _draw_ecdf(axs[state][ci], series[key][state][:, col], color=color, linewidth=0.7, alpha=0.6)
+    symlog = (not normalize) if logx is None else logx
+    for ci, col in enumerate(cols):
+        lo, hi = ranges[ci]
+        for state, state_label in enumerate(state_labels):
+            ax = axs[state][ci]
+            if symlog:
+                ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.tick_params(axis="x", labelsize=6)
+            if hi > lo:
+                ax.set_xlim(lo, hi)
+            ax.set_ylim(0, 1)
+            ax.grid(alpha=0.25)
+            mean = np.nanmean([means[k, state, ci] for k in series])
+            ax.axvline(mean, color="black", linewidth=1.4)
+            if legend:
+                ax.text(0.02, 0.98, f"mean = {mean:.3g}", transform=ax.transAxes, ha="left", va="top", fontsize=7,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
+            ax.set_title(f"{topologies[ci]} ({state_label})", fontsize=9)
+            if state == 1:
+                ax.set_xlabel("normalized window mean" if normalize else "window mean")
+            if ci == 0:
+                ax.set_ylabel("proportion")
+    if norm:
+        fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axs, label="branch length (CU)",
+                     fraction=0.025, pad=0.02)
+    _suptitle(fig, title(n_experiments), fontsize=10)
+    return fig
+
+
+@functools.lru_cache(maxsize=None)
+def _sim_cu_branch_length(sim_dir):
+    _, clade, _ = get_simulation_clade(Path(sim_dir) / "_" / "scores.tsv")
+    bl = get_cu_branch_length_from_population_info(clade) if clade else None
+    return None if bl is None else bl * BRANCH_LENGTH_SCALE
+
+
+@functools.lru_cache(maxsize=None)
+def _admixture_cu_branch_length(source_leaf, pattern):
+    _, clade, _ = get_simulation_clade(Path(source_leaf) / str(pattern) / "scores.tsv")
+    return get_cu_branch_length_from_population_info(clade) if clade else None
+
+
+def _cu_branch_lengths(df):
+    cu = df["branch_length_cu"].astype(float).copy()
+    missing = cu.isna() & (df["category"] == "admixture")
+    cu[missing] = [_admixture_cu_branch_length(l, p) for l, p in zip(df.loc[missing, "source_leaf"], df.loc[missing, "pattern"])]
+    return cu * BRANCH_LENGTH_SCALE
+
+
+def _gt_mean_axis_values(df, col):
+    vals = df[col].unique().tolist()
+    if col == "merged_category":
+        return sorted(vals, key=_merged_category_sort_key)
+    if col == "branch_length":
+        return [b for b, _, _ in BRANCH_LENGTH_BIN_EDGES if b in vals]
+    if col == "topology":
+        return [t for t in TOPOLOGY_NAMES if t in vals]
+    return sorted(vals, key=lambda v: (not isinstance(v, (int, float)), v if isinstance(v, (int, float)) else str(v)))
+
+
+_POOLED_SCORE_AXES = {
+    "-w": lambda w, parts: w,
+    "category": lambda w, parts: parts[0],
+    "subcategory": lambda w, parts: parts[1],
+    "merged_category": lambda w, parts: parts[0] if parts[0] == "admixture" else f"{parts[0]} {parts[1]}",
+    "pattern": lambda w, parts: parts[3],
+}
+
+
+def _pooled_axis_values(axis, vals):
+    if axis is None:
+        return [None]
+    if axis == "merged_category":
+        return sorted(vals, key=_merged_category_sort_key)
+    return sorted(vals, key=lambda v: (not isinstance(v, (int, float)), v if isinstance(v, (int, float)) else str(v)))
+
+
+def _gt_mean_axis_label(axis, value):
+    if axis == "-w":
+        return f"w{format_val(value)}"
+    if axis == "branch_length":
+        return f"BL {value} CU"
+    return str(value)
+
+
+def _draw_ecdf(ax, vals, **style):
+    vals = np.sort(vals[np.isfinite(vals)])
+    if not len(vals):
+        return None, 0
+    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), _ECDF_MAX_POINTS)).astype(int))
+    ax.plot(vals[idx], (idx + 1) / len(vals), drawstyle="steps-post", **style)
+    return float(vals.mean()), len(vals)
+
+
+_STATE_STYLES = (("Null", 0, "--"), ("Outlier", 1, "-"))
+_QQ_PROBS = np.linspace(0.005, 0.995, 199)
+_QQ_FITS = {"gaussian": (stats.norm, 1.2, 0.75), "laplace": (stats.laplace, 0.8, 0.45)}
+
+
+def _dist_series(scores, labels, topologies):
+    for topology in topologies:
+        vals = scores[:, TOPOLOGY_NAMES.index(topology)]
+        for state_name, state, linestyle in _STATE_STYLES:
+            v = vals[(labels == state) & np.isfinite(vals)]
+            if len(v):
+                yield topology, state_name, state, linestyle, v
+
+
+def _text_box(ax, lines):
+    ax.text(0.98, 0.02, "\n".join(lines), transform=ax.transAxes, ha="right", va="bottom", multialignment="left",
+            fontsize=7, family="monospace", bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
+
+
+def _score_xaxis(ax, scores, topologies, normalize, logx):
+    finite = scores[:, [TOPOLOGY_NAMES.index(t) for t in topologies]]
+    finite = finite[np.isfinite(finite)]
+    lo, hi = ((0, 1) if normalize == "0-1" else (-1, 1)) if normalize else np.percentile(finite, [0.5, 99.5]) if len(finite) else (0, 0)
+    if hi > lo:
+        ax.set_xlim(lo, hi)
+    ax.set_ylim(0, 1)
+    if logx and not normalize and len(finite) and finite.min() > 0 and _resolve_logy(logx, {"": pd.DataFrame({"v": finite})}, "v"):
+        ax.set_xscale("log")
+    else:
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5))
+
+
+def _panel_ecdf(ax, scores, labels, topologies, normalize, logx):
+    means = {}
+    for topology, state_name, state, linestyle, v in _dist_series(scores, labels, topologies):
+        means[topology, state], _ = _draw_ecdf(ax, v, color=_ECDF_TOPO_COLORS[topology], linestyle=linestyle, linewidth=1.6)
+    _text_box(ax, ["Δ(O−N)" + (", normalized" if normalize else "")]
+              + [f"{t}: {means.get((t, 1), np.nan) - means.get((t, 0), np.nan):+.3g}" for t in topologies])
+    _score_xaxis(ax, scores, topologies, normalize, logx)
+
+
+def _panel_qq(ax, scores, labels, topologies, normalize, logx):
+    theo = stats.laplace.ppf(_QQ_PROBS)
+    lines = []
+    for topology, state_name, state, linestyle, v in _dist_series(scores, labels, topologies):
+        loc = np.median(v)
+        scale = np.mean(np.abs(v - loc)) or 1.0
+        ax.plot(theo, (np.quantile(v, _QQ_PROBS) - loc) / scale, color=_ECDF_TOPO_COLORS[topology], linestyle=linestyle, linewidth=1.6)
+        lines.append(f"{topology} {state_name[0]}: D={stats.kstest(v, 'laplace', args=(loc, scale)).statistic:.3f}")
+    ax.plot(theo, theo, color="black", linewidth=1)
+    ax.plot(theo, stats.norm.ppf(_QQ_PROBS) / np.sqrt(2 / np.pi), color="gray", linestyle=":", linewidth=1.2)
+    _text_box(ax, lines)
+
+
+def _fit_series(scores, labels, topologies):
+    for topology, state_name, state, linestyle, v in _dist_series(scores, labels, topologies):
+        fits = {name: rv.fit(v) for name, (rv, _, _) in _QQ_FITS.items()}
+        ds = " ".join(f"{name[0]}={stats.kstest(v, rv.cdf, args=fits[name]).statistic:.3f}" for name, (rv, _, _) in _QQ_FITS.items())
+        yield topology, linestyle, v, fits, f"{topology} {state_name[0]}: D {ds}"
+
+
+def _panel_fit(ax, scores, labels, topologies, normalize, logx):
+    lines = []
+    for topology, linestyle, v, fits, line in _fit_series(scores, labels, topologies):
+        color = _ECDF_TOPO_COLORS[topology]
+        _draw_ecdf(ax, v, color=color, linestyle=linestyle, linewidth=2.2)
+        grid = np.linspace(v.min(), v.max(), 400)
+        for name, (rv, lw, alpha) in _QQ_FITS.items():
+            ax.plot(grid, rv.cdf(grid, *fits[name]), color=color, linestyle=linestyle, linewidth=lw, alpha=alpha)
+        lines.append(line)
+    _text_box(ax, lines)
+    _score_xaxis(ax, scores, topologies, normalize, logx)
+
+
+def _panel_fit_qq(ax, scores, labels, topologies, normalize, logx):
+    theo = stats.laplace.ppf(_QQ_PROBS)
+    lines = []
+    for topology, linestyle, v, fits, line in _fit_series(scores, labels, topologies):
+        color = _ECDF_TOPO_COLORS[topology]
+        loc, scale = fits["laplace"]
+        ax.plot(theo, (np.quantile(v, _QQ_PROBS) - loc) / scale, color=color, linestyle=linestyle, linewidth=1.8)
+        ax.plot(theo, (stats.norm.ppf(_QQ_PROBS, *fits["gaussian"]) - loc) / scale, color=color, linestyle=linestyle,
+                linewidth=1.0, alpha=0.55)
+        lines.append(line)
+    ax.plot(theo, theo, color="black", linewidth=1)
+    _text_box(ax, lines)
+
+
+def _series_handles(topologies, kinds):
+    return [(matplotlib.lines.Line2D([], [], color=_ECDF_TOPO_COLORS[t], linestyle=ls, linewidth=lw, alpha=alpha),
+             f"{t} {name}{' ' + kind if kind else ''}")
+            for t in topologies for kind, lw, alpha in kinds for name, _, ls in _STATE_STYLES]
+
+
+_DIST_OPTIONS = {"pattern", "topologies", "logx", "linthresh", "normalize", "legend"}
+
+_SCORE_DIST_METRICS = {
+    "ecdf": (_panel_ecdf, "topology-score ECDFs", "topology score", "proportion",
+             lambda ts: _series_handles(ts, [("", 1.6, 1.0)])),
+    "qq": (_panel_qq, "topology-score QQ vs fitted Laplace (median, mean abs dev)", "Laplace(0,1) quantile",
+           "standardized sample quantile",
+           lambda ts: _series_handles(ts, [("", 1.6, 1.0)])
+           + [(matplotlib.lines.Line2D([], [], color="black", linewidth=1), "Laplace (y=x)"),
+              (matplotlib.lines.Line2D([], [], color="gray", linestyle=":", linewidth=1.2), "Gaussian ref")]),
+    "fit": (_panel_fit, "topology-score ECDF (thick) vs Gaussian/Laplace MLE CDFs", "topology score", "proportion",
+            lambda ts: _series_handles(ts, [("observed ECDF", 2.2, 1.0)]
+                                       + [(f"{name} fit", lw, alpha) for name, (_, lw, alpha) in _QQ_FITS.items()])),
+    "fit_qq": (_panel_fit_qq, "topology-score QQ vs Laplace fit (y=x) and Gaussian fit (curve)", "Laplace(0,1) quantile",
+               "Laplace-standardized quantile",
+               lambda ts: _series_handles(ts, [("observed", 1.8, 1.0), ("gaussian fit", 1.0, 0.55)])
+               + [(matplotlib.lines.Line2D([], [], color="black", linewidth=1), "laplace fit (y=x)")]),
+}
+
+_DIST_METRICS = {"window_ecdf", "ecdf_all", "mean_all_vs_bl", "ecdf_hmm", "ecdf_all_hmm", "gap_ecdf", "mean_ecdf", "gap_vs_bl", "mean_vs_bl", *_SCORE_DIST_METRICS}
+
+
 def _out_transition_totals(parsed):
     totals = {"fitted_transition_total": transition_total(parsed)}
     for prefix in ("gt", "viterbi"):
@@ -3306,6 +4431,14 @@ def _matches_flags(recorded, flags):
 
 def _strip_flag(flag):
     return flag.lstrip("-")
+
+
+def _tag_legend_params(figs, params):
+    for fig in figs if isinstance(figs, list) else [figs]:
+        for f in fig if isinstance(fig, list) else [fig]:
+            if f is not None:
+                f._legend_params = params
+    return figs
 
 
 def _compose_title(suffix, *parts):
@@ -3861,6 +4994,12 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
         frame["_source_dir"] = str(d)
         frames.append(frame)
     df = pd.concat(frames, ignore_index=True).copy() if frames else pd.DataFrame()
+    if not df.empty and BRANCH_LENGTH_SCALE != 1.0 and "branch_length_cu" in df.columns:
+        scaled = (df["category"] != "admixture") & df["branch_length_cu"].notna()
+        df["x_bin"] = df["x_bin"].astype(object)
+        df.loc[scaled, "x_bin"] = (df.loc[scaled, "branch_length_cu"] * BRANCH_LENGTH_SCALE).apply(
+            lambda v: assign_bin(v, BRANCH_LENGTH_BIN_EDGES))
+        df.loc[scaled & df["x_bin"].isna(), "in_panel_a"] = False
     if not df.empty and "exclusion" in df.columns:
         failed = (df["exclusion"] == _NO_METRICS_EXCLUSION) & df["fraction_bin"].notna()
         df.loc[failed, _FAILED_RUN_ZERO_METRICS] = 0.0

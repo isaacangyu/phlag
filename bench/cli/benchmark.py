@@ -2308,7 +2308,7 @@ CASTER_ARG_SPECS = [
     ("exp_minus", "--exp-minus", True),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
-    ("site", "--site", True),
+    ("site", "--site", "bool"),
     ("chunk_size", "--chunk", False),
     ("chunk_scores", "--chunk-scores", False),
     ("zscale", "-z", True),
@@ -2401,7 +2401,9 @@ def _build_forward_args(args, specs):
     tokens = []
     for dest, flag, is_store_true in specs:
         value = getattr(args, dest)
-        if is_store_true:
+        if is_store_true == "bool":
+            tokens.append(flag if value else "--no-" + flag.lstrip("-"))
+        elif is_store_true:
             if value:
                 tokens.append(flag)
         elif value is not None:
@@ -2523,7 +2525,7 @@ def _build_parser():
         help="Forwarded to caster's --pair (caster-pair/quartet-scoring mode instead of dstar).",
     )
     caster_group.add_argument(
-        "--site", dest="site", action="store_true",
+        "--site", dest="site", action=argparse.BooleanOptionalAction, default=None,
         help="Forwarded to caster's --site (caster-site mode instead of dstar; mutually exclusive with --pair).",
     )
     caster_group.add_argument(
@@ -2546,7 +2548,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion", "null-alt-anchor", "snr"],
+        default="free", choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(
@@ -2657,6 +2659,8 @@ def parse_arguments(argv=None):
     args.explicit_dests = _explicit_dests(argv, _build_parser())
     if args.step_size is None:
         args.step_size = args.window_size
+    if args.site is None:
+        args.site = not args.pair
     if args.sweep is not None:
         args.sweep = _resolve_sweep_spec(args.sweep, parser, args.explicit_dests)
     return args
@@ -3329,6 +3333,7 @@ def finished_with_same_args(args, out_dir):
     parser = _build_parser()
     current = json.loads(json.dumps({dest: getattr(args, dest) for dest in MIRRORED_DESTS}, default=str))
     defaults = json.loads(json.dumps({dest: parser.get_default(dest) for dest in MIRRORED_DESTS}, default=str))
+    defaults["site"] = False
     return all(recorded.get(dest, defaults[dest]) == value for dest, value in current.items())
 
 

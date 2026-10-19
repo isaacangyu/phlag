@@ -73,7 +73,8 @@ def group_tokens(tokens, parser):
         flag, eq, value = tok.partition("=")
         if tok == TOGGLE_FLAG and tok not in options:
             groups.append([tok, None, []])
-        elif groups and groups[-1][1] is None and tok in options and options[tok].nargs == 0:
+        elif groups and groups[-1][1] is None and tok in options and (
+                not groups[-1][2] or options[tok].nargs == 0 and options.get(groups[-1][2][0], options[tok]).nargs == 0):
             groups[-1][2].append(tok)
         elif tok.startswith("-") and (tok in options or (eq and flag in options)):
             name = flag if eq else tok
@@ -194,18 +195,30 @@ def toggle_actions(groups, parser):
     for flag, action, vals in groups:
         if action is not None:
             continue
-        for name in vals:
-            opt = name if name.startswith("--") else f"--{name}"
+        i = 0
+        while i < len(vals):
+            name = vals[i]
+            opt = name if name.startswith("-") else f"--{name}"
             act = parser._option_string_actions.get(opt)
-            if act is None or act.nargs != 0:
+            j = i + 1
+            if act is not None and act.nargs != 0 and i == 0 and name == opt:
+                j = i + 2 if act.nargs is None else len(vals)
+            elif act is None or act.nargs != 0:
                 raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: not an on/off flag")
-            toggles.append((opt, act))
+            if j > len(vals) or j == i + 1 and act.nargs != 0:
+                raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: missing value")
+            toggles.append((opt, act, vals[i + 1:j]))
+            i = j
     return toggles
 
 
-def toggle_label(action, on):
+def toggle_label(action, on, vals=()):
     from phlag.utils import PHLAG_SEGMENT_DEFAULTS, phlag_param_segment
-    name = phlag_param_segment(action.dest, True) if action.dest in PHLAG_SEGMENT_DEFAULTS else action.dest.replace("_", "-")
+    value = " ".join(vals) if vals else True
+    if action.dest in PHLAG_SEGMENT_DEFAULTS:
+        name = phlag_param_segment(action.dest, value)
+    else:
+        name = action.dest.replace("_", "-") + (f"={','.join(vals)}" if vals else "")
     return name if on else f"no-{name}"
 
 
@@ -229,8 +242,8 @@ def split_command(tokens):
         if "step_size" in combo and "step_size" not in axis_combo and "window_size" in axis_combo:
             axis_combo["step_size"] = combo["step_size"]
         ws, segs = path_segments(axis_combo, fixed)
-        on = [(opt, act) for (opt, act), state in zip(toggles, states) if state]
-        segs += [toggle_label(act, True) for _, act in on]
+        on = [toggle for toggle, state in zip(toggles, states) if state]
+        segs += [toggle_label(act, True, vals) for _, act, vals in on]
         argv = [cmd, *pos]
         for flag, action, vals in groups:
             if action.dest in axis_combo:
@@ -239,7 +252,7 @@ def split_command(tokens):
                 argv += [flag, rewrite_path(vals[0], ws, segs)]
             else:
                 argv += [flag, *vals]
-        argv += [opt for opt, _ in on]
+        argv += [tok for opt, _, vals in on for tok in (opt, *vals)]
         label = [cmd]
         if split_pos:
             label.append(pos[0].removesuffix("/scores.tsv"))
@@ -247,7 +260,7 @@ def split_command(tokens):
             w, s = ws
             label.append(f"w{w}" if s in (None, w) else f"s{s}" if w is None else f"w{w}_s{s}")
         label += segs[:len(segs) - len(on)]
-        label += [toggle_label(act, state) for (_, act), state in zip(toggles, states)]
+        label += [toggle_label(act, state, vals) for (_, act, vals), state in zip(toggles, states)]
         runs.append(("-".join(label), argv))
     return runs
 
