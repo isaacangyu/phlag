@@ -182,7 +182,7 @@ def emission_norm_str(params):
     covs = params.emissions.covariances
     mn = jnp.linalg.norm(means.reshape(means.shape[0], -1), axis=1)
     cn = jnp.linalg.norm(covs.reshape(covs.shape[0], -1), axis=1)
-    return f"Null |mean|={mn[0]:.4g} |cov|={cn[0]:.4g}, Alt |mean|={mn[1]:.4g} |cov|={cn[1]:.4g}"
+    return f"Null |mean|={mn[0]:.4g} |cov|={cn[0]:.4g}, Outlier |mean|={mn[1]:.4g} |cov|={cn[1]:.4g}"
 
 
 def gaussian_hellinger2(mu1, Sigma1, mu2, Sigma2):
@@ -465,7 +465,8 @@ class ParamsGaussianHMMEmissions(NamedTuple):
 class EmissionParam(Enum):
     FREE = "free"
     REPULSION = "repulsion"
-    NULL_ALT_ANCHOR = "null-alt-anchor"
+    NULL_ALT_ZERO = "null-alt-zero"
+    NULL_ALT_EQUAL = "null-alt-equal"
     SNR = "snr"
     BL_ANCHOR = "bl-anchor"
 
@@ -786,9 +787,10 @@ class PhlagHMMEmissions(HMMEmissions):
                 Sxx_s = sum_xxT[s]
                 mode = EmissionParam(self.parameterization[s])
 
-                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ANCHOR, EmissionParam.SNR, EmissionParam.BL_ANCHOR):
+                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ZERO, EmissionParam.NULL_ALT_EQUAL,
+                            EmissionParam.SNR, EmissionParam.BL_ANCHOR):
                     mu_s = xbar_s
-                    if mode in (EmissionParam.NULL_ALT_ANCHOR, EmissionParam.BL_ANCHOR):
+                    if mode in (EmissionParam.NULL_ALT_ZERO, EmissionParam.BL_ANCHOR):
                         free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
                         mu_s = jnp.where(free, xbar_s, self.anchor_value)
                     elif mode is EmissionParam.SNR:
@@ -797,8 +799,13 @@ class PhlagHMMEmissions(HMMEmissions):
                         var_ils = Sxx_s[ils, ils] / (n_s + 1e-12) - xbar_s[ils] ** 2
                         ceiling = xbar_s[ils] / (var_ils + 1e-12)
                         mu_s = xbar_s.at[anchor].set(jnp.minimum(jnp.mean(xbar_s[anchor]), ceiling))
+                    elif mode is EmissionParam.NULL_ALT_EQUAL:
+                        anchor = jnp.array(self.anchor_dims)
+                        mu_s = xbar_s.at[anchor].set(jnp.mean(xbar_s[anchor]))
                     Sigma_s = (Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, mu_s) - jnp.outer(mu_s, xbar_s)
                                + jnp.outer(mu_s, mu_s) + 1e-5 * jnp.eye(self.emission_dim))
+                    if mode is EmissionParam.NULL_ALT_EQUAL:
+                        Sigma_s = swap_symmetrize(Sigma_s, self.anchor_dims)
                 elif mode is EmissionParam.REPULSION:
                     other = 1 - s # assumes 2 states
                     mu_s, Sigma_s, clip_count_s, clip_attempts_s = self.map_estimate_repulsion(
@@ -851,6 +858,13 @@ class PhlagHMMEmissions(HMMEmissions):
                 total_distance += dist
                 num_pairs += 1
         return total_distance / num_pairs
+
+
+def swap_symmetrize(cov, dims):
+    perm = list(range(cov.shape[-1]))
+    perm[dims[0]], perm[dims[1]] = perm[dims[1]], perm[dims[0]]
+    perm = jnp.array(perm)
+    return 0.5 * (cov + cov[perm][:, perm])
 
 
 def params_all_finite(params):

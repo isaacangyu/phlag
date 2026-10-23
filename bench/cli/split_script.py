@@ -191,6 +191,7 @@ def rewrite_path(path, ws, segs):
 
 
 def toggle_actions(groups, parser):
+    from phlag.phlag import accepts_extra_value
     toggles = []
     for flag, action, vals in groups:
         if action is not None:
@@ -200,14 +201,20 @@ def toggle_actions(groups, parser):
             name = vals[i]
             opt = name if name.startswith("-") else f"--{name}"
             act = parser._option_string_actions.get(opt)
-            j = i + 1
             if act is not None and act.nargs != 0 and i == 0 and name == opt:
-                j = i + 2 if act.nargs is None else len(vals)
+                j = i + 1
+                while j < len(vals) and (act.nargs not in (None, "?") or j == i + 1
+                                         or accepts_extra_value(act, vals[j])):
+                    j += 1
+                if j == i + 1 and act.nargs != "?":
+                    raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: missing value")
+                given = vals[i + 1:j]
+                alts = [[v] for v in given] if act.nargs in (None, "?") and given else [given]
             elif act is None or act.nargs != 0:
                 raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: not an on/off flag")
-            if j > len(vals) or j == i + 1 and act.nargs != 0:
-                raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: missing value")
-            toggles.append((opt, act, vals[i + 1:j]))
+            else:
+                j, alts = i + 1, [[]]
+            toggles.append((opt, act, alts))
             i = j
     return toggles
 
@@ -234,7 +241,8 @@ def split_command(tokens):
     fixed = {g[1].dest: g[2][0] for g in groups if len(g[2]) == 1}
     pos_choices = [[p] for p in positionals] if split_pos else [positionals]
     runs = []
-    for pos, states, values in itertools.product(pos_choices, itertools.product((True, False), repeat=len(toggles)),
+    toggle_states = itertools.product(*[[*alts, None] for _, _, alts in toggles])
+    for pos, states, values in itertools.product(pos_choices, list(toggle_states),
                                                  itertools.product(*(vals for _, vals in axes))):
         combo = resolve_step({**{d: fixed[d] for d in ("window_size", "step_size") if d in fixed},
                               **dict(zip((d for d, _ in axes), values))})
@@ -242,7 +250,7 @@ def split_command(tokens):
         if "step_size" in combo and "step_size" not in axis_combo and "window_size" in axis_combo:
             axis_combo["step_size"] = combo["step_size"]
         ws, segs = path_segments(axis_combo, fixed)
-        on = [toggle for toggle, state in zip(toggles, states) if state]
+        on = [(opt, act, state) for (opt, act, _), state in zip(toggles, states) if state is not None]
         segs += [toggle_label(act, True, vals) for _, act, vals in on]
         argv = [cmd, *pos]
         for flag, action, vals in groups:
@@ -260,7 +268,9 @@ def split_command(tokens):
             w, s = ws
             label.append(f"w{w}" if s in (None, w) else f"s{s}" if w is None else f"w{w}_s{s}")
         label += segs[:len(segs) - len(on)]
-        label += [toggle_label(act, state, vals) for (_, act, vals), state in zip(toggles, states)]
+        label += [f"no-{opt.lstrip('-')}" if state is None and len(alts) > 1
+                  else toggle_label(act, state is not None, alts[0] if state is None else state)
+                  for (opt, act, alts), state in zip(toggles, states)]
         runs.append(("-".join(label), argv))
     return runs
 

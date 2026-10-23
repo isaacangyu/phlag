@@ -666,7 +666,7 @@ class CasterPlotter:
             # Pure interval format (e.g. 45-55)
             alt_shaded = False
             for start_pos, end_pos in anomaly_intervals:
-                lbl = 'Alt' if not alt_shaded else None
+                lbl = 'Outlier' if not alt_shaded else None
                 ax.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
                 alt_shaded = True
                 ax.axvline(x=start_pos, color='gray', linestyle='--', alpha=0.7, linewidth=1.2)
@@ -678,10 +678,10 @@ class CasterPlotter:
                 start_pos = curr_pos_bp
                 end_pos = curr_pos_bp + length_bp
                 mid_pos = (start_pos + end_pos) / 2.0
-                label_text = "null" if b_type == 'n' else "alt"
+                label_text = "null" if b_type == 'n' else "outlier"
 
                 if b_type == 'a':
-                    lbl = 'Alt' if not alt_shaded else None
+                    lbl = 'Outlier' if not alt_shaded else None
                     ax.axvspan(start_pos, end_pos, color='#E05638', alpha=0.12, label=lbl)
                     alt_shaded = True
 
@@ -924,7 +924,7 @@ class CasterPlotter:
         # every subplot's title reports the real joint separability (capturing
         # cross-topology covariance) instead of a per-topology univariate
         # value that ignores it. Computed once, shared across all subplots.
-        null_mask, alt_mask = labels == 'Null', labels == 'Alt'
+        null_mask, alt_mask = labels == 'Null', labels == 'Outlier'
         h2_joint = None
         if null_mask.sum() > 1 and alt_mask.sum() > 1:
             Y_all = self.df[avg_cols].to_numpy(dtype=float)
@@ -980,7 +980,7 @@ class CasterPlotter:
             x_grid = np.linspace(p_lo - margin, p_hi + margin, 200)
 
             null_vals = self.df.loc[labels == 'Null', col]
-            alt_vals = self.df.loc[labels == 'Alt', col]
+            alt_vals = self.df.loc[labels == 'Outlier', col]
             # Same 1st-percentile floor as x_grid/p_lo above, not the raw
             # min -- a single extreme outlier below the bulk of the data
             # (seen directly: a w10_s10 raw dstar column with std~300 but
@@ -1024,7 +1024,7 @@ class CasterPlotter:
             if len(null_vals) > 0:
                 sns.histplot(null_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color=null_color, label='Null Histogram', bins=bin_edges_topo)
             if len(alt_vals) > 0:
-                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Alt Histogram', bins=bin_edges_topo)
+                sns.histplot(alt_vals, ax=ax, stat='density', element='step', kde=False, alpha=0.35, color='#E05638', label='Outlier Histogram', bins=bin_edges_topo)
 
             null_rate = alt_rate = None
             if len(null_vals) > 1:
@@ -1052,17 +1052,17 @@ class CasterPlotter:
                     scale_alt = np.clip(alt_vals.to_numpy(dtype=float) - shift, 0, None).mean()
                     alt_rate = 1.0 / scale_alt
                     mean_alt = shift + scale_alt
-                    ax.plot(x_grid, expon.pdf(x_grid - shift, scale=scale_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                    ax.plot(x_grid, expon.pdf(x_grid - shift, scale=scale_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Outlier Fit')
                     ax.axvline(mean_alt, color='#E05638', linestyle=':', linewidth=1.5)
                     ax.text(mean_alt, 0.75, f"$\\lambda_{{alt}}={alt_rate:.3g}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
                 elif is_double_exponential:
                     loc_alt, scale_alt = laplace.fit(alt_vals)
-                    ax.plot(x_grid, laplace.pdf(x_grid, loc_alt, scale_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                    ax.plot(x_grid, laplace.pdf(x_grid, loc_alt, scale_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Outlier Fit')
                     ax.axvline(loc_alt, color='#E05638', linestyle=':', linewidth=1.5)
                     ax.text(loc_alt, 0.75, f"$\\mu_{{alt}}={loc_alt:.4g}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
                     ax.text(loc_alt + scale_alt, 0.67, f"$b_{{alt}}={scale_alt:.4g}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
                 else:
-                    ax.plot(x_grid, norm.pdf(x_grid, mu_alt, std_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Alt Fit')
+                    ax.plot(x_grid, norm.pdf(x_grid, mu_alt, std_alt), color='#E05638', linewidth=2.2, linestyle='--', label='Outlier Fit')
                     ax.axvline(mu_alt, color='#E05638', linestyle=':', linewidth=1.5)
                     ax.text(mu_alt, 0.75, f"$\\mu_{{alt}}={format_adaptive(mu_alt, mu_null)}$", transform=trans, color='#E05638', fontsize=8, ha='center', fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
                     ax.text(mu_alt + std_alt, 0.67, f"$\\sigma_{{alt}}={format_adaptive(std_alt, std_null)}$", transform=trans, color='#E05638', fontsize=7, ha='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
@@ -1139,7 +1139,7 @@ class CasterPlotter:
         plot_topology_pairs and plot_correlation's null/alt split can reuse
         the exact same parse_pattern_string logic
         instead of re-deriving it. Returns a numpy object array of
-        'Null'/'Alt' (one per row of df, positional) or None if no
+        'Null'/'Outlier' (one per row of df, positional) or None if no
         ground-truth locus pattern is resolvable. df defaults to self.df;
         plot_quartet_counts passes its own quartet_counts_df instead, since
         that file's 'pos' column is a separate per-window table.
@@ -1159,7 +1159,7 @@ class CasterPlotter:
         for idx, pos in enumerate(positions):
             for start_bp, end_bp in anomaly_intervals:
                 if start_bp <= pos <= end_bp:
-                    labels[idx] = 'Alt'
+                    labels[idx] = 'Outlier'
                     break
         return labels
 
@@ -1179,7 +1179,7 @@ class CasterPlotter:
 
         vals = {t: self.df[col_for_topo[t]].to_numpy(dtype=float) for t in ('ABBA', 'BABA', 'AABB')}
         labels = self._compute_null_alt_labels()
-        label_colors = {'Null': self.topo_colors['ABBA'], 'Alt': '#E05638'}
+        label_colors = {'Null': self.topo_colors['ABBA'], 'Outlier': '#E05638'}
 
         pairs = [('ABBA', 'BABA'), ('ABBA', 'AABB'), ('BABA', 'AABB')]
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -1187,7 +1187,7 @@ class CasterPlotter:
         for ax, (xt, yt) in zip(axes, pairs):
             x, y = vals[xt], vals[yt]
             if labels is not None:
-                for lbl in ('Null', 'Alt'):
+                for lbl in ('Null', 'Outlier'):
                     mask = labels == lbl
                     if mask.any():
                         ax.scatter(x[mask], y[mask], c=label_colors[lbl], label=lbl, alpha=0.6, s=14, edgecolors='none')
@@ -1250,7 +1250,7 @@ class CasterPlotter:
         else:
             n_by_lbl = {}
             corr_by_lbl = {}
-            for lbl in ('Null', 'Alt'):
+            for lbl in ('Null', 'Outlier'):
                 lbl_mask = labels == lbl
                 n = int(lbl_mask.sum())
                 n_by_lbl[lbl] = n
@@ -1271,18 +1271,18 @@ class CasterPlotter:
                 null_ax.set_yticks([])
             null_ax.set_title(f'Null (n={n_by_lbl["Null"]})', fontsize=11, fontweight='bold')
 
-            alt_corr = corr_by_lbl['Alt']
+            alt_corr = corr_by_lbl['Outlier']
             if null_corr is not None and alt_corr is not None:
                 diff_corr = alt_corr - null_corr
                 vmax = max(np.abs(diff_corr.values).max(), 0.05)
                 vmin = -vmax
                 sns.heatmap(diff_corr, mask=triu_mask, annot=True, fmt='.2f', cmap='coolwarm', vmin=vmin, vmax=vmax,
-                            square=True, cbar_kws={'label': 'Alt − Null r'}, ax=alt_ax)
+                            square=True, cbar_kws={'label': 'Outlier − Null r'}, ax=alt_ax)
             else:
                 alt_ax.text(0.5, 0.5, 'Not enough windows', ha='center', va='center', transform=alt_ax.transAxes)
                 alt_ax.set_xticks([])
                 alt_ax.set_yticks([])
-            alt_ax.set_title(f'Alt (n={n_by_lbl["Alt"]})', fontsize=11, fontweight='bold')
+            alt_ax.set_title(f'Outlier (n={n_by_lbl["Outlier"]})', fontsize=11, fontweight='bold')
 
             fig.suptitle(title, fontsize=13, fontweight='bold')
             plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -1410,7 +1410,7 @@ class CasterPlotter:
             print("No resolvable ground-truth locus pattern; skipping quartet counts distribution plot.")
             return
 
-        row_order = ['Null', 'Alt']
+        row_order = ['Null', 'Outlier']
         fig, axes = plt.subplots(2, 3, figsize=(15, 10), sharex='col')
 
         for col_idx, topo in enumerate(topo_order):
@@ -1581,7 +1581,7 @@ class CasterPlotter:
             if labels is None:
                 out[t] = [('All', '-', v[finite])]
             else:
-                out[t] = [(r, ls, v[finite & (labels == k)]) for k, r, ls in (('Null', 'Null', '--'), ('Alt', 'Outlier', '-'))]
+                out[t] = [(r, ls, v[finite & (labels == k)]) for k, r, ls in (('Null', 'Null', '--'), ('Outlier', 'Outlier', '-'))]
         return out
 
     def _save_topology_grid(self, fig, title, filename, what):
@@ -1597,6 +1597,7 @@ class CasterPlotter:
         plt.close()
 
     def plot_ecdf(self):
+        from .utils import ecdf_points
         series = self._topology_series()
         if series is None:
             print("Need all three ABBA/BABA/AABB topology columns for an ECDF plot; skipping.")
@@ -1609,7 +1610,7 @@ class CasterPlotter:
             for region, ls, v in groups:
                 if len(v) == 0:
                     continue
-                sns.ecdfplot(v, ax=ax, color=color, linestyle=ls, linewidth=1.6, label=f"{t} {region}")
+                ax.step(*ecdf_points(v), where='post', color=color, linestyle=ls, linewidth=1.6, label=f"{t} {region}")
                 mean_lines.append(f"{region}: {v.mean():.4g} (n={len(v)})")
             log_x = len(allv) and allv.min() > 0 and self._needs_log_scale(allv)
             if log_x:

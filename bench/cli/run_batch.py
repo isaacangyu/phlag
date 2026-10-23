@@ -3,6 +3,9 @@ import collections
 import datetime
 import os
 import pathlib
+import pwd
+import resource
+import signal
 import subprocess
 import sys
 import threading
@@ -16,6 +19,35 @@ from bench.cli.split_script import plan
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total} [{elapsed}<{remaining}{postfix}]"
+CAUGHT = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT)
+
+
+def describe_sender(info):
+    if info.si_pid == 0:
+        return "kernel" + (" (terminal hung up)" if info.si_signo == signal.SIGHUP else "")
+    try:
+        user = pwd.getpwuid(info.si_uid).pw_name
+    except KeyError:
+        user = str(info.si_uid)
+    chain, pid = [], info.si_pid
+    while pid > 1 and len(chain) < 4:
+        try:
+            cmd = " ".join(pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").split())[:200]
+            ppid = int(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            chain.append(f"pid {pid} (gone)")
+            break
+        chain.append(f"pid {pid} [{cmd}]")
+        pid = ppid
+    return f"user {user}: " + " <- ".join(chain)
+
+
+def oom_kills():
+    try:
+        text = pathlib.Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/memory.events").read_text()
+    except OSError:
+        return "unknown"
+    return next((line.split()[1] for line in text.splitlines() if line.startswith("oom_kill ")), "unknown")
 
 
 def read_progress(path):
@@ -27,6 +59,7 @@ def read_progress(path):
 
 
 def main(argv=None):
+    signal.pthread_sigmask(signal.SIG_BLOCK, CAUGHT)
     ap = argparse.ArgumentParser(description="Run bench/script.sh's split runs, one progress bar per script line, output in per-run logs.")
     ap.add_argument("script", nargs="?", default="bench/script.sh")
     ap.add_argument("--log-dir", type=pathlib.Path, default=pathlib.Path("logs/batch"))
@@ -62,15 +95,20 @@ def main(argv=None):
     started = datetime.datetime.now(PACIFIC)
     state = {name: "pending" for _, name, _, _ in planned}
     summary_path = args.log_dir / "00-summary.txt"
+    killed = []
+    oom_at_start = oom_kills()
 
     def write_summary(done):
         counts = collections.Counter(state.values())
-        head = [f"batch summary ({'finished' if done else 'in progress'})",
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        head = [f"batch summary ({'finished' if done else 'killed' if killed else 'in progress'})",
                 f"script: {args.script}",
                 f"started: {started:%Y-%m-%d %H:%M:%S %Z}",
                 f"updated: {datetime.datetime.now(PACIFIC):%Y-%m-%d %H:%M:%S %Z}",
+                f"cpu: {usage.ru_utime + usage.ru_stime:.0f} s",
+                f"oom kills at start: {oom_at_start}",
                 f"runs: {len(planned)} total, {counts['done']} done, {counts['failed']} failed, "
-                f"{counts['running']} running, {counts['pending']} pending", ""]
+                f"{counts['running']} running, {counts['pending']} pending", *killed, ""]
         if done:
             body = ["commands run:"] + [f"[{state[name]}] {name}\n    {cmd}" for _, name, cmd, _ in planned]
         else:
@@ -83,6 +121,20 @@ def main(argv=None):
         os.replace(tmp, summary_path)
 
     write_summary(False)
+
+    def wait_for_signal():
+        info = signal.sigwaitinfo(CAUGHT)
+        killed.append(f"killed: {signal.Signals(info.si_signo).name} at "
+                      f"{datetime.datetime.now(PACIFIC):%Y-%m-%d %H:%M:%S %Z} by {describe_sender(info)}")
+        got = lock.acquire(timeout=5)
+        try:
+            write_summary(False)
+        finally:
+            if got:
+                lock.release()
+        os._exit(128 + info.si_signo)
+
+    threading.Thread(target=wait_for_signal, daemon=True).start()
 
     def refresh(line):
         bars[line].set_postfix_str(f"runs={finished[line]}/{per_line[line]} running={running[line]} "
@@ -115,7 +167,8 @@ def main(argv=None):
         try:
             with open(log_path, "w") as log:
                 code = subprocess.run(cmd, shell=True, executable="/bin/bash", stdout=log,
-                                      stderr=subprocess.STDOUT, env=env).returncode
+                                      stderr=subprocess.STDOUT, env=env,
+                                      preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, CAUGHT)).returncode
         finally:
             if tokens:
                 os.write(jobserver_fd, b"+" * tokens)

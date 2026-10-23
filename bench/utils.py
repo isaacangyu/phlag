@@ -1,9 +1,14 @@
 import argparse
 import colorsys
+import contextlib
+import concurrent.futures
 import functools
+import hashlib
 import io
 import itertools
 import math
+import multiprocessing
+import os
 import re
 import textwrap
 import warnings
@@ -26,6 +31,7 @@ from bench.cli.benchmark import (
     COL_ADMIXTURE,
     DEFAULT_CONCAT_PATTERNS,
     FIGURE_COLUMNS,
+    FRACTION_BIN_EDGES,
     FRACTION_BINS,
     HD_NUM_BINS,
     PHLAG_ARG_SPECS,
@@ -44,7 +50,9 @@ from bench.cli.benchmark import (
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path
 from phlag.utils import (
     ADMIXTURE_DIVERGENCE_THRESHOLD_MYR,
+    ECDF_MAX_POINTS,
     PHLAG_SEGMENT_DEFAULTS,
+    ecdf_points,
     get_admixture_divergence_time,
     get_cu_branch_length_from_population_info,
     get_out_root,
@@ -378,6 +386,7 @@ class CrossRunAnalysis:
         self._agg_given = True
         self._raw_beta_cache = {}
         self._last_configs = None
+        self._color_cache = {}
         self._bin_specs = {}
         self._args_json_cache = {}
         self._match_cache = {}
@@ -589,7 +598,7 @@ class CrossRunAnalysis:
             p = run_dir / "runs.tsv"
             if not p.exists():
                 continue
-            df = pd.read_csv(p, sep="\t")
+            df = _drop_hidden_admixture(pd.read_csv(p, sep="\t"))
             if col == "merged_category":
                 if "category" in df.columns and "subcategory" in df.columns:
                     values.update(_merged_category(df["category"], df["subcategory"]).unique())
@@ -1105,17 +1114,13 @@ class CrossRunAnalysis:
 
     # ---- cross-run PNG-metric grids ----
 
-    def _plot_tpr_fpr_grid(self, configs, title="TPR/FPR"):
+    def _plot_tpr_fpr_grid(self, configs, title="TPR/FPR", full=False):
         colors = {label: _config_color(i) for i, (label, _) in enumerate(configs)}
         auc_by_label = self._metric_by_label(configs, "roc_auc")
 
         def cell(ax, dfs, column, fraction_bin, x_bins):
-            ax.set_xlim(-0.015, 0.515)
-            ax.set_ylim(-0.03, 1.03)
-            ax.set_xticks([0.0, 0.125, 0.25, 0.375, 0.5])
-            ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            _tpr_fpr_axes(ax, full)
             ax.set_xlabel("FPR", fontsize=8)
-            ax.plot([0, 0.5], [0, 0.5], color="#cfcfc9", linewidth=1.0, linestyle="--", zorder=1)
             for label, _ in configs:
                 d = dfs[label]
                 if d.empty:
@@ -1170,7 +1175,7 @@ class CrossRunAnalysis:
             rank[v] = min(rank.get(v, r), r)
         return sorted(rank, key=lambda v: (rank[v], _token_sort_key(v)))
 
-    def _plot_tpr_fpr_grouped(self, configs, title, agg_idx=0):
+    def _plot_tpr_fpr_grouped(self, configs, title, agg_idx=0, full=False):
         """Multi-level agg (2-4 axes, see resolve_configs_cartesian/
         _plot_grouped) version of _plot_tpr_fpr_grid: agg[0] -> one line per
         value (colored, shared legend, different segments), agg[1] -> one
@@ -1231,13 +1236,9 @@ class CrossRunAnalysis:
         for ri, rv in enumerate(row_vals):
             for ci, cv in enumerate(col_vals):
                 ax = axes[ri][ci]
-                ax.set_xlim(-0.015, 0.515)
-                ax.set_ylim(-0.03, 1.03)
-                ax.set_xticks([0.0, 0.125, 0.25, 0.375, 0.5])
-                ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+                _tpr_fpr_axes(ax, full)
                 ax.yaxis.grid(True, linestyle="--", alpha=0.4)
                 ax.set_axisbelow(True)
-                ax.plot([0, 0.5], [0, 0.5], color="#cfcfc9", linewidth=1.0, linestyle="--", zorder=1)
                 if ri == n_rows - 1:
                     ax.set_xlabel("FPR", fontsize=8)
                 if ri == 0 and cv not in (None, "(none)"):
@@ -1716,41 +1717,58 @@ class CrossRunAnalysis:
         return fig
 
     def _plot_window_ecdf(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
-                          logx=None, linthresh=None, normalize=False, legend=True, color=None):
-        if color not in (None, "bl"):
-            raise ValueError(f"window_ecdf: color must be None or 'bl', got {color!r}")
-        if color == "bl" and runs is not None:
-            raise ValueError("window_ecdf: color='bl' needs the pooled form (no run=)")
+                          logx=None, linthresh=None, normalize=False, legend=True, color=None, agg=()):
+        if color is not None and runs is not None:
+            raise ValueError("window_ecdf: color= needs the pooled form (no run=)")
+        by = [a for a in agg or () if a] or ["-w"]
+        if len(by) > 1 or by[0] not in _POOLED_SCORE_AXES or (by[0] != "-w" and runs is not None):
+            raise ValueError(f"window_ecdf: agg is one of {sorted(_POOLED_SCORE_AXES)} (non '-w' only without run=), got {agg}")
+        by = by[0]
         topologies = [topologies] if isinstance(topologies, str) else list(topologies)
         cols = [TOPOLOGY_NAMES.index(t) for t in topologies]
         figs = []
-        if runs is None and color == "bl":
-            series = []
+        if runs is None:
+            per_w = []
             for w, root in self._caster_window_roots(axes):
                 runs_w = _caster_scores_by_run(root, tuple(exclude_keywords), pattern)
-                if not runs_w:
+                if runs_w:
+                    per_w.append((w, runs_w, [np.nan] * len(runs_w) if color is None
+                                  else self._run_color_values(color, w, root, runs_w, exclude_keywords)))
+            spec = None
+            if color is not None:
+                spec = _color_spec([v for *_, vals in per_w for v in vals], color) if per_w else None
+                if per_w and spec is None:
+                    raise ValueError(f"window_ecdf: no {color!r} values found for any run")
+
+            def build(label, members):
+                rs = [r for r, _ in members]
+                s = (label, np.concatenate([r[1] for r in rs]), np.concatenate([r[2] for r in rs]), len(rs))
+                if spec is not None:
+                    codes = _color_codes(spec, [v for _, v in members])
+                    s += tuple(np.concatenate([np.full(len(r[i]), c) for r, c in zip(rs, codes)]) for i in (1, 2))
+                return s
+
+            if by == "-w":
+                panels = [(None, [build(_gt_mean_axis_label("-w", w), list(zip(runs_w, vals))) for w, runs_w, vals in per_w])]
+            else:
+                panels = []
+                for w, runs_w, vals in per_w:
+                    groups = {}
+                    for r, v in zip(runs_w, vals):
+                        groups.setdefault(_POOLED_SCORE_AXES[by](w, r[0]), []).append((r, v))
+                    panels.append((w, [build(_gt_mean_axis_label(by, k), groups[k]) for k in _pooled_axis_values(by, set(groups))]))
+            for w, series in panels:
+                if not series:
                     continue
-                bls = [_sim_cu_branch_length(str(root / Path(*parts[:3]))) or np.nan for parts, _, _ in runs_w]
-                series.append((w, np.concatenate([r[1] for r in runs_w]), np.concatenate([r[2] for r in runs_w]), len(runs_w),
-                               *(np.concatenate([np.full(len(r[i]), bl) for r, bl in zip(runs_w, bls)]) for i in (1, 2))))
-            if series:
-                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean",
-                                                title or f"GT window-mean ECDFs pooled over all runs by window size, points colored by CU branch length "
-                                                f"(n runs = {series[0][3]})" + (f" — {pattern}" if pattern is not None else ""),
-                                                symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
-                                                legend=legend, color_by_bl=True))
-        elif runs is None:
-            series = []
-            for w, root in self._caster_window_roots(axes):
-                pooled = _pooled_caster_scores(root, tuple(exclude_keywords), pattern)
-                if pooled[0] is not None:
-                    series.append((w, *pooled))
-            if series:
-                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean",
-                                                title or f"GT window-mean ECDFs pooled over all runs by window size (n runs = {series[0][3]})"
-                                                + (f" — {pattern}" if pattern is not None else ""),
-                                                symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
-                                                legend=legend))
+                n_runs = series[0][3] if by == "-w" else sum(s[3] for s in series)
+                figs.append(_window_ecdf_figure(
+                    series, cols, topologies, "window mean",
+                    title or f"GT window-mean ECDFs pooled over all runs by {'window size' if by == '-w' else by}"
+                    + (f", w{format_val(w)}" if w is not None else "")
+                    + (f", points colored by {_color_label(color)}" if spec is not None else "")
+                    + f" (n runs = {n_runs})" + (f" — {pattern}" if pattern is not None else ""),
+                    symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
+                    legend=legend, color_by=spec, cmap="Greys" if by in _ORDERED_POOLED_AXES else "tab10"))
         for label, path in runs or ():
             entries, df = self._ecdf_entries(axes, path, exclude_keywords, None)
             by_pattern = {}
@@ -1765,7 +1783,7 @@ class CrossRunAnalysis:
                     except ValueError as e:
                         print(f"Skipping w{format_val(w)}: {e}")
                         continue
-                    series.append((w, scores[y_true == 0], scores[y_true == 1]))
+                    series.append((_gt_mean_axis_label("-w", w), scores[y_true == 0], scores[y_true == 1]))
                 if not series:
                     continue
                 rel = "/".join((_path_after_out(path),) + tuple(tail))
@@ -1777,41 +1795,223 @@ class CrossRunAnalysis:
         plt.show()
         return figs[0] if len(figs) == 1 else figs
 
+    def _plot_topology_scatter(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
+                               logx=None, linthresh=None, normalize=False, legend=True, state=None, topology=None, stat="all",
+                               color=None, corr="spearman", percentile=None, agg=()):
+        by = [a for a in agg or () if a] or ["-w"]
+        if len(by) > 1 or by[0] not in _POOLED_SCORE_AXES:
+            raise ValueError(f"topology_topology_{stat}: agg is one of {sorted(_POOLED_SCORE_AXES)}, got {agg}")
+        by = by[0]
+        if corr not in ("spearman", "pearson"):
+            raise ValueError(f"topology_topology_{stat}: corr is 'spearman' or 'pearson', got {corr!r}")
+        symbol = "ρ" if corr == "spearman" else "r"
+        states = [s for s in _STATE_STYLES if state is None or s[0] in ([state] if isinstance(state, str) else state)]
+        picked = TOPOLOGY_NAMES if topology is None else [topology] if isinstance(topology, str) else list(topology)
+        if not states or set(picked) - set(TOPOLOGY_NAMES):
+            raise ValueError(f"topology_topology_{stat}: state from {[s[0] for s in _STATE_STYLES]}, topology from {TOPOLOGY_NAMES}")
+        fitted = stat.startswith("fitted_") or stat in _VITERBI_SPLIT_STATS
+        names = _COVARIANCE_PAIR_NAMES if stat.endswith("covariances") else TOPOLOGY_NAMES
+        if names is _COVARIANCE_PAIR_NAMES:
+            picked = [n for n, (a, b) in zip(names, _COVARIANCE_PAIRS) if TOPOLOGY_NAMES[a] in picked or TOPOLOGY_NAMES[b] in picked]
+        prefixes = [Path(p).parts for p in runs or ()]
+        series, n_runs = [], 0
+        for w, root, leaf, leaf_label, kept in self._topology_scatter_sources(axes, exclude_keywords, pattern, prefixes, fitted, stat):
+            n_runs = max(n_runs, len(kept))
+            all_values = self._run_color_values(color, w, root, [(r[0], None, None) for r in kept] if fitted else kept,
+                                                exclude_keywords, leaf) if color is not None else [np.nan] * len(kept)
+            groups = {}
+            for r, v in zip(kept, all_values):
+                groups.setdefault(None if by == "-w" else _POOLED_SCORE_AXES[by](w, r[0]), []).append((r, v))
+            for key in _pooled_axis_values(by, set(groups)) if by != "-w" else [None]:
+                label = _gt_mean_axis_label("-w", w) + leaf_label + ("" if key is None else f" {_gt_mean_axis_label(by, key)}")
+                series.append((label, *self._topology_scatter_points([r for r, _ in groups[key]], [v for _, v in groups[key]], stat)))
+        if not series:
+            raise ValueError(f"No topology_topology_{stat} could be drawn for {runs} with {axes}")
+        spec = None
+        if color is not None:
+            spec = _color_spec([v for s in series for v in s[4][0]], color)
+            if spec is None:
+                raise ValueError(f"topology_topology_{stat}: no {color!r} values found for any run")
+        pairs = [(a, b) for a, b in itertools.combinations(range(len(names)), 2)
+                 if (names[a] in picked) + (names[b] in picked) >= min(len(picked), 2)]
+        fig, axs = plt.subplots(len(pairs), len(series), figsize=(3.8 * len(series) + (1.2 if spec else 0), 3.5 * len(pairs)),
+                                squeeze=False)
+        rng = np.random.default_rng(0)
+        what = {"all": "window mean", "means": "mean window mean", "variances": "window-mean variance",
+                "covariances": "window-mean covariance", "fitted_all": "window mean", "viterbi_variances": "window-mean variance", "fitted_means": "fitted mean", "fitted_variances": "fitted variance",
+                "fitted_covariances": "fitted covariance"}[stat]
+        markers = ("o", "^") if spec else ("o", "o")
+        for ci, (w, null, alt, _, run_values) in enumerate(series):
+            if normalize:
+                both = np.concatenate([null, alt])
+                both = np.column_stack([_minmax_normalize(both[:, c], normalize) for c in range(both.shape[1])])
+                null, alt = both[:len(null)], both[len(null):]
+            bounds = np.tile([-np.inf, np.inf], (null.shape[1], 1))
+            if percentile is not None:
+                pooled = np.concatenate([(null, alt)[si] for _, si, _ in states])
+                for c in range(pooled.shape[1]):
+                    if np.isfinite(pooled[:, c]).any():
+                        bounds[c] = np.nanpercentile(pooled[:, c], percentile)
+            codes = [_color_codes(spec, v) if spec else None for v in run_values]
+            for ri, (a, b) in enumerate(pairs):
+                ax = axs[ri][ci]
+                lines, kept = [], []
+                for name, si, _ in states:
+                    xy = (null, alt)[si][:, [a, b]]
+                    finite = np.flatnonzero(np.isfinite(xy).all(axis=1) & (xy >= bounds[[a, b], 0]).all(axis=1)
+                                            & (xy <= bounds[[a, b], 1]).all(axis=1))
+                    kept.append(xy[finite])
+                    shown = rng.choice(finite, _SCATTER_MAX_POINTS, replace=False) if len(finite) > _SCATTER_MAX_POINTS else finite
+                    point_colors = [_color_of(spec, c) for c in codes[si][shown]] if spec else _HMM_STATE_COLORS[si]
+                    ax.scatter(xy[shown, 0], xy[shown, 1], s=2 if stat.endswith("all") else 8, alpha=0.25 if stat.endswith("all") else 0.5,
+                               c=point_colors, marker=markers[si], linewidths=0, rasterized=True)
+                    lines.append(f"{name} {symbol}={_corr(xy[finite], corr):.3f} (n={len(finite)})")
+                if len(states) > 1:
+                    lines.append(f"all {symbol}={_corr(np.concatenate(kept), corr):.3f}")
+                ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes, va="top", ha="left", fontsize=7,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, linewidth=0.5))
+                if logx:
+                    ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                    ax.set_yscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.grid(alpha=0.25)
+                ax.set_title(f"{w}: {names[a]} vs {names[b]}", fontsize=9)
+                ax.set_xlabel(f"{'normalized ' if normalize else ''}{names[a]} {what}")
+                if ci == 0:
+                    ax.set_ylabel(f"{'normalized ' if normalize else ''}{names[b]} {what}")
+        scope = ", ".join("/".join(p) for p in prefixes) or "all runs"
+        _suptitle(fig, title or {"all": "GT window-mean", "means": "GT per-run mean window-mean (point = run)",
+                                 "variances": "GT per-run window-mean variance (point = run)",
+                                 "covariances": "GT per-run window-mean covariance (point = run)",
+                                 "fitted_all": "HMM (Viterbi) window-mean",
+                                 "viterbi_variances": "HMM (Viterbi) per-run window-mean variance (point = run)",
+                                 "fitted_means": "HMM-fitted emission mean (point = run)",
+                                 "fitted_variances": "HMM-fitted emission variance (point = run)",
+                                 "fitted_covariances": "HMM-fitted emission covariance (point = run)"}[stat]
+                  + f" topology vs topology, {scope} (n runs = {n_runs}, {corr.capitalize()} {symbol}"
+                  + (f", x/y = p{format_val(percentile[0])}–p{format_val(percentile[1])}" if percentile is not None else "") + ")"
+                  + (f", colored by {_color_label(color)}" if spec else "")
+                  + (f" — {pattern}" if pattern is not None else ""), fontsize=10)
+        right = 1 - 1.1 / fig.get_figwidth() if spec else 1.0
+        if legend:
+            _legend_below_axes(fig, [matplotlib.lines.Line2D([], [], marker=markers[si], linestyle="",
+                                                             color="gray" if spec else _HMM_STATE_COLORS[si]) for _, si, _ in states],
+                               [name for name, _, _ in states], ncol=len(states), fontsize=8, right=right)
+        else:
+            fig.tight_layout(rect=[0, 0, right, 0.95])
+        if spec and spec["cats"] is None:
+            top, bottom = axs[0][-1].get_position().y1, axs[-1][-1].get_position().y0
+            cax = fig.add_axes([right + 0.15 / fig.get_figwidth(), bottom, 0.15 / fig.get_figwidth(), top - bottom])
+            fig.colorbar(matplotlib.cm.ScalarMappable(norm=spec["norm"], cmap=spec["cmap"]), cax=cax,
+                         label="branch length (CU)" if spec["label"] == "bl" else spec["label"])
+        elif spec:
+            fig.legend([matplotlib.lines.Line2D([], [], color=_color_of(spec, i), linewidth=2) for i in range(len(spec["cats"]))],
+                       spec["cats"], title=spec["label"], loc="center left", bbox_to_anchor=(right, 0.5), fontsize=7, title_fontsize=8)
+        plt.show()
+        return fig
+
+    def _topology_scatter_sources(self, axes, exclude_keywords, pattern, prefixes, fitted, stat):
+        roots = self._caster_window_roots(axes)
+        keep = lambda parts: not prefixes or any(parts[:len(p)] == p for p in prefixes)
+        if not fitted:
+            for w, root in roots:
+                kept = [r for r in _caster_scores_by_run(root, tuple(exclude_keywords), pattern) if keep(r[0])]
+                if kept:
+                    yield w, root, None, "", kept
+            return
+        leaves = sorted({Path(d) for _, ds in self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords) for d in ds})
+        for w, root in roots:
+            at_w = [leaf for leaf in leaves if self._get_args(leaf).get("window_size") == w]
+            if not at_w:
+                continue
+            depth = min(len(leaf.parts) for leaf in at_w)
+            skipped = [leaf for leaf in at_w if len(leaf.parts) > depth]
+            if skipped:
+                print(f"w{format_val(w)}: skipping variant runs (pin their flag to plot them): {[str(s) for s in skipped]}")
+            at_w = [leaf for leaf in at_w if len(leaf.parts) == depth]
+            tails = [[p for p in leaf.parts[next(i for i, p in enumerate(leaf.parts) if _OUT_SIZE_SEGMENT.match(p)) + 1:]]
+                     for leaf in at_w]
+            common = os.path.commonprefix(tails) if len(tails) > 1 else tails[0]
+            for leaf, tail in zip(at_w, tails):
+                reports = [r for r in sorted((leaf / "reports").glob("*/*/*/*.tsv"))
+                           if keep(r.relative_to(leaf / "reports").with_suffix("").parts)
+                           and (pattern is None or r.stem == str(pattern)) and not any(k in str(r) for k in exclude_keywords)]
+                if stat in _VITERBI_SPLIT_STATS:
+                    args = self._get_args(leaf)
+                    scores_paths = [get_expected_scores_path(
+                        Path("simulations", *parts[:3], "concat", f"{parts[3]}.fa"), Path(*parts[:3]),
+                        window_size=args.get("window_size"), step_size=args.get("step_size"),
+                        **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
+                        for parts in (r.relative_to(leaf / "reports").with_suffix("").parts for r in reports)]
+                    loaded = _hmm_split_scores_many(reports, scores_paths)
+                else:
+                    loaded = _fitted_moments_many(reports)
+                kept = [(r.relative_to(leaf / "reports").with_suffix("").parts, *m) for r, m in zip(reports, loaded) if m is not None]
+                if kept:
+                    yield w, root, leaf, "".join(f" {p}" for p in tail[len(common):]), kept
+
+    @staticmethod
+    def _topology_scatter_points(kept, values, stat):
+        if stat in _VITERBI_SPLIT_STATS:
+            stat = _VITERBI_SPLIT_STATS[stat]
+        elif stat.startswith("fitted_"):
+            pick = {"fitted_means": lambda mean, cov: mean, "fitted_variances": lambda mean, cov: np.diagonal(cov),
+                    "fitted_covariances": lambda mean, cov: cov[tuple(np.array(_COVARIANCE_PAIRS).T)]}[stat]
+            points = [np.array([pick(r[1][i], r[2][i]) for r in kept]) for i in (0, 1)]
+            return (*points, len(kept), [values, values])
+        if stat == "covariances":
+            def offdiag(x):
+                return np.cov(x[np.isfinite(x).all(axis=1)].T)[tuple(np.array(_COVARIANCE_PAIRS).T)] \
+                    if np.isfinite(x).all(axis=1).sum() >= 2 else np.full(len(_COVARIANCE_PAIRS), np.nan)
+            points = [np.array([offdiag(r[i]) for r in kept]) for i in (1, 2)]
+            return (*points, len(kept), [values, values])
+        if stat == "all":
+            points = [np.concatenate([r[i] for r in kept]) for i in (1, 2)]
+            run_values = [[v for r, v in zip(kept, values) for _ in range(len(r[i]))] for i in (1, 2)]
+        else:
+            reduce, min_n = (np.nanvar, 2) if stat == "variances" else (np.nanmean, 1)
+            points = [np.array([reduce(r[i], axis=0) if len(r[i]) >= min_n else np.full(len(TOPOLOGY_NAMES), np.nan)
+                                for r in kept]) for i in (1, 2)]
+            run_values = [values, values]
+        return (*points, len(kept), run_values)
+
     def _plot_ecdf_all(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
-                       logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99), vs_bl=False):
+                       logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99), vs_bl=False, color=None,
+                       logy=False, fit=False):
         prefixes = [Path(p).parts for p in runs or ()]
         figs = []
         for w, root in self._caster_window_roots(axes):
-            branches = {}
+            branches, exps = {}, {}
             for parts, null, alt in _caster_scores_by_run(root, tuple(exclude_keywords), pattern):
                 if prefixes and not any(parts[:len(p)] == p for p in prefixes):
                     continue
                 branch = branches.setdefault(parts[:3], ([], []))
                 branch[0].append(null)
                 branch[1].append(alt)
+                exps.setdefault(parts[:3], []).append((parts, null, alt))
             if not branches:
                 continue
             bls = {k: _sim_cu_branch_length(str(root / Path(*k))) for k in branches}
+            colors = self._branch_colors(color, w, root, exps, bls, exclude_keywords)
             scope = ", ".join("/".join(p) for p in prefixes) or "all runs"
-            figs.append((_mean_vs_bl_all_figure if vs_bl else _ecdf_all_figure)(
+            figs.append((functools.partial(_mean_vs_bl_all_figure, logy=logy) if vs_bl else functools.partial(_ecdf_all_figure, fit=fit))(
                 branches, bls, topologies, ("Null", "Outlier"), normalize, logx, linthresh, legend, percentile,
                 lambda n: title or f"w{format_val(w)} GT {'per-branch window-mean mean vs CU branch length' if vs_bl else 'window-mean ECDFs per branch'}, {scope} (n experiments = {n}, "
                 f"branches = {len(branches)}, x = p{format_val(percentile[0])}–p{format_val(percentile[1])})"
-                + (f" — {pattern}" if pattern is not None else "")))
+                + (f" — {pattern}" if pattern is not None else ""), None if vs_bl and color in (None, "bl") else colors))
         if not figs:
             raise ValueError(f"No {'mean_all_vs_bl' if vs_bl else 'ecdf_all'} could be drawn for {runs} with {axes}")
         plt.show()
         return figs[0] if len(figs) == 1 else figs
 
     def _plot_ecdf_all_hmm(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
-                          logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99)):
+                          logx=None, linthresh=None, normalize=False, legend=True, percentile=(1, 99), color=None, fit=False):
         prefixes = [Path(p).parts for p in runs or ()]
         dirs = sorted({d for _, ds in self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords) for d in ds})
         figs = []
         for leaf in dirs:
             leaf = Path(leaf)
             args = self._get_args(leaf)
-            branches, bls, skipped = {}, {}, 0
+            branches, bls, exps, skipped = {}, {}, {}, 0
             for report in sorted((leaf / "reports").glob("*/*/*/*.tsv")):
                 parts = report.relative_to(leaf / "reports").with_suffix("").parts
                 if prefixes and not any(parts[:len(p)] == p for p in prefixes):
@@ -1830,6 +2030,7 @@ class CrossRunAnalysis:
                 branch = branches.setdefault(parts[:3], ([], []))
                 branch[0].append(scores[y_pred == 0])
                 branch[1].append(scores[y_pred == 1])
+                exps.setdefault(parts[:3], []).append((parts, None, None))
                 bls.setdefault(parts[:3], _sim_cu_branch_length(str(scores_path.parent.parent)))
             if skipped:
                 print(f"{leaf}: skipped {skipped} reports without a usable state path/scores")
@@ -1841,7 +2042,8 @@ class CrossRunAnalysis:
                 branches, bls, topologies, ("Null HMM", "Outlier HMM"), normalize, logx, linthresh, legend, percentile,
                 lambda n: title or f"{_size_label(config)} HMM (Viterbi) window-mean ECDFs per branch, {scope} (n experiments = {n}, "
                 f"branches = {len(branches)}, x = p{format_val(percentile[0])}–p{format_val(percentile[1])})"
-                + (f" — {pattern}" if pattern is not None else "")))
+                + (f" — {pattern}" if pattern is not None else ""),
+                self._branch_colors(color, args.get("window_size"), None, exps, bls, exclude_keywords, leaf), fit=fit))
         if not figs:
             raise ValueError(f"No ecdf_all_hmm could be drawn for {runs} with {axes}")
         plt.show()
@@ -1990,6 +2192,43 @@ class CrossRunAnalysis:
             long["_gap"] = (1 if normalize == "0-1" else 2) * long["_gap"] / span
         return long
 
+    def _run_color_values(self, color, w, root, runs, exclude_keywords=(), leaf=None):
+        if color == "bl":
+            return [_sim_cu_branch_length(str(root / Path(*parts[:3]))) or np.nan for parts, *_ in runs]
+        if color in _POOLED_SCORE_AXES and color != "-w":
+            return [_POOLED_SCORE_AXES[color](w, parts) for parts, *_ in runs]
+        if color in ("anomaly_fraction", "outlier_pct"):
+            scale = 100 if color == "outlier_pct" else 1
+            fracs = [nominal_anomaly_fraction(parts[3]) for parts, *_ in runs]
+            return [scale * (f if f is not None else len(alt) / max(len(null) + len(alt), 1) if null is not None else np.nan)
+                    for f, (_, null, alt) in zip(fracs, runs)]
+        table = self._runs_tsv_column(color, w, leaf, tuple(exclude_keywords))
+        return [table.get(f"{'/'.join(parts[:3])}::{parts[3]}", np.nan) for parts, *_ in runs]
+
+    def _runs_tsv_column(self, col, w, leaf=None, exclude_keywords=()):
+        key = (col, w, leaf and str(leaf), exclude_keywords)
+        if key not in self._color_cache:
+            dirs = [Path(leaf)] if leaf is not None else [
+                d for d in self._all_leaf_dirs() if not any(k in str(d) for k in exclude_keywords)
+                and self._get_args(d).get("window_size") == w and (self._get_args(d).get("step_size") or w) == w]
+            frames = [pd.read_csv(d / "runs.tsv", sep="\t", usecols=lambda c: c in ("run_id", col)) for d in dirs if (d / "runs.tsv").exists()]
+            df = pd.concat([f for f in frames if col in f.columns] or [pd.DataFrame(columns=["run_id", col])])
+            if df.empty:
+                raise ValueError(f"color={col!r}: not a runs.tsv column (or no runs at w{format_val(w)})")
+            grouped = df.groupby("run_id")[col]
+            self._color_cache[key] = (grouped.mean() if pd.api.types.is_numeric_dtype(df[col])
+                                      else grouped.agg(_aggregate_color)).to_dict()
+        return self._color_cache[key]
+
+    def _branch_colors(self, color, w, root, exps, bls, exclude_keywords=(), leaf=None):
+        if color in (None, "bl"):
+            values = {k: bls[k] or np.nan for k in exps}
+            spec = _color_spec(list(values.values()), "bl", log=True, cmap="viridis")
+        else:
+            values = {k: _aggregate_color(self._run_color_values(color, w, root, runs, exclude_keywords, leaf)) for k, runs in exps.items()}
+            spec = _color_spec(list(values.values()), color)
+        return spec, dict(zip(values, _color_codes(spec, list(values.values())))) if spec else {}
+
     def _caster_window_roots(self, axes):
         windows = axes.get("-w", axes.get("--window-size"))
         if windows is None:
@@ -2007,7 +2246,13 @@ class CrossRunAnalysis:
     def plot(self, *args, show_axes=True, legend=None, gtrees=False, **kwargs):
         if legend not in (None, "hide", "values"):
             raise ValueError(f"legend must be None, 'hide', or 'values', got {legend!r}")
-        figs = self._plot_vs_paper(*args, **kwargs) if gtrees else self._plot(*args, **kwargs)
+        options = dict(kwargs.get("options") or {})
+        admixture = options.pop("admixture", True)
+        kwargs["options"] = options or None
+        if not admixture:
+            kwargs["exclude_keywords"] = (*kwargs.get("exclude_keywords", ()), "admixture")
+        with _hiding_admixture(not admixture):
+            figs = self._plot_vs_paper(*args, **kwargs) if gtrees else self._plot(*args, **kwargs)
         split = isinstance(figs, list) and any(isinstance(f, list) for f in figs)
         for fig in [f for row in figs for f in row] if split else figs if isinstance(figs, (list, tuple)) else [figs]:
             if fig is None:
@@ -2171,19 +2416,30 @@ class CrossRunAnalysis:
         (default True: per-subplot legend / box of each curve's mean;
         False = one shared legend, no means). metrics=["window_ecdf"]:
         every "-w" value overlaid (gray, light = small), cols = topologies,
+        (pooled only) agg=[axis] from _POOLED_SCORE_AXES (merged_category,
+        x_bin, fraction_bin, ...) overlays that axis instead, one figure per -w,
         rows = GT Null/Outlier; with `run`, one figure per run/pattern of
         its window scores, without, one figure of every store/caster run's
-        GT mean (gt_stats.txt) for each window; color="bl" (pooled only)
-        colors each ECDF's points by their run's CU branch length (linear
-        rainbow; window lines + mean vlines stay gray on top). metrics=["ecdf_all"]: one
+        GT mean (gt_stats.txt) for each window; color= (pooled only)
+        colors each ECDF's points by their run's value (window lines + mean
+        vlines stay gray on top): "bl" = CU branch length, category/
+        subcategory/merged_category/pattern/direction (up/down/admixture)
+        from the path, anomaly_fraction/
+        outlier_pct from the pattern, any other runs.tsv column = mean (or
+        mode) over every store run's row at that window (ecdf_all_hmm: its
+        own runs.tsv); numeric = rainbow colorbar, else tab legend. ecdf_all/
+        ecdf_all_hmm/mean_all_vs_bl take the same color= per branch
+        (patterns averaged; default "bl"). metrics=["ecdf_all"]: one
         figure per "-w", one thin GT window-score ECDF per branch (sim,
         patterns pooled) colored by CU branch length, cols = topologies,
         rows = Null/Outlier; `run` (e.g. "10X/down", a list of them)
         restricts branches by store/caster path prefix; option
         "percentile" (default (1, 99)) sets each column's x range from the
-        pooled values. metrics=["mean_all_vs_bl"]: same branches, clipping
+        pooled values; option "fit"=True (also ecdf_all_hmm) overlays the
+        pooled clipped ECDF (thick black) and its Gaussian MLE CDF (red
+        dashed), μ/σ/KS D in the box. metrics=["mean_all_vs_bl"]: same branches, clipping
         and normalize as ecdf_all, but one point per branch = its clipped
-        mean vs CU branch length (log x; logx=False = linear) with a fitted
+        mean vs CU branch length (log x; logx=False = linear; logy=True = log y) with a fitted
         y = a + b·e^(−kx). normalize="0-1" (any dist metric) min-max
         normalizes to [0, 1] instead of [-1, 1].
         metrics=["ecdf_all_hmm"]: ecdf_all split by each
@@ -2322,6 +2578,11 @@ class CrossRunAnalysis:
         minus "tpr_fpr") -- print_configs defaults to that instead of
         requiring metrics= on every call.
 
+        options also takes "admixture" (default True; False hides admixture
+        rows/columns/x_bins and the admixture path keyword) and "tpr_fpr_full"
+        (default False; True shows the tpr_fpr grid's full 0-1 FPR axis
+        instead of 0-0.5).
+
         options=None (default): a dict of {"logx", "logy", "interp"} bools,
         all off by default, applied only in the bar/violin paths (the
         single-level-agg path below and _plot_grouped -- not heatmap, whose
@@ -2354,7 +2615,10 @@ class CrossRunAnalysis:
             if len(metrics) != 1:
                 raise ValueError(f"pass metrics=[{dist_metric!r}] on its own")
             unknown = set(options or {}) - _DIST_OPTIONS - ({"percentile"} if dist_metric in ("ecdf_all", "ecdf_all_hmm", "mean_all_vs_bl") else set()) \
-                - ({"per_window"} if dist_metric == "gap_ecdf" else set())
+                - ({"fit"} if dist_metric in ("ecdf_all", "ecdf_all_hmm") else set()) \
+                - ({"logy"} if dist_metric == "mean_all_vs_bl" else set()) \
+                - ({"per_window"} if dist_metric == "gap_ecdf" else set()) \
+                - ({"state", "topology", "corr", "percentile"} if dist_metric in _TOPOLOGY_SCATTER_METRICS else set())
             if unknown:
                 raise ValueError(f"{dist_metric}: unknown options {sorted(unknown)} (takes {sorted(_DIST_OPTIONS)})")
             opts = {"pattern": None, "topologies": TOPOLOGY_NAMES, "logx": None, "linthresh": None, "normalize": False,
@@ -2363,16 +2627,21 @@ class CrossRunAnalysis:
             runs = runs and [(label, _resolve_run_path(p)) for label, p in runs]
             if dist_metric in ("ecdf_all", "mean_all_vs_bl"):
                 return self._plot_ecdf_all(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
-                                           title=title, vs_bl=dist_metric == "mean_all_vs_bl", **opts)
+                                           title=title, vs_bl=dist_metric == "mean_all_vs_bl", color=color, **opts)
             if dist_metric == "ecdf_all_hmm":
                 return self._plot_ecdf_all_hmm(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
-                                              title=title, **opts)
+                                              title=title, color=color, **opts)
             if dist_metric == "ecdf_hmm":
                 if run is None:
                     raise ValueError("ecdf_hmm needs run=")
                 return self._plot_ecdf_hmm(axes, runs, agg=agg, exclude_keywords=exclude_keywords, title=title, dir=dir, **opts)
+            if (dist_metric in _TOPOLOGY_SCATTER_METRICS) != (plot_type == "scatter"):
+                raise ValueError(f"plot_type='scatter' goes with metrics=[one of {sorted(_TOPOLOGY_SCATTER_METRICS)}]")
+            if dist_metric in _TOPOLOGY_SCATTER_METRICS:
+                return self._plot_topology_scatter(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
+                                                   title=title, stat=_TOPOLOGY_SCATTER_METRICS[dist_metric], color=color, agg=agg, **opts)
             if dist_metric == "window_ecdf":
-                return self._plot_window_ecdf(axes, runs, exclude_keywords=exclude_keywords, title=title, color=color, **opts)
+                return self._plot_window_ecdf(axes, runs, exclude_keywords=exclude_keywords, title=title, color=color, agg=agg, **opts)
             if dist_metric in _SCORE_DIST_METRICS:
                 if run is None:
                     return self._plot_score_dist_pooled(dist_metric, axes, agg=agg, exclude_keywords=exclude_keywords,
@@ -2430,10 +2699,11 @@ class CrossRunAnalysis:
             raise ValueError(f"agg_idx={agg_idx} out of range for {levels} agg level(s)")
         if "tpr_fpr" in metrics:
             tpr_fpr_title = _compose_title(suffix, title, "TPR/FPR")
+            full = bool(options.get("tpr_fpr_full"))
             if levels >= 2:
-                figs.append(self._plot_tpr_fpr_grouped(configs, title=tpr_fpr_title, agg_idx=agg_idx))
+                figs.append(self._plot_tpr_fpr_grouped(configs, title=tpr_fpr_title, agg_idx=agg_idx, full=full))
             else:
-                figs.append(self._plot_tpr_fpr_grid(configs, title=tpr_fpr_title))
+                figs.append(self._plot_tpr_fpr_grid(configs, title=tpr_fpr_title, full=full))
         metrics = [m for m in metrics if m != "tpr_fpr"]
         self.metrics = [m for panel in metrics for m in (panel if isinstance(panel, tuple) else (panel,))]
         if not metrics:
@@ -3568,8 +3838,7 @@ _OUT_RUN_COLUMNS = OUT_RUN_ID_COLUMNS + list(_OUT_RUN_METRIC_KEYS) + _OUT_TRANSI
 
 
 _ECDF_TOPO_COLORS = {"ABBA": "#1F77B4", "BABA": "#D62728", "AABB": "#2CA02C"}
-_ECDF_MAX_POINTS = 2000
-_RE_STATE_OCCUPANCY = re.compile(r"^State occupancy \(posterior, windows\): Null ([-\d.eE+na]+), Alt ([-\d.eE+na]+)")
+_RE_STATE_OCCUPANCY = re.compile(r"^State occupancy \(posterior, windows\): Null ([-\d.eE+na]+), (?:Alt|Outlier) ([-\d.eE+na]+)")
 
 
 _SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus")
@@ -3630,20 +3899,169 @@ def _minmax_normalize(values, mode=True):
     return unit if mode == "0-1" else 2 * unit - 1
 
 
+_GT_SCORES_MAX_ROWS = 20000
+_GT_SCORES_CACHE = Path("store") / "cache" / "gt_scores"
+_GT_SCORES_WORKERS = 16
+
+
+def _gt_scores_cache_path(scores_path):
+    st = scores_path.stat()
+    key = hashlib.sha1(f"{scores_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{_GT_SCORES_MAX_ROWS}".encode()).hexdigest()
+    return _gt_scores_cache_root() / key[:2] / f"{key}.npz"
+
+
+@functools.lru_cache(maxsize=None)
+def _gt_scores_cache_root():
+    return get_repo_root() / _GT_SCORES_CACHE
+
+
+def _cached_gt_scores(scores_path):
+    cache = _gt_scores_cache_path(scores_path)
+    try:
+        with np.load(cache) as z:
+            return z["null"], z["alt"]
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        scores, y_true = _scores_with_truth(scores_path, scores_path.parent.name)
+    except ValueError:
+        return None
+    if len(scores) > _GT_SCORES_MAX_ROWS:
+        keep = np.sort(np.random.default_rng(0).choice(len(scores), _GT_SCORES_MAX_ROWS, replace=False))
+        scores, y_true = scores[keep], y_true[keep]
+    null, alt = scores[y_true == 0], scores[y_true == 1]
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npz")
+    np.savez(tmp, null=null, alt=alt)
+    os.replace(tmp, cache)
+    return null, alt
+
+
 @functools.lru_cache(maxsize=32)
 def _caster_scores_by_run(root, exclude_keywords=(), pattern=None):
-    runs = []
-    for scores_path in sorted(root.glob("*/*/*/*/scores.tsv")):
-        if scores_path.relative_to(root).parts[0] in _CASTER_VARIANT_DIRS or any(k in str(scores_path) for k in exclude_keywords):
-            continue
-        if pattern is not None and scores_path.parent.name != str(pattern):
-            continue
-        try:
-            scores, y_true = _scores_with_truth(scores_path, scores_path.parent.name)
-        except ValueError:
-            continue
-        runs.append((scores_path.relative_to(root).parts[:4], scores[y_true == 0], scores[y_true == 1]))
-    return tuple(runs)
+    paths = [p for p in sorted(root.glob("*/*/*/*/scores.tsv"))
+             if p.relative_to(root).parts[0] not in _CASTER_VARIANT_DIRS and not any(k in str(p) for k in exclude_keywords)
+             and (pattern is None or p.parent.name == str(pattern))]
+    if sum(not _gt_scores_cache_path(p).exists() for p in paths) > 1:
+        with concurrent.futures.ProcessPoolExecutor(_GT_SCORES_WORKERS, mp_context=multiprocessing.get_context("fork")) as pool:
+            loaded = list(pool.map(_cached_gt_scores, paths, chunksize=4))
+    else:
+        loaded = [_cached_gt_scores(p) for p in paths]
+    return tuple((p.relative_to(root).parts[:4], *r) for p, r in zip(paths, loaded) if r is not None)
+
+
+_COVARIANCE_PAIRS = tuple(itertools.combinations(range(len(TOPOLOGY_NAMES)), 2))
+_COVARIANCE_PAIR_NAMES = [f"{TOPOLOGY_NAMES[a]}·{TOPOLOGY_NAMES[b]}" for a, b in _COVARIANCE_PAIRS]
+_FIT_MOMENTS_CACHE = Path("store") / "cache" / "fit_moments"
+
+
+def _fit_moments_cache_path(report):
+    fit = report.with_suffix(".fit.pkl")
+    stamp = "|".join(f"{p.stat().st_size}|{p.stat().st_mtime_ns}" for p in (report, fit) if p.exists())
+    key = hashlib.sha1(f"{report.resolve()}|{stamp}".encode()).hexdigest()
+    return get_repo_root() / _FIT_MOMENTS_CACHE / key[:2] / f"{key}.npz"
+
+
+def _read_fitted_moments(report):
+    import pickle
+    lines = report.read_text().splitlines()
+    flipped = any(line.strip() == "Label polarity flipped for evaluation: True" for line in lines)
+    fit = report.with_suffix(".fit.pkl")
+    if fit.exists():
+        with open(fit, "rb") as f:
+            e = pickle.load(f)["params"].emissions
+        means, covs = np.asarray(e.means, dtype=float), np.asarray(e.covariances, dtype=float)
+        if hasattr(e, "mixture_weights"):
+            w = np.asarray(e.mixture_weights, dtype=float)
+            mix = np.einsum("sm,smd->sd", w, means)
+            covs = np.einsum("sm,smde->sde", w, covs + np.einsum("smd,sme->smde", means, means)) - np.einsum("sd,se->sde", mix, mix)
+            means = mix
+        if means.shape != (2, len(TOPOLOGY_NAMES)):
+            return None
+        order = [1, 0] if flipped else [0, 1]
+        return means[order], covs[order]
+    header = next((i for i, line in enumerate(lines) if line.startswith("Topology\tState\t")), None)
+    if header is None:
+        return None
+    cols = lines[header].split("\t")
+    means, covs = np.full((2, 3), np.nan), np.full((2, 3, 3), np.nan)
+    for line in lines[header + 1:]:
+        cells = line.split("\t")
+        if len(cells) != len(cols) or cells[0] not in TOPOLOGY_NAMES:
+            break
+        row = dict(zip(cols, cells))
+        d, s = TOPOLOGY_NAMES.index(row["Topology"]), 0 if row["State"] == "Null" else 1
+        if "FittedMean" in row:
+            means[s, d], covs[s, d, d] = float(row["FittedMean"]), float(row["FittedStd"]) ** 2
+        elif row["Statistic"] == "mean":
+            means[s, d] = float(row["Fitted"])
+        elif row["Statistic"] == "std":
+            covs[s, d, d] = float(row["Fitted"]) ** 2
+    return means, covs
+
+
+def _cached_fitted_moments(report):
+    cache = _fit_moments_cache_path(report)
+    try:
+        with np.load(cache) as z:
+            return (z["means"], z["covs"]) if z["ok"] else None
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        moments = _read_fitted_moments(report)
+    except (OSError, ValueError, KeyError, AttributeError, EOFError):
+        moments = None
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npz")
+    np.savez(tmp, ok=moments is not None, means=moments[0] if moments else np.empty(0), covs=moments[1] if moments else np.empty(0))
+    os.replace(tmp, cache)
+    return moments
+
+
+def _fitted_moments_many(reports):
+    if sum(not _fit_moments_cache_path(r).exists() for r in reports) > 1:
+        with concurrent.futures.ProcessPoolExecutor(_GT_SCORES_WORKERS, mp_context=multiprocessing.get_context("fork")) as pool:
+            return list(pool.map(_cached_fitted_moments, reports, chunksize=8))
+    return [_cached_fitted_moments(r) for r in reports]
+
+
+_HMM_SPLIT_CACHE = Path("store") / "cache" / "hmm_split_scores"
+_VITERBI_SPLIT_STATS = {"fitted_all": "all", "viterbi_variances": "variances"}
+
+
+def _hmm_split_cache_path(report, scores_path):
+    stamp = "|".join(f"{p.resolve()}|{p.stat().st_size}|{p.stat().st_mtime_ns}" for p in (report, scores_path) if p.exists())
+    key = hashlib.sha1(f"{stamp}|{_GT_SCORES_MAX_ROWS}".encode()).hexdigest()
+    return get_repo_root() / _HMM_SPLIT_CACHE / key[:2] / f"{key}.npz"
+
+
+def _cached_hmm_split_scores(report, scores_path):
+    cache = _hmm_split_cache_path(report, scores_path)
+    try:
+        with np.load(cache) as z:
+            return (z["null"], z["alt"]) if z["ok"] else None
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        scores, _, y_pred, _ = _report_window_labels(report, scores_path, report.stem)
+        if len(scores) > _GT_SCORES_MAX_ROWS:
+            keep = np.sort(np.random.default_rng(0).choice(len(scores), _GT_SCORES_MAX_ROWS, replace=False))
+            scores, y_pred = scores[keep], y_pred[keep]
+        split = scores[y_pred == 0], scores[y_pred == 1]
+    except (OSError, ValueError):
+        split = None
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npz")
+    np.savez(tmp, ok=split is not None, null=split[0] if split else np.empty(0), alt=split[1] if split else np.empty(0))
+    os.replace(tmp, cache)
+    return split
+
+
+def _hmm_split_scores_many(reports, scores_paths):
+    if sum(not _hmm_split_cache_path(r, s).exists() for r, s in zip(reports, scores_paths)) > 1:
+        with concurrent.futures.ProcessPoolExecutor(_GT_SCORES_WORKERS, mp_context=multiprocessing.get_context("fork")) as pool:
+            return list(pool.map(_cached_hmm_split_scores, reports, scores_paths, chunksize=8))
+    return [_cached_hmm_split_scores(r, s) for r, s in zip(reports, scores_paths)]
 
 
 def _pooled_caster_scores(root, exclude_keywords=(), pattern=None):
@@ -3654,30 +4072,27 @@ def _pooled_caster_scores(root, exclude_keywords=(), pattern=None):
 
 
 def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, linthresh=None, normalize=False, legend=True,
-                        color_by_bl=False):
+                        color_by=None, cmap="Greys"):
     if normalize:
         series = [(w, *np.split(_minmax_normalize(np.concatenate([null, alt]), normalize), [len(null)]), *rest)
                   for w, null, alt, *rest in series]
         xlabel = f"normalized {xlabel}"
-    colors = plt.cm.Greys(np.linspace(0.35, 1.0, len(series)))
-    norm = None
-    if color_by_bl:
-        known = np.concatenate([b for s in series for b in s[4:6]])
-        known = known[np.isfinite(known) & (known > 0)]
-        norm = matplotlib.colors.Normalize(known.min(), known.max()) if len(known) else None
+    colors = plt.cm.Greys(np.linspace(0.35, 1.0, len(series))) if cmap == "Greys" else [plt.cm.tab10(i % 10) for i in range(len(series))]
+    norm = color_by
     fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols), 6.5), sharey=True, squeeze=False)
     handles, entries = [], {}
-    for (w, null, alt, *_), color in zip(series, colors):
+    for s, color in zip(series, colors):
+        w, null, alt = s[:3]
         handles.append(matplotlib.lines.Line2D([], [], color=color, linewidth=1.6))
         for state, vals in enumerate((null, alt)):
             for ci, col in enumerate(cols):
                 mean, _ = _draw_ecdf(axs[state][ci], vals[:, col], color=color, linewidth=0.6 if norm else 1.3, zorder=4 if norm else 2)
                 if mean is not None:
-                    entries.setdefault((state, ci), []).append((handles[-1], f"w{format_val(w)}: μ={mean:.3g}"))
+                    entries.setdefault((state, ci), []).append((handles[-1], f"{w}: μ={mean:.3g}"))
                     if norm is not None:
                         axs[state][ci].axvline(mean, color=color, linewidth=1.0, linestyle="--", zorder=5)
                 if norm is not None:
-                    _scatter_ecdf_by_bl(axs[state][ci], vals[:, col], series[[s[0] for s in series].index(w)][4 + state], norm)
+                    _scatter_ecdf_colored(axs[state][ci], vals[:, col], s[4 + state], norm)
     for ci, col in enumerate(cols):
         pooled = np.concatenate([v[:, col] for _, null, alt, *_ in series for v in (null, alt)])
         pooled = pooled[np.isfinite(pooled)]
@@ -3700,29 +4115,97 @@ def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, l
                 ax.legend(*zip(*entries[state, ci]), fontsize=6, loc="best")
     _suptitle(fig, title, fontsize=10)
     if norm is not None:
-        fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=_BL_POINT_CMAP), ax=axs, label="branch length (CU)",
-                     fraction=0.025, pad=0.02)
+        _add_color_key(fig, axs, norm)
     if not legend:
-        _legend_below_axes(fig, handles, [f"w{format_val(s[0])}" for s in series], ncol=min(len(series), 10), fontsize=8)
+        _legend_below_axes(fig, handles, [s[0] for s in series], ncol=min(len(series), 10), fontsize=8)
     return fig
 
 
 _HMM_STATE_COLORS = ("#1F3B73", "#E4573D")
+_SCATTER_MAX_POINTS = 20000
+
+
+def _corr(xy, method="spearman"):
+    xy = xy[np.isfinite(xy).all(axis=1)]
+    if len(xy) < 2 or np.ptp(xy[:, 0]) == 0 or np.ptp(xy[:, 1]) == 0:
+        return float("nan")
+    if method == "spearman":
+        xy = np.column_stack([stats.rankdata(xy[:, 0]), stats.rankdata(xy[:, 1])])
+    return float(np.corrcoef(xy[:, 0], xy[:, 1])[0, 1])
 
 
 _BL_POINT_CMAP = "rainbow"
 
 
-def _scatter_ecdf_by_bl(ax, vals, bls, norm):
+def _scatter_ecdf_colored(ax, vals, codes, spec):
     keep = np.isfinite(vals)
     order = np.argsort(vals[keep], kind="stable")
-    vals, bls = vals[keep][order], bls[keep][order]
+    vals, codes = vals[keep][order], codes[keep][order]
     if not len(vals):
         return
-    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), _ECDF_MAX_POINTS)).astype(int))
-    known = np.isfinite(bls[idx]) & (bls[idx] > 0)
-    ax.scatter(vals[idx][known], (idx[known] + 1) / len(vals), c=bls[idx][known], cmap=_BL_POINT_CMAP, norm=norm, s=8,
+    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), ECDF_MAX_POINTS)).astype(int))
+    known = np.isfinite(codes[idx])
+    ax.scatter(vals[idx][known], (idx[known] + 1) / len(vals), c=codes[idx][known], cmap=spec["cmap"], norm=spec["norm"], s=8,
                linewidths=0, zorder=3, rasterized=True)
+
+
+def _is_number(v):
+    return isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_))
+
+
+def _aggregate_color(values):
+    present = [v for v in values if not pd.isna(v)]
+    if not present:
+        return np.nan
+    if all(_is_number(v) for v in present):
+        return float(np.mean(present))
+    labels = [str(v) for v in present]
+    return max(dict.fromkeys(labels), key=labels.count)
+
+
+def _color_label(color):
+    return "CU branch length" if color == "bl" else color
+
+
+def _color_spec(values, label, log=False, cmap=_BL_POINT_CMAP):
+    present = [v for v in values if not pd.isna(v)]
+    if all(_is_number(v) for v in present):
+        known = np.array(present, dtype=float)
+        known = known[np.isfinite(known) & ((known > 0) if log else True)]
+        if not len(known):
+            return None
+        return {"label": label, "cats": None, "cmap": matplotlib.colormaps[cmap],
+                "norm": (matplotlib.colors.LogNorm if log else matplotlib.colors.Normalize)(known.min(), known.max())}
+    cats = sorted(set(map(str, present)), key=_merged_category_sort_key if label == "merged_category" else
+                  (lambda v: (_DIRECTION_ORDER.index(v) if v in _DIRECTION_ORDER else len(_DIRECTION_ORDER), v)) if label == "direction"
+                  else _token_sort_key)
+    return {"label": label, "cats": cats, "cmap": matplotlib.colors.ListedColormap([_config_color(i) for i in range(len(cats))]),
+            "norm": matplotlib.colors.BoundaryNorm(np.arange(len(cats) + 1) - 0.5, len(cats))}
+
+
+_DIRECTION_ORDER = ("up", "down", "admixture")
+
+
+def _color_codes(spec, values):
+    if spec["cats"] is None:
+        return np.array([np.nan if pd.isna(v) or not _is_number(v) else v for v in values], dtype=float)
+    idx = {c: i for i, c in enumerate(spec["cats"])}
+    return np.array([np.nan if pd.isna(v) else idx.get(str(v), np.nan) for v in values], dtype=float)
+
+
+def _color_of(spec, code):
+    if spec is None or not np.isfinite(code) or (isinstance(spec["norm"], matplotlib.colors.LogNorm) and code <= 0):
+        return "gray"
+    return spec["cmap"](spec["norm"](code))
+
+
+def _add_color_key(fig, axs, spec):
+    if spec["cats"] is None:
+        fig.colorbar(matplotlib.cm.ScalarMappable(norm=spec["norm"], cmap=spec["cmap"]), ax=axs,
+                     label="branch length (CU)" if spec["label"] == "bl" else spec["label"], fraction=0.025, pad=0.02)
+    else:
+        fig.legend([matplotlib.lines.Line2D([], [], color=_color_of(spec, i), linewidth=2) for i in range(len(spec["cats"]))],
+                   spec["cats"], title=spec["label"], loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=7, title_fontsize=8)
 
 
 def _size_label(text):
@@ -3749,19 +4232,21 @@ def _ecdf_all_series(branches, topologies, normalize, percentile):
     return topologies, cols, series, ranges, means
 
 
-def _mean_vs_bl_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title):
+def _mean_vs_bl_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title, colors=None,
+                           logy=False):
     topologies, cols, series, ranges, means = _ecdf_all_series(branches, topologies, normalize, percentile)
     n_experiments = sum(len(null) for null, _ in branches.values())
     keys = [k for k in series if bls[k]]
     x = np.array([bls[k] for k in keys], dtype=float)
-    grid = np.geomspace(x.min(), x.max(), 200) if logx is not False else np.linspace(0, x.max(), 200)
+    grid = np.geomspace(x.min(), x.max(), 200) if logx is not False else np.linspace(x.min(), x.max(), 200)
     fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols) + 1.2, 6.5), sharex=True, sharey="col", squeeze=False)
     for ci in range(len(cols)):
         for state, state_label in enumerate(state_labels):
             ax = axs[state][ci]
             y = np.array([means[k, state, ci] for k in keys], dtype=float)
             ok = np.isfinite(y)
-            ax.scatter(x[ok], y[ok], s=14, color="C0", alpha=0.6, linewidths=0)
+            ax.scatter(x[ok], y[ok], s=14, color=[_color_of(colors[0], colors[1].get(k, np.nan)) for k, o in zip(keys, ok) if o]
+                       if colors and colors[0] else "C0", alpha=0.6, linewidths=0)
             fit = _fit_exp_decay(x[ok], y[ok])
             if fit is not None:
                 a, b, k = fit
@@ -3771,12 +4256,16 @@ def _mean_vs_bl_all_figure(branches, bls, topologies, state_labels, normalize, l
                         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
             if logx is not False:
                 ax.set_xscale("log")
+            if logy:
+                ax.set_yscale("log")
             ax.grid(alpha=0.25)
             ax.set_title(f"{topologies[ci]} ({state_label})", fontsize=9)
             if state == 1:
                 ax.set_xlabel("branch length (CU)")
             if ci == 0:
                 ax.set_ylabel("normalized mean" if normalize else "mean")
+    if colors and colors[0]:
+        _add_color_key(fig, axs, colors[0])
     _suptitle(fig, title(n_experiments), fontsize=10)
     return fig
 
@@ -3792,14 +4281,14 @@ def _fit_exp_decay(x, y):
     return params
 
 
-def _ecdf_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title):
+def _ecdf_all_figure(branches, bls, topologies, state_labels, normalize, logx, linthresh, legend, percentile, title, colors,
+                     fit=False):
     topologies, cols, series, ranges, means = _ecdf_all_series(branches, topologies, normalize, percentile)
     n_experiments = sum(len(null) for null, _ in branches.values())
-    known = [v for v in bls.values() if v]
-    norm = matplotlib.colors.LogNorm(min(known), max(known)) if known else None
+    spec, codes = colors
     fig, axs = plt.subplots(2, len(cols), figsize=(3.8 * len(cols) + 1.2, 6.5), sharey=True, squeeze=False)
-    for key in sorted(series, key=lambda k: bls[k] or np.inf):
-        color = plt.cm.viridis(norm(bls[key])) if bls[key] and norm else "gray"
+    for key in sorted(series, key=lambda k: (not np.isfinite(codes.get(k, np.nan)), codes.get(k, 0))):
+        color = _color_of(spec, codes.get(key, np.nan))
         for state in (0, 1):
             for ci, col in enumerate(cols):
                 _draw_ecdf(axs[state][ci], series[key][state][:, col], color=color, linewidth=0.7, alpha=0.6)
@@ -3817,17 +4306,33 @@ def _ecdf_all_figure(branches, bls, topologies, state_labels, normalize, logx, l
             ax.grid(alpha=0.25)
             mean = np.nanmean([means[k, state, ci] for k in series])
             ax.axvline(mean, color="black", linewidth=1.4)
+            box = [f"mean = {mean:.3g}"]
+            if fit:
+                pooled = np.concatenate([series[k][state][:, col] for k in series])
+                pooled = pooled[np.isfinite(pooled)]
+                pooled = pooled[(pooled >= lo) & (pooled <= hi)] if hi > lo else pooled
+                if len(pooled) > 1:
+                    mu, sigma = stats.norm.fit(pooled)
+                    _draw_ecdf(ax, pooled, color="black", linewidth=2.2)
+                    grid = np.union1d(np.linspace(pooled.min(), pooled.max(), 400), np.quantile(pooled, np.linspace(0, 1, 400)))
+                    ax.plot(grid, stats.norm.cdf(grid, mu, sigma), color="red", linestyle="--", linewidth=1.8)
+                    box.append(f"N(μ={mu:.3g}, σ={sigma:.3g}) D={stats.kstest(pooled, 'norm', args=(mu, sigma)).statistic:.3f}")
             if legend:
-                ax.text(0.02, 0.98, f"mean = {mean:.3g}", transform=ax.transAxes, ha="left", va="top", fontsize=7,
+                ax.text(0.02, 0.98, "\n".join(box), transform=ax.transAxes, ha="left", va="top", fontsize=7,
                         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
             ax.set_title(f"{topologies[ci]} ({state_label})", fontsize=9)
             if state == 1:
                 ax.set_xlabel("normalized window mean" if normalize else "window mean")
             if ci == 0:
                 ax.set_ylabel("proportion")
-    if norm:
-        fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axs, label="branch length (CU)",
-                     fraction=0.025, pad=0.02)
+    if spec:
+        _add_color_key(fig, axs, spec)
+    if fit:
+        fig.legend([matplotlib.lines.Line2D([], [], color="black", linewidth=1.4),
+                    matplotlib.lines.Line2D([], [], color="black", linewidth=2.2),
+                    matplotlib.lines.Line2D([], [], color="red", linestyle="--", linewidth=1.8)],
+                   ["mean of per-branch means", "pooled ECDF (all branches, clipped)", "Gaussian MLE fit to pooled"],
+                   loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=3, fontsize=8)
     _suptitle(fig, title(n_experiments), fontsize=10)
     return fig
 
@@ -3868,8 +4373,17 @@ _POOLED_SCORE_AXES = {
     "category": lambda w, parts: parts[0],
     "subcategory": lambda w, parts: parts[1],
     "merged_category": lambda w, parts: parts[0] if parts[0] == "admixture" else f"{parts[0]} {parts[1]}",
+    "direction": lambda w, parts: parts[0] if parts[0] == "admixture" else parts[1],
     "pattern": lambda w, parts: parts[3],
+    "x_bin": lambda w, parts: parts[1] if parts[0] == "admixture" else _sim_branch_length_bin(parts),
+    "fraction_bin": lambda w, parts: assign_bin(nominal_anomaly_fraction(parts[3]), FRACTION_BIN_EDGES),
 }
+_ORDERED_POOLED_AXES = ("-w", "fraction_bin")
+
+
+def _sim_branch_length_bin(parts):
+    cu = _sim_cu_branch_length(str(Path("store", "caster", *parts[:3])))
+    return None if cu is None else assign_bin(cu, BRANCH_LENGTH_BIN_EDGES)
 
 
 def _pooled_axis_values(axis, vals):
@@ -3877,24 +4391,28 @@ def _pooled_axis_values(axis, vals):
         return [None]
     if axis == "merged_category":
         return sorted(vals, key=_merged_category_sort_key)
+    if axis in _DATA_COLUMN_AXES:
+        order = _DATA_COLUMN_AXES[axis]
+        return sorted(vals, key=lambda v: (v not in order, order.index(v) if v in order else str(v)))
     return sorted(vals, key=lambda v: (not isinstance(v, (int, float)), v if isinstance(v, (int, float)) else str(v)))
 
 
 def _gt_mean_axis_label(axis, value):
     if axis == "-w":
         return f"w{format_val(value)}"
+    if axis in ("x_bin", "fraction_bin"):
+        return f"{'outlier fraction' if axis == 'fraction_bin' else 'admixture' if value in ADMIXTURE_BINS else 'BL'} {value}"
     if axis == "branch_length":
         return f"BL {value} CU"
     return str(value)
 
 
 def _draw_ecdf(ax, vals, **style):
-    vals = np.sort(vals[np.isfinite(vals)])
-    if not len(vals):
+    finite = vals[np.isfinite(vals)]
+    if not len(finite):
         return None, 0
-    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), _ECDF_MAX_POINTS)).astype(int))
-    ax.plot(vals[idx], (idx + 1) / len(vals), drawstyle="steps-post", **style)
-    return float(vals.mean()), len(vals)
+    ax.plot(*ecdf_points(finite), drawstyle="steps-post", **style)
+    return float(finite.mean()), len(finite)
 
 
 _STATE_STYLES = (("Null", 0, "--"), ("Outlier", 1, "-"))
@@ -4010,7 +4528,10 @@ _SCORE_DIST_METRICS = {
                + [(matplotlib.lines.Line2D([], [], color="black", linewidth=1), "laplace fit (y=x)")]),
 }
 
-_DIST_METRICS = {"window_ecdf", "ecdf_all", "mean_all_vs_bl", "ecdf_hmm", "ecdf_all_hmm", "gap_ecdf", "mean_ecdf", "gap_vs_bl", "mean_vs_bl", *_SCORE_DIST_METRICS}
+_TOPOLOGY_SCATTER_METRICS = {f"topology_topology_{s}": s for s in ("all", "means", "variances", "covariances", "fitted_all", "viterbi_variances", "fitted_means",
+                                                                    "fitted_variances", "fitted_covariances")}
+
+_DIST_METRICS = {*_TOPOLOGY_SCATTER_METRICS, "window_ecdf", "ecdf_all", "mean_all_vs_bl", "ecdf_hmm", "ecdf_all_hmm", "gap_ecdf", "mean_ecdf", "gap_vs_bl", "mean_vs_bl", *_SCORE_DIST_METRICS}
 
 
 def _out_transition_totals(parsed):
@@ -4713,12 +5234,12 @@ def _resolve_logy(logy, dfs, metrics):
     return math.log10(hi / lo) >= _AUTOLOG_MIN_DECADES
 
 
-def _legend_below_axes(fig, handles, labels, top=0.95, pad_px=6, **kwargs):
+def _legend_below_axes(fig, handles, labels, top=0.95, pad_px=6, right=1.0, **kwargs):
     legend = fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0), frameon=False, **kwargs)
     renderer = fig.canvas.get_renderer()
     fig_h_px = fig.get_size_inches()[1] * fig.dpi
     legend_h = (legend.get_window_extent(renderer).height + 2 * pad_px) / fig_h_px
-    fig.tight_layout(rect=[0, legend_h, 1, top])
+    fig.tight_layout(rect=[0, legend_h, right, top])
     fig.canvas.draw()
     axes_bottom = min(ax.get_tightbbox(renderer).y0 for ax in fig.axes if ax.get_visible())
     legend.set_bbox_to_anchor((0.5, (axes_bottom - pad_px) / fig_h_px), transform=fig.transFigure)
@@ -4961,6 +5482,30 @@ def _windowless_runs_df(source):
     return df
 
 
+_HIDE_ADMIXTURE = False
+
+
+@contextlib.contextmanager
+def _hiding_admixture(hide):
+    global _HIDE_ADMIXTURE, FIGURE_COLUMNS
+    saved = _HIDE_ADMIXTURE, FIGURE_COLUMNS, dict(_DATA_COLUMN_AXES)
+    if hide:
+        _HIDE_ADMIXTURE = True
+        FIGURE_COLUMNS = [c for c in FIGURE_COLUMNS if c != COL_ADMIXTURE]
+        _DATA_COLUMN_AXES.update(x_bin=list(BRANCH_LENGTH_BINS), column=FIGURE_COLUMNS)
+    try:
+        yield
+    finally:
+        _HIDE_ADMIXTURE, FIGURE_COLUMNS = saved[:2]
+        _DATA_COLUMN_AXES.update(saved[2])
+
+
+def _drop_hidden_admixture(df):
+    if _HIDE_ADMIXTURE and "category" in df.columns:
+        return df[df["category"] != "admixture"]
+    return df
+
+
 def _load_raw_config_df(dirs, get_args, bin_specs=None):
     """Concats `dirs`' runs.tsv into one frame, tagging every row with its
     source dir's window_size as "_window_size" (a config's dirs, see
@@ -5013,7 +5558,7 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
         for bin_col, (source_col, edges) in bin_specs.items():
             if source_col in df.columns:
                 df[bin_col] = df[source_col].apply(lambda v: assign_bin(v, edges))
-    return df
+    return _drop_hidden_admixture(df)
 
 
 def _load_configs_runs(configs, row_filters=None, bin_specs=None, get_args=None):
@@ -5091,6 +5636,15 @@ def _shade_color(base_color, frac):
 def _gradient_color(base_color, frac):
     h, _, s = colorsys.rgb_to_hls(*matplotlib.colors.to_rgb(base_color))
     return colorsys.hls_to_rgb(h, 0.8 - 0.65 * frac, s)
+
+
+def _tpr_fpr_axes(ax, full=False):
+    hi = 1.0 if full else 0.5
+    ax.set_xlim(-0.03 * hi, 1.03 * hi)
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_xticks(np.linspace(0, hi, 6 if full else 5))
+    ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.plot([0, hi], [0, hi], color="#cfcfc9", linewidth=1.0, linestyle="--", zorder=1)
 
 
 def _cross_run_grid(configs, title, cell_plot_fn, categorical_x=True):

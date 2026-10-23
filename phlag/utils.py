@@ -163,6 +163,20 @@ def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
     return blocks, anomaly_intervals, curr_pos
 
 GT_STATS_FILENAME = "gt_stats.txt"
+STATE_LABELS = {"Null": "Null", "Alt": "Outlier", "Overall": "Overall"}
+_GT_STATS_KEYS = {"Outlier": "Alt"}
+
+ECDF_MAX_POINTS = 2000
+ECDF_MAX_SORT = 1_000_000
+
+def ecdf_points(vals, max_points=ECDF_MAX_POINTS, max_sort=ECDF_MAX_SORT):
+    import numpy as np
+    vals = vals[np.isfinite(vals)]
+    if len(vals) > max_sort:
+        vals = np.random.default_rng(0).choice(vals, max_sort, replace=False)
+    vals = np.sort(vals)
+    idx = np.unique(np.linspace(0, len(vals) - 1, min(len(vals), max_points)).astype(int))
+    return vals[idx], (idx + 1) / max(len(vals), 1)
 
 def gaussian_hellinger2_nd(mu1, Sigma1, mu2, Sigma2, eps=1e-6):
     """
@@ -310,25 +324,26 @@ def write_gt_stats_file(path, stats):
         if label not in stats:
             continue
         mean, cov = stats[label]
+        name = STATE_LABELS[label]
         mean_vals = [float(x) for x in mean]
-        lines.append(f"{label} mean: {mean_vals}")
+        lines.append(f"{name} mean: {mean_vals}")
         mean_norm = sum(x * x for x in mean_vals) ** 0.5
-        lines.append(f"{label} mean norm: {mean_norm}")
+        lines.append(f"{name} mean norm: {mean_norm}")
         cov_rows = [list(float(x) for x in row) for row in cov]
-        lines.append(f"{label} covariance: {cov_rows}")
+        lines.append(f"{name} covariance: {cov_rows}")
         cov_norm = sum(x * x for row in cov_rows for x in row) ** 0.5
-        lines.append(f"{label} covariance norm: {cov_norm}")
+        lines.append(f"{name} covariance norm: {cov_norm}")
         skew_key = f"{label}Skewness"
         if skew_key in stats:
             skew_vals = [float(x) for x in stats[skew_key]]
-            lines.append(f"{label} skewness: {skew_vals}")
+            lines.append(f"{name} skewness: {skew_vals}")
         if f"{label}MardiaSkewness" in stats:
-            lines.append(f"{label} Mardia skewness: {float(stats[f'{label}MardiaSkewness'])}")
+            lines.append(f"{name} Mardia skewness: {float(stats[f'{label}MardiaSkewness'])}")
         within_mean_key, within_var_key = f"{label}WithinMean", f"{label}WithinVariance"
         if within_mean_key in stats:
-            lines.append(f"{label} within mean: {[float(x) for x in stats[within_mean_key]]}")
+            lines.append(f"{name} within mean: {[float(x) for x in stats[within_mean_key]]}")
         if within_var_key in stats:
-            lines.append(f"{label} within variance: {[float(x) for x in stats[within_var_key]]}")
+            lines.append(f"{name} within variance: {[float(x) for x in stats[within_var_key]]}")
     if "Hellinger2" in stats:
         lines.append(f"Hellinger2: {float(stats['Hellinger2'])}")
     if lines:
@@ -368,45 +383,45 @@ def read_gt_stats_file(path):
                 except ValueError:
                     pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) mean:\s*(\[.+\])\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) mean:\s*(\[.+\])\s*$', line)
         if m:
             try:
-                means[m.group(1)] = ast.literal_eval(m.group(2))
+                means[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) covariance:\s*(\[\[.+\]\])\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) covariance:\s*(\[\[.+\]\])\s*$', line)
         if m:
             try:
-                covs[m.group(1)] = ast.literal_eval(m.group(2))
+                covs[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) skewness:\s*(\[.+\])\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) skewness:\s*(\[.+\])\s*$', line)
         if m:
             try:
-                skews[m.group(1)] = ast.literal_eval(m.group(2))
+                skews[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) within mean:\s*(\[.+\])\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) within mean:\s*(\[.+\])\s*$', line)
         if m:
             try:
-                within_means[m.group(1)] = ast.literal_eval(m.group(2))
+                within_means[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) within variance:\s*(\[.+\])\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) within variance:\s*(\[.+\])\s*$', line)
         if m:
             try:
-                within_vars[m.group(1)] = ast.literal_eval(m.group(2))
+                within_vars[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = ast.literal_eval(m.group(2))
             except (ValueError, SyntaxError):
                 pass
             continue
-        m = re.match(r'^(Null|Alt|Overall) Mardia skewness:\s*(\S+)\s*$', line)
+        m = re.match(r'^(Null|Alt|Outlier|Overall) Mardia skewness:\s*(\S+)\s*$', line)
         if m:
             try:
-                mardias[m.group(1)] = float(m.group(2))
+                mardias[_GT_STATS_KEYS.get(m.group(1), m.group(1))] = float(m.group(2))
             except ValueError:
                 pass
             continue
@@ -750,7 +765,8 @@ _NAMED_SEGMENTS = {
     "var2x": ("double_variance_init", True),
     "repulsion": ("alt_emission_parameterization", "repulsion"),
     "annealing": ("annealing", True),
-    "null-alt-anchor": ("null_emission_parameterization", "null-alt-anchor"),
+    "null-alt-zero": ("null_emission_parameterization", "null-alt-zero"),
+    "null-alt-equal": ("null_emission_parameterization", "null-alt-equal"),
     "snr": ("null_emission_parameterization", "snr"),
     "bl-anchor": ("null_emission_parameterization", "bl-anchor"),
 }

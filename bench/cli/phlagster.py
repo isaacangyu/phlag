@@ -12,7 +12,7 @@ def build_parser(input_file=True):
     parser = argparse.ArgumentParser(
         description="Phlagster: Run caster then phlag end-to-end from a FASTA or an existing caster scores.tsv.",
         epilog="-b <flag> <value> (or -b <on/off flag>...): run both without and with it, "
-               "computing caster scores once (e.g. '-b --np null-alt-anchor').",
+               "computing caster scores once (e.g. '-b --np null-alt-zero').",
     )
     if input_file:
         parser.add_argument(
@@ -167,7 +167,7 @@ def build_parser(input_file=True):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -300,14 +300,11 @@ _CASTER_RESULTS = {}
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    from phlag.phlag import split_toggles, TOGGLE_FLAG
-    untoggled, toggles = split_toggles(raw_argv, build_parser())
-    if toggles:
-        import itertools
-        for states in itertools.product((False, True), repeat=len(toggles)):
-            on = [tok for t, state in zip(toggles, states) if state for tok in t]
-            print(f"[phlagster] {TOGGLE_FLAG} -- running {' '.join(on) or 'baseline'}...")
-            main(untoggled + on)
+    from phlag.phlag import expand_toggles_and_multi
+    runs = expand_toggles_and_multi(raw_argv, build_parser(), "phlagster")
+    if runs is not None:
+        for run_argv in runs:
+            main(run_argv)
         return
     args = parse_arguments(raw_argv)
     from phlag.utils import expand_node_specs

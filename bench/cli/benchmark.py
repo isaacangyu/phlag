@@ -192,7 +192,7 @@ _RE_METRICS_WITH_PRECISION_AUC = re.compile(
     r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+),\s*(?:ROC-)?AUC:\s*([-\d.eE+]+)\s*$'
 )
 _RE_RELERR_ROW = re.compile(
-    r'^(\w+)\t(Null|Alt)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
+    r'^(\w+)\t(Null|Alt|Outlier)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
     re.IGNORECASE,
 )
 _RE_EM_DIVERGENCE = re.compile(
@@ -224,9 +224,13 @@ _RE_TRANSITION_MATRIX = re.compile(
     r'\[\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\],\s*\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\]\]\s*$'
 )
 _RE_TRANSITION_ROW = re.compile(
-    r'^(Ground truth|Viterbi path|Final) transition matrix(?: \(after EM\))? \((Null|Alt) row\):\s*'
+    r'^(Ground truth|Viterbi path|Final) transition matrix(?: \(after EM\))? \((Null|Alt|Outlier) row\):\s*'
     r'\[([-\d.eE+]+|nan),\s*([-\d.eE+]+|nan)\]\s*$'
 )
+def _report_state(state):
+    return "Alt" if state.lower() in ("alt", "outlier") else state.capitalize()
+
+
 _TRANSITION_ROW_PREFIX = {"Ground truth": "gt_transition", "Viterbi path": "viterbi_transition", "Final": "transition"}
 _RE_CASTER_MTIME = re.compile(r'^Caster source mtime:\s*([\d.eE+]+)\s*$')
 _RE_PHLAG_MTIME = re.compile(r'^Phlag source mtime:\s*([\d.eE+]+)\s*$')
@@ -429,19 +433,19 @@ def parse_report(report_path):
                 except ValueError:
                     value = None
                 if value is not None and not math.isnan(value):
-                    parsed["rel_err"][(topology, state.capitalize())] = value
+                    parsed["rel_err"][(topology, _report_state(state))] = value
                 try:
                     gt_mean_value = float(gt_mean_str)
                 except ValueError:
                     gt_mean_value = None
                 if gt_mean_value is not None and not math.isnan(gt_mean_value):
-                    parsed["ground_truth_stats"][(topology, state.capitalize(), "mean")] = gt_mean_value
+                    parsed["ground_truth_stats"][(topology, _report_state(state), "mean")] = gt_mean_value
                 try:
                     gt_std_value = float(gt_std_str)
                 except ValueError:
                     gt_std_value = None
                 if gt_std_value is not None and not math.isnan(gt_std_value):
-                    parsed["ground_truth_stats"][(topology, state.capitalize(), "std")] = gt_std_value
+                    parsed["ground_truth_stats"][(topology, _report_state(state), "std")] = gt_std_value
                 continue
 
             m = (
@@ -495,7 +499,7 @@ def parse_report(report_path):
             m = _RE_TRANSITION_ROW.match(line)
             if m:
                 prefix, state, to_null, to_alt = m.groups()
-                state = state.lower()
+                state = _report_state(state).lower()
                 parsed[f"{_TRANSITION_ROW_PREFIX[prefix]}_{state}_to_null"] = float(to_null)
                 parsed[f"{_TRANSITION_ROW_PREFIX[prefix]}_{state}_to_alt"] = float(to_alt)
                 continue
@@ -2548,7 +2552,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
+        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(

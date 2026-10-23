@@ -731,37 +731,11 @@ class Phlag:
             intervals.append((run_start, run_end))
         return intervals
 
-    def compute_output(self):
-        divergence = self.hmm.state_emission_divergence(self.params)
-        try:
-            emission_divergence_str = ", ".join(map(str, divergence.tolist()))
-        except TypeError:
-            emission_divergence_str = str(float(divergence))
-
-        # Squared Hellinger distance between states -- gaussian-only (depends
-        # on the full covariance matrix; beta/gmm emissions have no analog).
-        em_hellinger2_distance = None
-        if getattr(self.args, "model_design", "gaussian") == "gaussian":
-            em_hellinger2_distance = float(self.hmm.em_divergence(self.params))
-        self.em_hellinger2 = em_hellinger2_distance
-        self.gt_hellinger2 = None
-
-
-        log_likelihoods = []
-        for state in range(self.hmm.num_states):
-            dist = self.hmm.emission_component.distribution(self.params.emissions, state)
-            log_likelihoods.append(dist.log_prob(self.Y))
-        log_likelihoods = jnp.stack(log_likelihoods, axis=-1)
-        
-        initial_probs_np = np.array(self.params.initial.probs)
-        transition_matrix_np = np.array(self.params.transitions.transition_matrix)
-        log_likelihoods_np = np.array(log_likelihoods)
-        
+    def compute_ground_truth(self):
         # Extract the required ground truth pattern from the input filename/path.
         # Format example: ...a1n5a2a3n8n1...
         # 'a' = anomaly locus block of 500Kb, 'n' = normal locus block of 500Kb
         # Each token (e.g., 'n1', 'n8', 'a1', 'n5') represents one 500Kb locus block.
-        import re
         input_path_obj = pathlib.Path(self.args.caster_scores)
 
         sorted_positions = sorted(self.pos_to_caster.keys())
@@ -824,6 +798,61 @@ class Phlag:
                         if start_bp <= pos <= end_bp:
                             y_true[idx] = 1
                             break
+        return y_true
+
+    def correct_transition_params(self):
+        arg = self.args.correct_transition
+        if arg.lower() != "auto":
+            nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", arg)]
+            if len(nums) == 2:
+                p0, p1 = nums
+                tm = np.array([[p0, 1.0 - p0], [1.0 - p1, p1]], dtype=np.float32)
+            elif len(nums) == 4:
+                tm = np.array(nums, dtype=np.float32).reshape(2, 2)
+            else:
+                print(f"Warning: Could not parse transition values from '{arg}'. Using auto ground-truth estimation.")
+                arg = "auto"
+            if arg != "auto":
+                leave_null, leave_alt = 1.0 - tm[0, 0], 1.0 - tm[1, 1]
+                stay_null = leave_alt / (leave_null + leave_alt) if (leave_null + leave_alt) > 0 else 0.5
+                return tm, np.array([stay_null, 1.0 - stay_null], dtype=np.float32)
+        y_true = self.compute_ground_truth()
+        if not self.has_ground_truth:
+            print("Warning: --correct-transition auto requested but no ground truth pattern is available -- skipping.")
+            return None
+        counts = np.array([[np.sum((y_true[:-1] == a) & (y_true[1:] == b)) for b in (0, 1)] for a in (0, 1)], dtype=float)
+        rows = counts.sum(axis=1, keepdims=True)
+        tm = np.where(rows > 0, counts / np.where(rows > 0, rows, 1), 0.5).astype(np.float32)
+        n_alt = float(np.sum(y_true == 1))
+        return tm, np.array([1.0 - n_alt / len(y_true), n_alt / len(y_true)], dtype=np.float32)
+
+    def compute_output(self):
+        divergence = self.hmm.state_emission_divergence(self.params)
+        try:
+            emission_divergence_str = ", ".join(map(str, divergence.tolist()))
+        except TypeError:
+            emission_divergence_str = str(float(divergence))
+
+        # Squared Hellinger distance between states -- gaussian-only (depends
+        # on the full covariance matrix; beta/gmm emissions have no analog).
+        em_hellinger2_distance = None
+        if getattr(self.args, "model_design", "gaussian") == "gaussian":
+            em_hellinger2_distance = float(self.hmm.em_divergence(self.params))
+        self.em_hellinger2 = em_hellinger2_distance
+        self.gt_hellinger2 = None
+
+
+        log_likelihoods = []
+        for state in range(self.hmm.num_states):
+            dist = self.hmm.emission_component.distribution(self.params.emissions, state)
+            log_likelihoods.append(dist.log_prob(self.Y))
+        log_likelihoods = jnp.stack(log_likelihoods, axis=-1)
+        
+        initial_probs_np = np.array(self.params.initial.probs)
+        transition_matrix_np = np.array(self.params.transitions.transition_matrix)
+        log_likelihoods_np = np.array(log_likelihoods)
+        
+        y_true = self.compute_ground_truth()
 
         # Store ground truth info and compute the ground-truth-split empirical fits
         # (Null vs Alt), shared by the report's relative-error stats and the em.png top row
@@ -837,73 +866,6 @@ class Phlag:
                 mu_null, std_null = stats.norm.fit(null_vals)
                 mu_alt, std_alt = stats.norm.fit(alt_vals)
                 self.ground_truth_fits[d] = (float(mu_null), float(std_null), float(mu_alt), float(std_alt))
-
-        # Check if --correct-transition was requested to manually/automatically set ground truth transition matrix
-        correct_trans_arg = getattr(self.args, "correct_transition", None)
-        if correct_trans_arg is not None:
-            transition_corrected = False
-            gt_tm = None
-            if isinstance(correct_trans_arg, str) and correct_trans_arg.lower() != "auto":
-                nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|\d+", correct_trans_arg)]
-                if len(nums) == 2:
-                    p0, p1 = nums[0], nums[1]
-                    gt_tm = np.array([[p0, 1.0 - p0], [1.0 - p1, p1]], dtype=np.float32)
-                    transition_corrected = True
-                elif len(nums) == 4:
-                    gt_tm = np.array([[nums[0], nums[1]], [nums[2], nums[3]]], dtype=np.float32)
-                    transition_corrected = True
-                else:
-                    print(f"Warning: Could not parse transition values from '{correct_trans_arg}'. Using auto ground-truth estimation.")
-                    correct_trans_arg = "auto"
-            
-            is_auto = correct_trans_arg == "auto" or (isinstance(correct_trans_arg, str) and correct_trans_arg.lower() == "auto")
-            if is_auto and not self.has_ground_truth:
-                print("Warning: --correct-transition auto requested but no ground truth pattern is available -- skipping.")
-            elif is_auto:
-                N_00 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 0))
-                N_01 = np.sum((y_true[:-1] == 0) & (y_true[1:] == 1))
-                N_10 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 0))
-                N_11 = np.sum((y_true[:-1] == 1) & (y_true[1:] == 1))
-
-                A00 = float(N_00 / (N_00 + N_01)) if (N_00 + N_01) > 0 else 0.5
-                A01 = 1.0 - A00
-                A10 = float(N_10 / (N_10 + N_11)) if (N_10 + N_11) > 0 else 0.5
-                A11 = 1.0 - A10
-
-                gt_tm = np.array([[A00, A01], [A10, A11]], dtype=np.float32)
-                transition_corrected = True
-
-            if transition_corrected and gt_tm is not None:
-                from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
-                from dynamax.hidden_markov_model.models.initial import ParamsStandardHMMInitialState
-                if is_auto:
-                    n_alt = float(np.sum(y_true == 1))
-                    gt_init = np.array([1.0 - n_alt / len(y_true), n_alt / len(y_true)], dtype=np.float32)
-                else:
-                    leave_null, leave_alt = 1.0 - gt_tm[0, 0], 1.0 - gt_tm[1, 1]
-                    stay_null = leave_alt / (leave_null + leave_alt) if (leave_null + leave_alt) > 0 else 0.5
-                    gt_init = np.array([stay_null, 1.0 - stay_null], dtype=np.float32)
-
-                states_swapped = False
-                if self.has_ground_truth:
-                    occupancy = np.argmax(log_likelihoods_np, axis=1)
-                    matched = int(np.sum((occupancy == 0) & (y_true == 0)) + np.sum((occupancy == 1) & (y_true == 1)))
-                    states_swapped = matched < len(y_true) - matched
-                if states_swapped:
-                    gt_tm = gt_tm[::-1, ::-1].copy()
-                    gt_init = gt_init[::-1].copy()
-
-                transition_matrix_np = gt_tm
-                initial_probs_np = gt_init
-                self.params = self.params._replace(
-                    initial=ParamsStandardHMMInitialState(probs=jnp.array(gt_init, dtype=jnp.float32)),
-                    transitions=ParamsStandardHMMTransitions(transition_matrix=jnp.array(gt_tm, dtype=jnp.float32)),
-                )
-                print(
-                    f"\n[Ground Truth Transition Matrix Override] Applied: {gt_tm.tolist()}, "
-                    f"initial probs {gt_init.tolist()}"
-                    f"{' (states swapped to match ground-truth occupancy)' if states_swapped else ''}\n"
-                )
 
         n_paths = getattr(self.args, "best_paths", 1)
         paths, path_likelihoods = self.get_n_best_viterbi_paths(
@@ -946,8 +908,8 @@ class Phlag:
             metrics_str = "N/A (Viterbi decoding failed -- no valid path found)"
         elif self.has_ground_truth:
             y_pred = np.array(paths[0])
-            # Null = whichever state the Viterbi path occupies more often
-            if np.sum(y_pred == 1) > np.sum(y_pred == 0):
+            # Null = anchored state 0 under a constrained --np, else the Viterbi-majority state
+            if not self.anchor_dims and np.sum(y_pred == 1) > np.sum(y_pred == 0):
                 y_pred = 1 - y_pred
                 flipped_for_eval = True
             self.flipped_for_eval = flipped_for_eval
@@ -1092,7 +1054,7 @@ class Phlag:
             _append_transition_rows("Viterbi path transition matrix (pooled)", _empirical_transition_matrix(paths[0], null_state, alt_state))
             if self.has_ground_truth:
                 gt_arr = np.asarray(y_true)
-                for region, region_state in (("Null", 0), ("Alt", 1)):
+                for region, region_state in (("Null", 0), ("Outlier", 1)):
                     pair_mask = (gt_arr[:-1] == region_state) & (gt_arr[1:] == region_state)
                     _append_transition_rows(
                         f"Viterbi path transition matrix ({region} region)",
@@ -1105,7 +1067,7 @@ class Phlag:
         _append_transition_rows("Final transition matrix (after EM)", transition_matrix_np.tolist())
         occ = self.state_occupancy()
         occ_null, occ_alt = (occ[1], occ[0]) if flipped_for_eval else (occ[0], occ[1])
-        headers.append(f"State occupancy (posterior, windows): Null {occ_null:.1f}, Alt {occ_alt:.1f}")
+        headers.append(f"State occupancy (posterior, windows): Null {occ_null:.1f}, Outlier {occ_alt:.1f}")
         if getattr(self, "em_diverged_at", None) is not None:
             headers.append(f"EM diverged to NaN: True (outer iteration {self.em_diverged_at}/{self.n_iters}; reporting the last finite parameters)")
         if viterbi_fallback_used:
@@ -1113,15 +1075,15 @@ class Phlag:
                 "Viterbi decoding: EM's final transition matrix diverged to NaN -- "
                 "decoded against the initial transition matrix instead"
             )
-        if correct_trans_arg is not None:
-            headers.append("Corrected transition matrix applied: True")
+        if self.correct_transition is not None:
+            headers.append("Corrected transition matrix applied: True (frozen during EM)")
 
         if hasattr(self, "final_em_log_prob"):
             headers.append(f"EM final joint log-likelihood: {format_number(self.final_em_log_prob)}")
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         if getattr(self, "anchor_dims", ()):
-            k_params -= len(self.anchor_dims) - (self.args.null_emission_parameterization == "snr")
+            k_params -= {"snr": 1, "null-alt-equal": 4}.get(self.args.null_emission_parameterization, len(self.anchor_dims))
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1159,7 +1121,7 @@ class Phlag:
                 kl_alt = kl_divergence_1d(mu_alt_fit, std_alt_fit, mu_alt_gt, std_alt_gt)
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
                 headers.append(f"{topo_name}\tNull\t{format_report_value(mu_null_fit)}\t{format_report_value(std_null_fit)}\t{format_report_value(mu_null_gt)}\t{format_report_value(std_null_gt)}\t{format_report_value(kl_null)}")
-                headers.append(f"{topo_name}\tAlt\t{format_report_value(mu_alt_fit)}\t{format_report_value(std_alt_fit)}\t{format_report_value(mu_alt_gt)}\t{format_report_value(std_alt_gt)}\t{format_report_value(kl_alt)}")
+                headers.append(f"{topo_name}\tOutlier\t{format_report_value(mu_alt_fit)}\t{format_report_value(std_alt_fit)}\t{format_report_value(mu_alt_gt)}\t{format_report_value(std_alt_gt)}\t{format_report_value(kl_alt)}")
                 # (fitted - ground_truth) / ground_truth per topology/state/statistic --
                 # the metric the KL/Hellinger divergence above replaced as the report's
                 # primary error measure; kept available here only to feed --plot relerr.
@@ -1195,10 +1157,10 @@ class Phlag:
                 skew_key = f"{skew_label}Skewness"
                 if skew_key in gt_stats:
                     skew_vals = [format_number(v) for v in gt_stats[skew_key]]
-                    headers.append(f"{skew_label} skewness (ABBA, BABA, AABB): {skew_vals}")
+                    headers.append(f"{utils.STATE_LABELS[skew_label]} skewness (ABBA, BABA, AABB): {skew_vals}")
                 mardia_key = f"{skew_label}MardiaSkewness"
                 if mardia_key in gt_stats:
-                    headers.append(f"{skew_label} Mardia skewness: {format_number(gt_stats[mardia_key])}")
+                    headers.append(f"{utils.STATE_LABELS[skew_label]} Mardia skewness: {format_number(gt_stats[mardia_key])}")
 
             # Within-window mean/variance (raw per-site scores WITHIN each
             # window, averaged across windows), read straight from
@@ -1216,10 +1178,10 @@ class Phlag:
                 within_mean_key, within_var_key = f"{within_label}WithinMean", f"{within_label}WithinVariance"
                 if within_mean_key in gt_stats:
                     mean_vals = [format_number(v) for v in gt_stats[within_mean_key]]
-                    headers.append(f"{within_label} within-window mean (ABBA, BABA, AABB): {mean_vals}")
+                    headers.append(f"{utils.STATE_LABELS[within_label]} within-window mean (ABBA, BABA, AABB): {mean_vals}")
                 if within_var_key in gt_stats:
                     var_vals = [format_number(v) for v in gt_stats[within_var_key]]
-                    headers.append(f"{within_label} within-window variance (ABBA, BABA, AABB): {var_vals}")
+                    headers.append(f"{utils.STATE_LABELS[within_label]} within-window variance (ABBA, BABA, AABB): {var_vals}")
 
             if "Hellinger2" in gt_stats:
                 gt_hellinger2_joint = gt_stats["Hellinger2"]
@@ -1314,7 +1276,7 @@ class Phlag:
                     ax_hist.bar(centers, flagged, width=widths, color=colors[0], alpha=0.7, label="Path 1 flagged")
                     if self.has_ground_truth:
                         ax_hist.step(centers, truth_flagged, where="mid", color="black", linestyle="--", linewidth=1.5, label="Ground Truth")
-                    ax_hist.set_ylabel(f"Alt windows per {agg}", fontsize=12, labelpad=10)
+                    ax_hist.set_ylabel(f"Outlier windows per {agg}", fontsize=12, labelpad=10)
                     ax_hist.set_xlabel("Genomic Position (kb)", fontsize=12, labelpad=10)
                     ax_hist.legend(loc="upper left", framealpha=0.9)
                 else:
@@ -1322,7 +1284,7 @@ class Phlag:
                 ax1.set_ylabel("HMM State", fontsize=12, labelpad=10)
                 ax1.set_ylim(-0.05, 1.05)
                 ax1.set_yticks([0, 1])
-                ax1.set_yticklabels(["Null", "Alternative"])
+                ax1.set_yticklabels(["Null", "Outlier"])
                 locus_desc = get_title_locus(input_path, self.output_file)
                 if locus_desc:
                     ax1.set_title(f"Genomic Profile: {locus_desc}\nTop {len(paths)} Viterbi Paths", fontsize=12, fontweight="bold", pad=12)
@@ -1386,8 +1348,8 @@ class Phlag:
                     fig, ax = plt.subplots(figsize=(max(6, len(topo_labels) * 2), 6))
                     ax.bar(x - 1.5 * bar_width, null_mean, bar_width, label="Null mean", color="#4C72B0")
                     ax.bar(x - 0.5 * bar_width, null_std, bar_width, label="Null std", color="#8CA8D8")
-                    ax.bar(x + 0.5 * bar_width, alt_mean, bar_width, label="Alt mean", color="#C44E52")
-                    ax.bar(x + 1.5 * bar_width, alt_std, bar_width, label="Alt std", color="#DC8A8D")
+                    ax.bar(x + 0.5 * bar_width, alt_mean, bar_width, label="Outlier mean", color="#C44E52")
+                    ax.bar(x + 1.5 * bar_width, alt_std, bar_width, label="Outlier std", color="#DC8A8D")
                     ax.axhline(0, color="black", linewidth=1)
                     ax.set_xticks(x)
                     ax.set_xticklabels(topo_labels)
@@ -1452,7 +1414,7 @@ class Phlag:
 
         self.anchor_dims = ()
         self.anchor_value = 0.0
-        if self.args.null_emission_parameterization in ("null-alt-anchor", "snr", "bl-anchor"):
+        if self.args.null_emission_parameterization in ("null-alt-zero", "null-alt-equal", "snr", "bl-anchor"):
             if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
                 raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
             self.anchor_dims = (0, 1)
@@ -1491,7 +1453,11 @@ class Phlag:
         data_cov = jnp.cov(self.Y, rowvar=False)
         data_var = jnp.diag(data_cov)
         null_mean = data_mean
-        if self.anchor_dims and self.args.null_emission_parameterization == "snr":
+        null_cov = data_cov
+        if self.anchor_dims and self.args.null_emission_parameterization == "null-alt-equal":
+            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(jnp.mean(data_mean[jnp.array(self.anchor_dims)]))
+            null_cov = hmm.swap_symmetrize(data_cov, self.anchor_dims)
+        elif self.anchor_dims and self.args.null_emission_parameterization == "snr":
             ceiling = data_mean[2] / (data_var[2] + 1e-12)
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(
                 jnp.minimum(jnp.mean(data_mean[jnp.array(self.anchor_dims)]), ceiling))
@@ -1518,6 +1484,14 @@ class Phlag:
                 initial_transition_matrix = prior_mean
             initial_transition_matrix = initial_transition_matrix.astype(jnp.float32)
 
+        self.correct_transition = None
+        if self.args.correct_transition is not None:
+            self.correct_transition = self.correct_transition_params()
+        if self.correct_transition is not None:
+            initial_transition_matrix = jnp.array(self.correct_transition[0])
+            initial_probs = jnp.array(self.correct_transition[1])
+            print(f"Correct transition matrix (frozen during EM): {self.correct_transition[0].tolist()}, initial probs {self.correct_transition[1].tolist()}")
+
         if self.args.model_design == "gmm":
             # Only used as a fallback seed if gmm_init_params wasn't computed
             # (determine_optimal_mixtures normally supplies it instead, full
@@ -1535,7 +1509,7 @@ class Phlag:
             # Shape: [num_states, emission_dim, 2] where column 0 is the mean and
             # column 1 is the variance -- hmm.py's initialize() builds the actual
             # (diagonal) covariance matrix from this itself.
-            state0_init = jnp.concatenate([null_mean[:, None], data_cov], axis=-1) # CHANGED FROM data_cov and data_mean[:,None]
+            state0_init = jnp.concatenate([null_mean[:, None], null_cov], axis=-1) # CHANGED FROM data_cov and data_mean[:,None]
             state1_init = jnp.concatenate([data_mean[:, None], alt_variance_mult * data_cov], axis=-1)
             init_emissions = jnp.stack([state0_init, state1_init], axis=0)
             self.params, self.props = self.hmm.initialize(
@@ -1544,7 +1518,7 @@ class Phlag:
                 transition_matrix=initial_transition_matrix,
             )
         self.initial_transition_matrix = np.array(self.params.transitions.transition_matrix)
-        self.props.transitions.transition_matrix.trainable = True
+        self.props.transitions.transition_matrix.trainable = self.correct_transition is None
         if self.args.model_design == "gmm":
             self.props.emissions.mixture_weights.trainable = True
             self.props.emissions.means.trainable = True
@@ -1593,7 +1567,7 @@ class Phlag:
             tm = self.params.transitions.transition_matrix
             tm_str = ", ".join(f"[{', '.join(f'{x:.6f}' for x in row)}]" for row in tm.tolist())
             occ = self.state_occupancy()
-            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str} - {hmm.emission_norm_str(self.params)} - Occupancy: Null {occ[0]:.1f}, Alt {occ[1]:.1f}")
+            tqdm.write(f"Outer EM iteration {i + 1}/{self.n_iters} ({num_inner} inner steps) - Transition matrix: {tm_str} - {hmm.emission_norm_str(self.params)} - Occupancy: Null {occ[0]:.1f}, Outlier {occ[1]:.1f}")
             # Once NaN, every later EM step stays NaN -- roll back to the last
             # finite params and stop, so decoding/metrics see a real fit.
             if not bool(hmm.params_all_finite(self.params)):
@@ -1768,7 +1742,7 @@ class PhlagPlotter:
                 'line': '#E05A47',    # Warm Coral
                 'fill': '#E05A47',
                 'kde': '#FF9F1C',     # Orange
-                'label': 'Alt'
+                'label': 'Outlier'
             }
         }
 
@@ -1807,7 +1781,7 @@ class PhlagPlotter:
         self.save_plot()
 
     def _annotate_state_counts(self, fig, legend):
-        """Writes the Alt ($N_a$) and Null ($N_b$) window counts in the blank space
+        """Writes the Outlier ($N_o$) and Null ($N_b$) window counts in the blank space
         left of the legend: ground-truth split (if available) and HMM-assigned split."""
         if legend is None:
             return
@@ -1816,8 +1790,8 @@ class PhlagPlotter:
         lines = []
         if self.phlag.ground_truth_fits:
             y_true = np.array(self.phlag.y_true)
-            lines.append(f"Ground truth: $N_a$ (Alt) = {int((y_true == 1).sum())}, $N_b$ (Null) = {int((y_true == 0).sum())}")
-        lines.append(f"After EM: $N_a$ (Alt) = {int((assigned == param_states[1]).sum())}, $N_b$ (Null) = {int((assigned == param_states[0]).sum())}")
+            lines.append(f"Ground truth: $N_o$ (Outlier) = {int((y_true == 1).sum())}, $N_b$ (Null) = {int((y_true == 0).sum())}")
+        lines.append(f"After EM: $N_o$ (Outlier) = {int((assigned == param_states[1]).sum())}, $N_b$ (Null) = {int((assigned == param_states[0]).sum())}")
         fig.canvas.draw()
         box = legend.get_window_extent().transformed(fig.transFigure.inverted())
         fig.text(box.x0 - 0.01, box.y1, "\n".join(lines), ha="right", va="top", fontsize=9, linespacing=1.5)
@@ -1870,11 +1844,11 @@ class PhlagPlotter:
         for d in range(self.emission_dim):
             ax = row_axes[d]
             for state, ground_truth, vals in self._split_groups(Y_np[:, d]):
-                vals = np.sort(vals[np.isfinite(vals)])
-                if len(vals) == 0:
+                x, y = utils.ecdf_points(vals)
+                if len(x) == 0:
                     continue
                 ax.step(
-                    vals, np.arange(1, len(vals) + 1) / len(vals), where='post', linewidth=1.8,
+                    x, y, where='post', linewidth=1.8,
                     label=f"{self.colors[state]['label']} {'GT' if ground_truth else 'EM'} ECDF",
                     **self._line_style(state, ground_truth)
                 )
@@ -2242,7 +2216,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Phlag: Detecting genomic regions with unexplained phylogenetic heterogeneity using CASTER",
         epilog="-b <flag> <value>: run both without and with that flag (e.g. "
-               "'-b --np null-alt-anchor'; flags after the value are not toggled). "
+               "'-b --np null-alt-zero'; flags after the value are not toggled). "
                "-b <on/off flag>...: every on/off combination of those flags.",
     )
     parser.add_argument(
@@ -2377,14 +2351,15 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion", "null-alt-anchor", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
         help="""Parameterization of the null (background) state's emission distribution
                     (default: free): free (unconstrained MLE), repulsion (pushed away
                     from the alt state's currently fitted distribution),
-                    null-alt-anchor (free, but the alternative topologies' (ABBA, BABA)
-                    means fixed at 0), snr (ABBA and BABA means tied to their average,
+                    null-alt-zero (free, but the alternative topologies' (ABBA, BABA)
+                    means fixed at 0), null-alt-equal (ABBA and BABA share one mean,
+                    one variance and one covariance with AABB), snr (ABBA and BABA means tied to their average,
                     capped each EM iteration at the null state's AABB mean / AABB variance),
-                    or bl-anchor (like null-alt-anchor, but fixed at exp(-t)/3, t = the
+                    or bl-anchor (like null-alt-zero, but fixed at exp(-t)/3, t = the
                     clade's branch length in coalescent units; admixture uses the
                     first node in the simulation name).""",
     )
@@ -2565,7 +2540,7 @@ def build_parser():
         nargs="?",
         const="auto",
         default=None,
-        help="Manually set final transition matrix to ground truth (or pass explicit probabilities p0,p1)",
+        help="Fix the transition matrix to ground truth (or explicit p0,p1) and freeze it during EM",
     )
     parser.set_defaults(**PHLAG_SEGMENT_DEFAULTS)
     return parser
@@ -2942,6 +2917,26 @@ def _run_single(args):
 TOGGLE_FLAG = "-b"
 
 
+def accepts_extra_value(act, tok):
+    try:
+        value = act.type(tok) if act.type else tok
+    except (ValueError, TypeError, argparse.ArgumentTypeError):
+        return False
+    if act.choices is not None:
+        return value in act.choices
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def take_values(argv, j, act, options):
+    vals = []
+    while j < len(argv) and argv[j] not in options and argv[j] != TOGGLE_FLAG:
+        if act.nargs in (None, "?") and vals and not accepts_extra_value(act, argv[j]):
+            break
+        vals.append(argv[j])
+        j += 1
+    return vals, j
+
+
 def split_toggles(raw_argv, parser):
     options = parser._option_string_actions
     rest, toggles = [], []
@@ -2960,42 +2955,80 @@ def split_toggles(raw_argv, parser):
             if act is None:
                 break
             if act.nargs == 0:
-                toggles.append([opt])
+                toggles.append([[opt]])
                 i += 1
                 continue
             if len(toggles) > start or tok != opt:
                 break
-            j = i + 1
-            while j < len(raw_argv) and raw_argv[j] not in options and raw_argv[j] != TOGGLE_FLAG:
-                j += 1
-                if act.nargs is None:
-                    break
-            if j == i + 1:
+            vals, i = take_values(raw_argv, i + 1, act, options)
+            if not vals and act.nargs != "?":
                 parser.error(f"{TOGGLE_FLAG} {tok}: missing value")
-            toggles.append(raw_argv[i:j])
-            i = j
+            if act.nargs in (None, "?") and vals:
+                toggles.append([[opt, v] for v in vals])
+            else:
+                toggles.append([[opt, *vals]])
             break
         if len(toggles) == start:
             parser.error(f"{TOGGLE_FLAG} must be followed by the flag(s) to run both with and without")
     return rest, toggles
 
 
+def split_multi(raw_argv, parser):
+    options = parser._option_string_actions
+    out, multis = [], []
+    i = 0
+    while i < len(raw_argv):
+        tok = raw_argv[i]
+        out.append(tok)
+        i += 1
+        act = options.get(tok)
+        if act is None or act.nargs is not None or i >= len(raw_argv):
+            continue
+        vals, i = take_values(raw_argv, i, act, options)
+        out.append(vals[0] if vals else raw_argv[i])
+        if len(vals) > 1:
+            multis.append((len(out) - 1, tok, vals))
+    return out, multis
+
+
+def toggle_out_path(run_argv, on):
+    if on and "-o" in run_argv[:-1]:
+        o_idx = run_argv.index("-o") + 1
+        out = pathlib.Path(run_argv[o_idx])
+        run_argv[o_idx] = str(out.parent / "_".join(tok.lstrip("-") for tok in on) / out.name)
+    return run_argv
+
+
+def expand_toggles_and_multi(raw_argv, parser, prog):
+    import itertools
+    rest, toggles = split_toggles(raw_argv, parser)
+    if toggles:
+        runs = []
+        for choice in itertools.product(*[[[]] + alts for alts in toggles]):
+            on = [tok for alt in choice for tok in alt]
+            print(f"[{prog}] {TOGGLE_FLAG} -- queued {' '.join(on) or 'baseline'}")
+            runs.append(toggle_out_path(list(rest), on) + on)
+        return runs
+    base, multis = split_multi(raw_argv, parser)
+    if not multis:
+        return None
+    runs = []
+    for combo in itertools.product(*[vals for _, _, vals in multis]):
+        run_argv = list(base)
+        on = []
+        for (idx, flag, _), v in zip(multis, combo):
+            run_argv[idx] = v
+            on += [flag, v]
+        print(f"[{prog}] multi-value -- queued {' '.join(on)}")
+        runs.append(toggle_out_path(run_argv, on))
+    return runs
+
+
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    rest, toggles = split_toggles(raw_argv, build_parser())
-    if toggles:
-        import itertools
-        results = []
-        for states in itertools.product((False, True), repeat=len(toggles)):
-            on = [tok for t, state in zip(toggles, states) if state for tok in t]
-            run_argv = list(rest)
-            if on and "-o" in run_argv[:-1]:
-                o_idx = run_argv.index("-o") + 1
-                out = pathlib.Path(run_argv[o_idx])
-                run_argv[o_idx] = str(out.parent / "_".join(tok.lstrip("-") for tok in on) / out.name)
-            print(f"[phlag] {TOGGLE_FLAG} -- running {' '.join(on) or 'baseline'}...")
-            results.append(main(run_argv + on))
-        return results
+    runs = expand_toggles_and_multi(raw_argv, build_parser(), "phlag")
+    if runs is not None:
+        return [main(run_argv) for run_argv in runs]
 
     from .utils import expand_node_specs
     raw_specs = build_parser().parse_args(raw_argv).caster_scores or []

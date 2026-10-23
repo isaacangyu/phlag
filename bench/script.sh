@@ -1,0 +1,1 @@
+benchmark -w 20k 30k 35k --rho 0.9 --beta 4
