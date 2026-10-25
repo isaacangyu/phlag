@@ -2552,7 +2552,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
+        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(

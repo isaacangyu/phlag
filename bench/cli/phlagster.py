@@ -3,9 +3,17 @@ import pathlib
 import argparse
 
 from phlag.caster import int_or_abbrev, step_size_or_fraction
+from phlag.utils import PHLAG_PLOT_CHOICES, is_phlag_plot
 
 CASTER_PLOTS = ["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf", "qq", "qq-gaussian", "qq-exp", "qq-dexp"]
-PHLAG_PLOTS = ["em", "states", "relerr", "correlations", "topologies_3d"]
+PHLAG_PLOTS = PHLAG_PLOT_CHOICES + ["em_iters_<N>"]
+
+
+
+def plot_choice(p):
+    if p in CASTER_PLOTS or is_phlag_plot(p):
+        return p
+    raise argparse.ArgumentTypeError(f"invalid plot '{p}' (choose from {', '.join(CASTER_PLOTS + PHLAG_PLOTS)})")
 
 
 def build_parser(input_file=True):
@@ -154,7 +162,7 @@ def build_parser(input_file=True):
         "--plot",
         dest="plot",
         nargs="*",
-        choices=CASTER_PLOTS + PHLAG_PLOTS,
+        type=plot_choice,
         default=None,
         help="Plot names for either stage, routed to whichever one owns them "
              f"(caster: {', '.join(CASTER_PLOTS)}; phlag: {', '.join(PHLAG_PLOTS)}). "
@@ -167,7 +175,7 @@ def build_parser(input_file=True):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -353,7 +361,7 @@ def main(argv=None):
         caster_plot_args, phlag_plot_args = ["--plot"], ["--plot"]
     elif args.plot is not None:
         caster_plot_args = ["--plot"] + ([p for p in args.plot if p in CASTER_PLOTS] or ["none"])
-        phlag_plot_args = ["--plot"] + ([p for p in args.plot if p in PHLAG_PLOTS] or ["none"])
+        phlag_plot_args = ["--plot"] + ([p for p in args.plot if is_phlag_plot(p)] or ["none"])
     elif args.no_plots:
         caster_plot_args, phlag_plot_args = ["--plot", "none"], ["--plot", "none"]
     else:

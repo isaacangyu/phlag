@@ -166,6 +166,24 @@ GT_STATS_FILENAME = "gt_stats.txt"
 STATE_LABELS = {"Null": "Null", "Alt": "Outlier", "Overall": "Overall"}
 _GT_STATS_KEYS = {"Outlier": "Alt"}
 
+PHLAG_PLOT_CHOICES = ["em", "states", "relerr", "correlations", "topologies_3d"]
+EM_ITERS_RE = re.compile(r"em_iters_([1-9]\d*)")
+
+
+def is_phlag_plot(p):
+    return p in PHLAG_PLOT_CHOICES or EM_ITERS_RE.fullmatch(p) is not None
+
+
+def phlag_plot_choice(p):
+    if p == "none" or is_phlag_plot(p):
+        return p
+    raise argparse.ArgumentTypeError(f"invalid plot '{p}' (choose from {', '.join(PHLAG_PLOT_CHOICES)}, em_iters_<N>, none)")
+
+
+def em_iters_counts(plots):
+    return [int(m[1]) for p in plots or () if (m := EM_ITERS_RE.fullmatch(p))]
+
+
 ECDF_MAX_POINTS = 2000
 ECDF_MAX_SORT = 1_000_000
 
@@ -767,6 +785,7 @@ _NAMED_SEGMENTS = {
     "annealing": ("annealing", True),
     "null-alt-zero": ("null_emission_parameterization", "null-alt-zero"),
     "null-alt-equal": ("null_emission_parameterization", "null-alt-equal"),
+    "null-alt-equal-swap": ("null_emission_parameterization", "null-alt-equal-swap"),
     "snr": ("null_emission_parameterization", "snr"),
     "bl-anchor": ("null_emission_parameterization", "bl-anchor"),
 }

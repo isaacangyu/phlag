@@ -909,7 +909,7 @@ class Phlag:
         elif self.has_ground_truth:
             y_pred = np.array(paths[0])
             # Null = anchored state 0 under a constrained --np, else the Viterbi-majority state
-            if not self.anchor_dims and np.sum(y_pred == 1) > np.sum(y_pred == 0):
+            if (not self.anchor_dims or self.args.null_emission_parameterization == "null-alt-equal-swap") and np.sum(y_pred == 1) > np.sum(y_pred == 0):
                 y_pred = 1 - y_pred
                 flipped_for_eval = True
             self.flipped_for_eval = flipped_for_eval
@@ -1083,7 +1083,7 @@ class Phlag:
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         if getattr(self, "anchor_dims", ()):
-            k_params -= {"snr": 1, "null-alt-equal": 4}.get(self.args.null_emission_parameterization, len(self.anchor_dims))
+            k_params -= {"snr": 1, "null-alt-equal": 4}.get(self.null_np, len(self.anchor_dims))
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1407,14 +1407,15 @@ class Phlag:
             self.beta_1 = self.beta
             self.psi = jnp.array([[self.alpha_0, self.beta_0], [self.beta_1, self.alpha_1]]) + PSI_EPS
 
+        self.null_np = "null-alt-equal" if self.args.null_emission_parameterization == "null-alt-equal-swap" else self.args.null_emission_parameterization
         self.emission_parameterization = (
-            self.args.null_emission_parameterization,
+            self.null_np,
             self.args.alt_emission_parameterization,
         )
 
         self.anchor_dims = ()
         self.anchor_value = 0.0
-        if self.args.null_emission_parameterization in ("null-alt-zero", "null-alt-equal", "snr", "bl-anchor"):
+        if self.null_np in ("null-alt-zero", "null-alt-equal", "snr", "bl-anchor"):
             if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
                 raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
             self.anchor_dims = (0, 1)
@@ -1454,10 +1455,10 @@ class Phlag:
         data_var = jnp.diag(data_cov)
         null_mean = data_mean
         null_cov = data_cov
-        if self.anchor_dims and self.args.null_emission_parameterization == "null-alt-equal":
+        if self.anchor_dims and self.null_np == "null-alt-equal":
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(jnp.mean(data_mean[jnp.array(self.anchor_dims)]))
             null_cov = hmm.swap_symmetrize(data_cov, self.anchor_dims)
-        elif self.anchor_dims and self.args.null_emission_parameterization == "snr":
+        elif self.anchor_dims and self.null_np == "snr":
             ceiling = data_mean[2] / (data_var[2] + 1e-12)
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(
                 jnp.minimum(jnp.mean(data_mean[jnp.array(self.anchor_dims)]), ceiling))
@@ -1541,8 +1542,14 @@ class Phlag:
         self.clip_activation_attempts = 0
         self.final_em_log_prob = float("nan")
         self.em_diverged_at = None
+        n_history = max(utils.em_iters_counts(self.args.plot), default=0)
+        self.em_iter_history = []
         for i in tqdm(range(self.n_iters)):
             num_inner = (i + 1) * self.increment_steps
+            step_callback = None
+            if i < n_history:
+                self.em_iter_history.append([])
+                step_callback = self.em_iter_history[-1].append
             self.params, log_probs, clip_count, clip_attempts, last_finite_params, last_finite_lp = self.hmm.fit_em(
                 self.params,
                 self.props,
@@ -1555,6 +1562,7 @@ class Phlag:
                 # doesn't mean the same "amount of training" regardless of
                 # where it falls in the schedule.
                 outer_iter=cumulative_inner_steps if self.args.annealing else None,
+                step_callback=step_callback,
             )
             cumulative_inner_steps += num_inner
             self.clip_activation_count += clip_count
@@ -1723,6 +1731,8 @@ class PhlagPlotter:
             self.plot_correlations()
         if "topologies_3d" in plots:
             self.plot_topologies_3d()
+        for n in utils.em_iters_counts(plots):
+            self.plot_em_iters(n)
 
     def extract_metadata(self):
         """Extracts genomic filename, dimension, and styles configuration."""
@@ -1779,6 +1789,53 @@ class PhlagPlotter:
             plt.tight_layout(rect=[0, 0, 1, 0.95])
         self._annotate_state_counts(fig, legend)
         self.save_plot()
+
+    def plot_em_iters(self, n):
+        """ECDFs of the HMM-assigned split after each inner EM step (light -> dark)
+        for the first n outer iterations, plus a final-HMM row; no QQ row."""
+        history = getattr(self.phlag, "em_iter_history", None) or []
+        history = history[:n]
+        if not history:
+            print(f"Warning: no EM iteration history for em_iters_{n} -- skipping.")
+            return
+        sns.set_theme(style="whitegrid")
+        Y_np = np.array(self.phlag.Y, dtype=np.float64)
+        param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
+        cmaps = {0: plt.get_cmap("Blues"), 1: plt.get_cmap("Reds")}
+        y_true = np.array(self.phlag.y_true) if self.phlag.has_ground_truth else None
+
+        rows = [(f"Outer {i + 1} ({len(steps)} inner)", steps, "EM ECDF") for i, steps in enumerate(history)]
+        n_outer = self.phlag.em_diverged_at or self.phlag.n_iters
+        rows.append((f"Final HMM ({n_outer} outer)", [self.phlag.params], "EM ECDF"))
+
+        fig, axes = plt.subplots(len(rows), self.emission_dim, figsize=(5.5 * self.emission_dim, 3.6 * len(rows) + 1), squeeze=False)
+        for i, (row_title, steps, last_label) in enumerate(rows):
+            assigned = [np.array(self.phlag.hmm.most_likely_states(p, self.phlag.Y)) for p in steps]
+            for d in range(self.emission_dim):
+                ax = axes[i, d]
+                vals_d = Y_np[:, d]
+                if y_true is not None:
+                    for state in (0, 1):
+                        x, y = utils.ecdf_points(vals_d[y_true == state])
+                        if len(x):
+                            ax.step(x, y, where="post", linewidth=1.6, label=f"{self.colors[state]['label']} GT ECDF", **self._line_style(state, True))
+                for k, a in enumerate(assigned):
+                    shade = 0.3 + 0.7 * (k + 1) / len(assigned)
+                    last = k == len(assigned) - 1
+                    for state in (0, 1):
+                        x, y = utils.ecdf_points(vals_d[a == param_states[state]])
+                        if len(x):
+                            ax.step(x, y, where="post", linewidth=1.8 if last else 1.0, color=cmaps[state](shade),
+                                    label=f"{self.colors[state]['label']} {last_label}" if last else None)
+                self._style_axis(ax, row_title, d, "Topology Score", "Proportion")
+            self._apply_log_scales(axes[i])
+
+        legend = self._finalize_legend(fig, axes, ncol=2)
+        locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
+        title = "EM Inner-Step ECDFs (light \u2192 dark = inner step)"
+        fig.suptitle(f"{title} | {locus_desc}" if locus_desc else title, fontsize=13, fontweight="bold", y=0.995)
+        plt.tight_layout(rect=[0, 0, 1, 1 - 0.75 / fig.get_figheight()])
+        self.save_plot(f"em_iters_{n}.png")
 
     def _annotate_state_counts(self, fig, legend):
         """Writes the Outlier ($N_o$) and Null ($N_b$) window counts in the blank space
@@ -2265,14 +2322,16 @@ def build_parser():
     parser.add_argument(
         "--plot",
         nargs="*",
-        choices=["em", "states", "relerr", "correlations", "topologies_3d", "none"],
+        type=utils.phlag_plot_choice,
         default=["em", "states"],
         help="List of plots to generate (choices: em, states, relerr, "
-             "correlations, topologies_3d. Default: em and states; relerr is "
+             "correlations, topologies_3d, em_iters_<N>. Default: em and states; relerr is "
              "opt-in, saving relerr.png -- fitted-vs-ground-truth relative error "
              "per topology/state/statistic, requires ground truth; correlations "
-             "and topologies_3d are opt-in too. Passing --plot with no choices "
-             "explicitly requests all of the above).",
+             "and topologies_3d are opt-in too; em_iters_<N> saves em_iters_<N>.png, "
+             "ECDFs of the HMM-assigned split after every inner EM step of the "
+             "first N outer iterations (one row per outer iteration; always reruns EM). "
+             "Passing --plot with no choices explicitly requests all but em_iters).",
     )
     parser.add_argument(
         "-L",
@@ -2351,13 +2410,14 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
         help="""Parameterization of the null (background) state's emission distribution
                     (default: free): free (unconstrained MLE), repulsion (pushed away
                     from the alt state's currently fitted distribution),
                     null-alt-zero (free, but the alternative topologies' (ABBA, BABA)
                     means fixed at 0), null-alt-equal (ABBA and BABA share one mean,
-                    one variance and one covariance with AABB), snr (ABBA and BABA means tied to their average,
+                    one variance and one covariance with AABB), null-alt-equal-swap (null-alt-equal,
+                    but evaluation relabels the Viterbi-majority state as Null like free), snr (ABBA and BABA means tied to their average,
                     capped each EM iteration at the null state's AABB mean / AABB variance),
                     or bl-anchor (like null-alt-zero, but fixed at exp(-t)/3, t = the
                     clade's branch length in coalescent units; admixture uses the
@@ -2609,7 +2669,7 @@ def parse_arguments(argv=None):
     if args.plot == []:
         # Bare "--plot" (no choices given): plot everything, same as
         # caster.py's own --plot (see phlag/caster.py's main()).
-        args.plot = ["em", "states", "relerr", "correlations", "topologies_3d"]
+        args.plot = list(utils.PHLAG_PLOT_CHOICES)
     args.plot = [p for p in args.plot if p != "none"]
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
@@ -2876,6 +2936,10 @@ def merge_missing_report_lines(old, new):
     return merged, missing
 
 
+def needs_plotter(plots):
+    return bool(plots) and bool({"em", "correlations", "topologies_3d"} & set(plots) or utils.em_iters_counts(plots))
+
+
 def _run_single(args):
     if not args.bench:
         flags_str = " ".join(f"{k}={v}" for k, v in vars(args).items())
@@ -2890,14 +2954,16 @@ def _run_single(args):
         if not args.plot:
             print(f"Found existing report '{phlag.output_file}' with matching fit -- skipping, no plots missing.")
             return phlag.output_file
-        print(f"Found existing report '{phlag.output_file}' with matching fit -- skipping EM, drawing missing plots {args.plot}.")
-        phlag.load_fit(own_fit)
-        if {"em", "correlations", "topologies_3d"} & set(args.plot):
-            PhlagPlotter(phlag)
-        return phlag.output_file
+        if not utils.em_iters_counts(args.plot):
+            print(f"Found existing report '{phlag.output_file}' with matching fit -- skipping EM, drawing missing plots {args.plot}.")
+            phlag.load_fit(own_fit)
+            if needs_plotter(args.plot):
+                PhlagPlotter(phlag)
+            return phlag.output_file
+        print(f"Found existing report '{phlag.output_file}' with matching fit -- rerunning EM for {args.plot}.")
 
     store_report = None if args.bench or not reuse_fit else phlag.find_store_report()
-    if store_report is not None and fit_path_for(store_report).exists():
+    if store_report is not None and fit_path_for(store_report).exists() and not utils.em_iters_counts(args.plot):
         print(f"Found benchmarked fit for '{store_report}' -- skipping EM.")
         phlag.load_fit(fit_path_for(store_report))
     else:
@@ -2908,7 +2974,7 @@ def _run_single(args):
     if store_report is not None:
         phlag.update_store_report(store_report)
 
-    if args.plot and {"em", "correlations", "topologies_3d"} & set(args.plot):
+    if needs_plotter(args.plot):
         PhlagPlotter(phlag)
 
     return phlag.output_file

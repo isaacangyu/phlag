@@ -115,6 +115,10 @@ _METRIC_PANEL_COLUMN = {
     "alt_kl_agg": "in_panel_relerr",
 }
 
+def _as_list(x):
+    return [x] if isinstance(x, str) else x
+
+
 _NO_METRICS_EXCLUSION = "no TPR/FPR metrics line in report"
 _FAILED_RUN_ZERO_METRICS = ["f1", "tpr", "fpr", "precision"]
 
@@ -202,6 +206,21 @@ def _row_axis_display(name, value):
     if name == "outlier_pct":
         return f"{value:g}%"
     return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+_ROW_AXIS_TITLE_PREFIX = {
+    "fraction_bin": "outlier fraction", "anomaly_fraction": "outlier fraction", "outlier_pct": "outlier",
+    "em_hd_bin": "EM HD", "em_gt_hd_bin": "EM GT HD",
+}
+
+
+def _row_axis_title(name, value):
+    if value in (None, "(none)"):
+        return str(value)
+    if name == "x_bin":
+        return f"{'admixture' if value in ADMIXTURE_BINS else 'BL'} {value}"
+    prefix = _ROW_AXIS_TITLE_PREFIX.get(name)
+    return f"{prefix} {value}" if prefix else str(value)
 
 
 def _merged_category(category, subcategory):
@@ -1076,7 +1095,8 @@ class CrossRunAnalysis:
             configs = self._last_configs
         elif isinstance(configs, dict) or (isinstance(configs, list) and configs and isinstance(configs[0], dict)):
             configs = self.resolve_configs_cartesian(configs, exclude_keywords=exclude_keywords, agg=agg)
-        metrics = self.metrics if metrics is None else metrics
+        agg = _as_list(agg)
+        metrics = self.metrics if metrics is None else _as_list(metrics)
         metric_values = {metric: self._metric_by_label(configs, metric) for metric in metrics}
         for label, dirs in configs:
             stats = ", ".join(f"{metric}={metric_values[metric][label]:.4f}" for metric in metrics)
@@ -1166,6 +1186,11 @@ class CrossRunAnalysis:
         )
         return fig
 
+    def _axis_title(self, configs, idx, value, skip=None):
+        names = self._agg_axis_names.get(configs[0][0], []) if configs else []
+        names = [n for i, n in enumerate(names) if i != skip]
+        return _row_axis_title(names[idx] if idx < len(names) else None, value)
+
     def _axis_values(self, configs, idx):
         rank = {}
         for label, _ in configs:
@@ -1242,9 +1267,9 @@ class CrossRunAnalysis:
                 if ri == n_rows - 1:
                     ax.set_xlabel("FPR", fontsize=8)
                 if ri == 0 and cv not in (None, "(none)"):
-                    ax.set_title(str(cv), fontsize=9.5, pad=8)
+                    ax.set_title(self._axis_title(configs, 2, cv), fontsize=9.5, pad=8)
                 if ci == 0 and rv not in (None, "(none)"):
-                    ax.set_ylabel(str(rv), fontsize=8.5)
+                    ax.set_ylabel(self._axis_title(configs, 3, rv), fontsize=8.5)
                 for lv in line_vals:
                     points = []
                     for pv in point_vals:
@@ -1322,7 +1347,7 @@ class CrossRunAnalysis:
         fig.tight_layout(rect=[0, 0.04, 1, _below_title_top(fig, cursor_y)])
         return fig
 
-    def _plot_run(self, axes, path, metrics, exclude_keywords=(), logy=False, title="", dir="out"):
+    def _plot_run(self, axes, path, metrics, exclude_keywords=(), logy=False, title="", dir="store"):
         df = _collect_run_df(axes, path, exclude_keywords, dir, self.root)
         panels = [(m,) if isinstance(m, str) else tuple(m) for m in metrics]
         missing = sorted({m for panel in panels for m in panel} - set(df.columns))
@@ -1376,7 +1401,7 @@ class CrossRunAnalysis:
         plt.show()
         return fig
 
-    def _plot_branches(self, axes, runs, metrics, exclude_keywords=(), title="", dir="out"):
+    def _plot_branches(self, axes, runs, metrics, exclude_keywords=(), title="", dir="store"):
         dfs = {label: _collect_run_df(axes, path, exclude_keywords, dir, self.root) for label, path in runs.items()}
         columns = [c for m in metrics for c in (("tpr", "fpr") if m == "tpr_fpr" else (m,))]
         configs = sorted({c for df in dfs.values() for c in df.loc[df[columns].notna().any(axis=1), "config"]})
@@ -1479,7 +1504,7 @@ class CrossRunAnalysis:
                     **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
                 entries.append((size, tuple(df["config"][i].split("/")), args, report, scores_path, rel.name))
             return entries, df
-        df = _collect_run_df(axes, path, exclude_keywords)
+        df = _collect_run_df(axes, path, exclude_keywords, "out")
         entries = []
         for report in df["report_path"]:
             parts = Path(report).parent.parts
@@ -1491,7 +1516,7 @@ class CrossRunAnalysis:
     def _score_dist_cells(self, metric, axes, runs, agg, exclude_keywords, dir, pattern, by_em):
         assert "phlag" not in axes, f"{metric} doesn't take a 'phlag' source axis"
         assert dir in ("out", "store")
-        rest = [a for a in agg if a not in ("em", "gt", "topology")]
+        rest = [a for a in agg if a not in ("em", "gt", "topology", "state")]
         if len(rest) > 1:
             raise ValueError(f"{metric} agg takes 'em' and at most one row flag, got {agg}")
         windows = axes.get("-w", axes.get("--window-size"))
@@ -1518,7 +1543,7 @@ class CrossRunAnalysis:
                 figures.setdefault((size_key, tail), {})[(recorded.get(row_dest), ci)] = (report, scores_path, entry_pattern)
         return row_flag, row_dest, figures, col_titles
 
-    def _plot_score_dist(self, metric, axes, runs, agg=(), exclude_keywords=(), title="", dir="out", logx=None,
+    def _plot_score_dist(self, metric, axes, runs, agg=(), exclude_keywords=(), title="", dir="store", logx=None,
                          normalize=False, topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
         by_em = "em" in agg
         row_flag, row_dest, figures, col_titles = self._score_dist_cells(metric, axes, runs, agg, exclude_keywords, dir,
@@ -1581,7 +1606,7 @@ class CrossRunAnalysis:
         plt.show()
         return figs[0] if len(figs) == 1 else figs
 
-    def _plot_ecdf_hmm(self, axes, runs, agg=(), exclude_keywords=(), title="", dir="out", logx=None, normalize=False,
+    def _plot_ecdf_hmm(self, axes, runs, agg=(), exclude_keywords=(), title="", dir="store", logx=None, normalize=False,
                       topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
         row_flag, row_dest, figures, _ = self._score_dist_cells("ecdf_hmm", axes, runs, agg, exclude_keywords, dir, pattern, True)
         topologies = [topologies] if isinstance(topologies, str) else list(topologies)
@@ -1654,6 +1679,44 @@ class CrossRunAnalysis:
             raise ValueError(f"No ecdf_hmm could be drawn for {[p for _, p in runs]} with {axes}")
         plt.show()
         return figs[0] if len(figs) == 1 else figs
+
+    def _plot_ecdf_hmm_pooled(self, axes, agg=(), exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
+                              logx=None, linthresh=None, normalize=False, legend=True, windows=False):
+        name = f"ecdf_hmm{'_all' if windows else ''}"
+        agg = [agg] if isinstance(agg, str) else [a for a in agg or () if a]
+        by_state = "state" in agg
+        agg = [a for a in agg if a not in ("em", "topology", "state")]
+        flags = [a for a in agg if not (isinstance(a, str) and a in _POOLED_SCORE_AXES)]
+        by = [a for a in agg if a not in flags] or ["-w"]
+        if len(by) > 1:
+            raise ValueError(f"{name}: agg is at most one of {sorted(_POOLED_SCORE_AXES)} plus config flags, got {agg}")
+        by = by[0]
+        topologies = [topologies] if isinstance(topologies, str) else list(topologies)
+        cols = [TOPOLOGY_NAMES.index(t) for t in topologies]
+        series, n_reports = [], 0
+        for w, _, _, leaf_label, kept in self._topology_scatter_sources(axes, exclude_keywords, pattern, [], True, "fitted_all", flags):
+            n_reports += len(kept)
+            groups = {}
+            for r in kept:
+                groups.setdefault(None if by == "-w" else _POOLED_SCORE_AXES[by](w, r[0]), []).append(r)
+            for key in [None] if by == "-w" else _pooled_axis_values(by, set(groups)):
+                null, alt, *_ = self._topology_scatter_points(groups[key], [np.nan] * len(groups[key]), "all" if windows else "means")
+                series.append((_gt_mean_axis_label("-w", w) + leaf_label + ("" if key is None else f" {_gt_mean_axis_label(by, key)}"),
+                               null, alt))
+        if not series:
+            raise ValueError(f"No {name} could be drawn with {axes}")
+        what = "window mean" if windows else "per-run mean window mean"
+        title = title or f"HMM (Viterbi) {what} ECDFs pooled over all runs ({'point = window' if windows else 'point = run'}, " \
+            f"n reports = {n_reports})" + (f" — {pattern}" if pattern is not None else "")
+        symlog = (not normalize) if logx is None else logx
+        if by_state:
+            fig = _hmm_state_ecdf_figure(series, cols, topologies, what, title, symlog, linthresh, normalize, legend)
+        else:
+            fig = _window_ecdf_figure(series, cols, topologies, what, title, symlog=symlog, linthresh=linthresh, normalize=normalize,
+                                      legend=legend, cmap="Greys" if by in _ORDERED_POOLED_AXES and not flags else "tab10",
+                                      state_labels=("Null HMM", "Outlier HMM"))
+        plt.show()
+        return fig
 
     def _plot_score_dist_pooled(self, metric, axes, agg=(), exclude_keywords=(), title="", logx=None, normalize=False,
                                 topologies=TOPOLOGY_NAMES, pattern=None, linthresh=None, legend=True):
@@ -1798,9 +1861,13 @@ class CrossRunAnalysis:
     def _plot_topology_scatter(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
                                logx=None, linthresh=None, normalize=False, legend=True, state=None, topology=None, stat="all",
                                color=None, corr="spearman", percentile=None, agg=()):
-        by = [a for a in agg or () if a] or ["-w"]
-        if len(by) > 1 or by[0] not in _POOLED_SCORE_AXES:
-            raise ValueError(f"topology_topology_{stat}: agg is one of {sorted(_POOLED_SCORE_AXES)}, got {agg}")
+        agg = [agg] if isinstance(agg, str) else [a for a in agg or () if a]
+        flags = [a for a in agg if not (isinstance(a, str) and a in _POOLED_SCORE_AXES)]
+        by = [a for a in agg if a not in flags] or ["-w"]
+        fitted = stat.startswith("fitted_") or stat in _VITERBI_SPLIT_STATS
+        if len(by) > 1 or (flags and not fitted):
+            raise ValueError(f"topology_topology_{stat}: agg is at most one of {sorted(_POOLED_SCORE_AXES)} plus standard "
+                             f"config agg (flags/tuples, fitted_*/viterbi_* stats only), got {agg}")
         by = by[0]
         if corr not in ("spearman", "pearson"):
             raise ValueError(f"topology_topology_{stat}: corr is 'spearman' or 'pearson', got {corr!r}")
@@ -1809,13 +1876,12 @@ class CrossRunAnalysis:
         picked = TOPOLOGY_NAMES if topology is None else [topology] if isinstance(topology, str) else list(topology)
         if not states or set(picked) - set(TOPOLOGY_NAMES):
             raise ValueError(f"topology_topology_{stat}: state from {[s[0] for s in _STATE_STYLES]}, topology from {TOPOLOGY_NAMES}")
-        fitted = stat.startswith("fitted_") or stat in _VITERBI_SPLIT_STATS
         names = _COVARIANCE_PAIR_NAMES if stat.endswith("covariances") else TOPOLOGY_NAMES
         if names is _COVARIANCE_PAIR_NAMES:
             picked = [n for n, (a, b) in zip(names, _COVARIANCE_PAIRS) if TOPOLOGY_NAMES[a] in picked or TOPOLOGY_NAMES[b] in picked]
         prefixes = [Path(p).parts for p in runs or ()]
         series, n_runs = [], 0
-        for w, root, leaf, leaf_label, kept in self._topology_scatter_sources(axes, exclude_keywords, pattern, prefixes, fitted, stat):
+        for w, root, leaf, leaf_label, kept in self._topology_scatter_sources(axes, exclude_keywords, pattern, prefixes, fitted, stat, flags):
             n_runs = max(n_runs, len(kept))
             all_values = self._run_color_values(color, w, root, [(r[0], None, None) for r in kept] if fitted else kept,
                                                 exclude_keywords, leaf) if color is not None else [np.nan] * len(kept)
@@ -1909,7 +1975,7 @@ class CrossRunAnalysis:
         plt.show()
         return fig
 
-    def _topology_scatter_sources(self, axes, exclude_keywords, pattern, prefixes, fitted, stat):
+    def _topology_scatter_sources(self, axes, exclude_keywords, pattern, prefixes, fitted, stat, flags=()):
         roots = self._caster_window_roots(axes)
         keep = lambda parts: not prefixes or any(parts[:len(p)] == p for p in prefixes)
         if not fitted:
@@ -1918,36 +1984,41 @@ class CrossRunAnalysis:
                 if kept:
                     yield w, root, None, "", kept
             return
-        leaves = sorted({Path(d) for _, ds in self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords) for d in ds})
+        configs = self.resolve_configs_cartesian(axes, exclude_keywords=exclude_keywords, agg=list(flags))
+        if not flags:
+            configs = [("", [d for _, ds in configs for d in ds])]
         for w, root in roots:
-            at_w = [leaf for leaf in leaves if self._get_args(leaf).get("window_size") == w]
-            if not at_w:
-                continue
-            depth = min(len(leaf.parts) for leaf in at_w)
-            skipped = [leaf for leaf in at_w if len(leaf.parts) > depth]
-            if skipped:
-                print(f"w{format_val(w)}: skipping variant runs (pin their flag to plot them): {[str(s) for s in skipped]}")
-            at_w = [leaf for leaf in at_w if len(leaf.parts) == depth]
-            tails = [[p for p in leaf.parts[next(i for i, p in enumerate(leaf.parts) if _OUT_SIZE_SEGMENT.match(p)) + 1:]]
-                     for leaf in at_w]
-            common = os.path.commonprefix(tails) if len(tails) > 1 else tails[0]
-            for leaf, tail in zip(at_w, tails):
-                reports = [r for r in sorted((leaf / "reports").glob("*/*/*/*.tsv"))
-                           if keep(r.relative_to(leaf / "reports").with_suffix("").parts)
-                           and (pattern is None or r.stem == str(pattern)) and not any(k in str(r) for k in exclude_keywords)]
-                if stat in _VITERBI_SPLIT_STATS:
-                    args = self._get_args(leaf)
-                    scores_paths = [get_expected_scores_path(
-                        Path("simulations", *parts[:3], "concat", f"{parts[3]}.fa"), Path(*parts[:3]),
-                        window_size=args.get("window_size"), step_size=args.get("step_size"),
-                        **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
-                        for parts in (r.relative_to(leaf / "reports").with_suffix("").parts for r in reports)]
-                    loaded = _hmm_split_scores_many(reports, scores_paths)
-                else:
-                    loaded = _fitted_moments_many(reports)
-                kept = [(r.relative_to(leaf / "reports").with_suffix("").parts, *m) for r, m in zip(reports, loaded) if m is not None]
-                if kept:
-                    yield w, root, leaf, "".join(f" {p}" for p in tail[len(common):]), kept
+            for label, dirs in configs:
+                at_w = sorted({Path(d) for d in dirs if self._get_args(d).get("window_size") == w})
+                for source in self._topology_scatter_leaves(w, root, at_w, keep, pattern, exclude_keywords, stat) if at_w else ():
+                    yield (*source[:3], (f" {label}" if label else "") + source[3], source[4])
+
+    def _topology_scatter_leaves(self, w, root, at_w, keep, pattern, exclude_keywords, stat):
+        depth = min(len(leaf.parts) for leaf in at_w)
+        skipped = [leaf for leaf in at_w if len(leaf.parts) > depth]
+        if skipped:
+            print(f"w{format_val(w)}: skipping variant runs (pin their flag to plot them): {[str(s) for s in skipped]}")
+        at_w = [leaf for leaf in at_w if len(leaf.parts) == depth]
+        tails = [[p for p in leaf.parts[next(i for i, p in enumerate(leaf.parts) if _OUT_SIZE_SEGMENT.match(p)) + 1:]]
+                 for leaf in at_w]
+        common = os.path.commonprefix(tails) if len(tails) > 1 else tails[0]
+        for leaf, tail in zip(at_w, tails):
+            reports = [r for r in sorted((leaf / "reports").glob("*/*/*/*.tsv"))
+                       if keep(r.relative_to(leaf / "reports").with_suffix("").parts)
+                       and (pattern is None or r.stem == str(pattern)) and not any(k in str(r) for k in exclude_keywords)]
+            if stat in _VITERBI_SPLIT_STATS:
+                args = self._get_args(leaf)
+                scores_paths = [get_expected_scores_path(
+                    Path("simulations", *parts[:3], "concat", f"{parts[3]}.fa"), Path(*parts[:3]),
+                    window_size=args.get("window_size"), step_size=args.get("step_size"),
+                    **{k: args.get(k) or (None if k == "chunk_size" else False) for k in _SCORES_VARIANT_DESTS})
+                    for parts in (r.relative_to(leaf / "reports").with_suffix("").parts for r in reports)]
+                loaded = _hmm_split_scores_many(reports, scores_paths)
+            else:
+                loaded = _fitted_moments_many(reports)
+            kept = [(r.relative_to(leaf / "reports").with_suffix("").parts, *m) for r, m in zip(reports, loaded) if m is not None]
+            if kept:
+                yield w, root, leaf, "".join(f" {p}" for p in tail[len(common):]), kept
 
     @staticmethod
     def _topology_scatter_points(kept, values, stat):
@@ -2246,6 +2317,12 @@ class CrossRunAnalysis:
     def plot(self, *args, show_axes=True, legend=None, gtrees=False, **kwargs):
         if legend not in (None, "hide", "values"):
             raise ValueError(f"legend must be None, 'hide', or 'values', got {legend!r}")
+        args = list(args)
+        for i, name in ((2, "metrics"), (3, "agg")):
+            if len(args) > i:
+                args[i] = _as_list(args[i])
+            elif name in kwargs:
+                kwargs[name] = _as_list(kwargs[name])
         options = dict(kwargs.get("options") or {})
         admixture = options.pop("admixture", True)
         kwargs["options"] = options or None
@@ -2378,7 +2455,7 @@ class CrossRunAnalysis:
         return fig
 
     def _plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
-              title="", options=None, show_config_suffix=True, logy=False, dir="out", shared=False, agg_idx=0,
+              title="", options=None, show_config_suffix=True, logy=False, dir="store", shared=False, agg_idx=0,
               errorbar="default", color=None, scalex=False, scaley=False):
         """`run` (a directory, e.g. "out/10X/down/N276/37-62") makes this a
         run-specific plot: `axes` is still the config dict, but it now only
@@ -2447,7 +2524,14 @@ class CrossRunAnalysis:
         dir matching `axes`. metrics=["ecdf_hmm"]: one figure per run/pattern
         (store/out reports as agg=["em"]), cols = topologies, rows = agg's
         row flag (e.g. ["--np"]) or "-w", Null EM vs Outlier EM ECDFs split
-        by the Viterbi path, vlines/box = state means. dir="store" reads
+        by the Viterbi path, vlines/box = state means. Without `run`,
+        ecdf_hmm pools every store report matching `axes` (point = one
+        report's Viterbi Null/Outlier mean) and ecdf_hmm_all pools their
+        windows (point = window, Viterbi-labeled); rows = Null HMM/Outlier
+        HMM, cols = topologies, one curve per "-w" (plus config flags in
+        agg, or one _POOLED_SCORE_AXES axis); "state" in agg overlays both
+        states per panel instead, rows = those curves; with `run`,
+        ecdf_hmm_all = ecdf_hmm. dir="store" reads
         the same run's reports from self.root's leaf dirs instead of out/
         (reports/<run>.tsv, filtered by each leaf's args.json, config = leaf
         path minus its size segment -- see collect_store_runs). Without `run`, resolves `axes`/`agg`/`exclude_keywords` via resolve_configs_cartesian
@@ -2631,9 +2715,10 @@ class CrossRunAnalysis:
             if dist_metric == "ecdf_all_hmm":
                 return self._plot_ecdf_all_hmm(axes, [run] if isinstance(run, str) else run, exclude_keywords=exclude_keywords,
                                               title=title, color=color, **opts)
-            if dist_metric == "ecdf_hmm":
+            if dist_metric in ("ecdf_hmm", "ecdf_hmm_all"):
                 if run is None:
-                    raise ValueError("ecdf_hmm needs run=")
+                    return self._plot_ecdf_hmm_pooled(axes, agg=agg, exclude_keywords=exclude_keywords, title=title,
+                                                      windows=dist_metric == "ecdf_hmm_all", **opts)
                 return self._plot_ecdf_hmm(axes, runs, agg=agg, exclude_keywords=exclude_keywords, title=title, dir=dir, **opts)
             if (dist_metric in _TOPOLOGY_SCATTER_METRICS) != (plot_type == "scatter"):
                 raise ValueError(f"plot_type='scatter' goes with metrics=[one of {sorted(_TOPOLOGY_SCATTER_METRICS)}]")
@@ -3299,9 +3384,9 @@ class CrossRunAnalysis:
                     else:
                         bounded = _apply_bounded_yaxis(ax, metric)
                     if ri == 0 and cv not in (None, "(none)"):
-                        ax.set_title(str(cv), fontsize=9)
+                        ax.set_title(self._axis_title(configs, 2, cv), fontsize=9)
                     if ci == 0 and rv not in (None, "(none)"):
-                        ax.set_ylabel(str(rv), fontsize=9)
+                        ax.set_ylabel(self._axis_title(configs, 3, rv), fontsize=9)
                     cell_bounds = []
                     interp_points = {hv: [] for hv in hue_vals}
                     for bi, bv in enumerate(cell_bar_vals):
@@ -3460,9 +3545,9 @@ class CrossRunAnalysis:
                             ax.axhline(baselines[(rv, cv, hv)][0], color=line_color(*hv), linestyle=":",
                                        linewidth=1.2, alpha=0.8, zorder=2)
                     if ri == 0 and cv not in (None, "(none)"):
-                        ax.set_title(str(cv), fontsize=9)
+                        ax.set_title(self._axis_title(configs, 1, cv, skip=bi), fontsize=9)
                     if ci == 0 and rv not in (None, "(none)"):
-                        ax.set_ylabel(str(rv), fontsize=9)
+                        ax.set_ylabel(self._axis_title(configs, 2, rv, skip=bi), fontsize=9)
             _suptitle(fig, _compose_title(title_suffix, metric if len(metrics) > 1 else ""), fontsize=12, y=0.99)
             fig.supxlabel("beta (raw; beta' x n_windows)", fontsize=9)
             fig.supylabel(metric, fontsize=9)
@@ -3687,9 +3772,9 @@ class CrossRunAnalysis:
                                 color = "white" if (v - vmin) / (vmax - vmin or 1) > 0.6 else "black"
                                 ax.text(xn, yn, f"{v:.3f}", ha="center", va="center", color=color, fontsize=7)
                     if ri == 0 and cv not in (None, "(none)"):
-                        ax.set_title(str(cv), fontsize=9.5)
+                        ax.set_title(_row_axis_title(agg_names[2] if len(agg_names) > 2 else None, cv), fontsize=9.5)
                     if ci == 0 and rv not in (None, "(none)"):
-                        ax.set_ylabel(str(rv), fontsize=9, labelpad=28)
+                        ax.set_ylabel(_row_axis_title(agg_names[3] if len(agg_names) > 3 else None, rv), fontsize=9, labelpad=28)
             title_metric = "/".join(metrics) if metric_role else outer_metric
             base_label = "value" if metric_role else outer_metric
             multi_metric = metric_role is None and len(metrics) > 1
@@ -4072,7 +4157,7 @@ def _pooled_caster_scores(root, exclude_keywords=(), pattern=None):
 
 
 def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, linthresh=None, normalize=False, legend=True,
-                        color_by=None, cmap="Greys"):
+                        color_by=None, cmap="Greys", state_labels=("Null", "Outlier")):
     if normalize:
         series = [(w, *np.split(_minmax_normalize(np.concatenate([null, alt]), normalize), [len(null)]), *rest)
                   for w, null, alt, *rest in series]
@@ -4097,7 +4182,7 @@ def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, l
         pooled = np.concatenate([v[:, col] for _, null, alt, *_ in series for v in (null, alt)])
         pooled = pooled[np.isfinite(pooled)]
         lo, hi = np.percentile(pooled, [0.5, 99.5] if symlog else [1, 99]) if len(pooled) else (0, 0)
-        for state, state_label in enumerate(("Null", "Outlier")):
+        for state, state_label in enumerate(state_labels):
             ax = axs[state][ci]
             if symlog:
                 ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
@@ -4122,6 +4207,46 @@ def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, l
 
 
 _HMM_STATE_COLORS = ("#1F3B73", "#E4573D")
+
+
+def _hmm_state_ecdf_figure(series, cols, topologies, xlabel, title, symlog, linthresh, normalize, legend):
+    if normalize:
+        series = [(label, *np.split(_minmax_normalize(np.concatenate([null, alt]), normalize), [len(null)]))
+                  for label, null, alt in series]
+        xlabel = f"normalized {xlabel}"
+    fig, axs = plt.subplots(len(series), len(cols), figsize=(3.8 * len(cols), 3.2 * len(series) + 1.0), sharex="col", squeeze=False)
+    for ci, col in enumerate(cols):
+        pooled = np.concatenate([v[:, col] for _, null, alt in series for v in (null, alt)])
+        pooled = pooled[np.isfinite(pooled)]
+        lo, hi = np.percentile(pooled, [0.5, 99.5] if symlog else [1, 99]) if len(pooled) else (0, 0)
+        for ri, (label, null, alt) in enumerate(series):
+            ax = axs[ri][ci]
+            means = []
+            for vals, color in zip((null, alt), _HMM_STATE_COLORS):
+                mean, n = _draw_ecdf(ax, vals[:, col], color=color, linewidth=1.6)
+                means.append((mean, n))
+                if mean is not None:
+                    ax.axvline(mean, color=color, linewidth=1.0, alpha=0.7)
+            if legend:
+                _text_box(ax, ["Mean"] + [f"{name} HMM: {'n/a' if m is None else f'{m:.3g}'} (n={n})"
+                                          for name, (m, n) in zip(("Null", "Outlier"), means)])
+            if symlog:
+                ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.tick_params(axis="x", labelsize=6)
+            if hi > lo:
+                ax.set_xlim(lo, hi)
+            ax.set_ylim(0, 1)
+            ax.grid(alpha=0.25)
+            if ri == 0:
+                ax.set_title(topologies[ci], fontsize=10)
+            if ri == len(series) - 1:
+                ax.set_xlabel(xlabel)
+            if ci == 0:
+                ax.set_ylabel(f"{label}\nproportion")
+    _suptitle(fig, title, fontsize=10)
+    _legend_below_axes(fig, [matplotlib.lines.Line2D([], [], color=c, linewidth=1.6) for c in _HMM_STATE_COLORS],
+                       ["Null HMM", "Outlier HMM"], ncol=2, fontsize=8)
+    return fig
 _SCATTER_MAX_POINTS = 20000
 
 
@@ -4401,7 +4526,7 @@ def _gt_mean_axis_label(axis, value):
     if axis == "-w":
         return f"w{format_val(value)}"
     if axis in ("x_bin", "fraction_bin"):
-        return f"{'outlier fraction' if axis == 'fraction_bin' else 'admixture' if value in ADMIXTURE_BINS else 'BL'} {value}"
+        return _row_axis_title(axis, value)
     if axis == "branch_length":
         return f"BL {value} CU"
     return str(value)
@@ -4531,7 +4656,7 @@ _SCORE_DIST_METRICS = {
 _TOPOLOGY_SCATTER_METRICS = {f"topology_topology_{s}": s for s in ("all", "means", "variances", "covariances", "fitted_all", "viterbi_variances", "fitted_means",
                                                                     "fitted_variances", "fitted_covariances")}
 
-_DIST_METRICS = {*_TOPOLOGY_SCATTER_METRICS, "window_ecdf", "ecdf_all", "mean_all_vs_bl", "ecdf_hmm", "ecdf_all_hmm", "gap_ecdf", "mean_ecdf", "gap_vs_bl", "mean_vs_bl", *_SCORE_DIST_METRICS}
+_DIST_METRICS = {*_TOPOLOGY_SCATTER_METRICS, "window_ecdf", "ecdf_all", "mean_all_vs_bl", "ecdf_hmm", "ecdf_hmm_all", "ecdf_all_hmm", "gap_ecdf", "mean_ecdf", "gap_vs_bl", "mean_vs_bl", *_SCORE_DIST_METRICS}
 
 
 def _out_transition_totals(parsed):
@@ -4765,7 +4890,7 @@ def _resolve_run_path(path):
     return str(Path(get_out_root()) / path)
 
 
-def _collect_run_df(axes, path, exclude_keywords=(), dir="out", store_root=STORE_ROOT):
+def _collect_run_df(axes, path, exclude_keywords=(), dir="store", store_root=STORE_ROOT):
     """collect_out_runs + _filter_out_runs for one run dir. An axes "phlag"
     entry (a PHLAG_SOURCE_ROOTS key, or a list of them) instead reads `path`
     (relative to a source root, or with one as prefix) under each named root,
@@ -4777,8 +4902,7 @@ def _collect_run_df(axes, path, exclude_keywords=(), dir="out", store_root=STORE
     assert dir in ("out", "store")
     axes = dict(axes)
     sources = axes.pop("phlag", None)
-    if dir == "store":
-        assert sources is None, "axes 'phlag' only applies to dir='out'"
+    if dir == "store" and sources is None:
         df, recorded = collect_store_runs(_path_below_source_root(path), store_root, exclude_keywords)
         if df.empty:
             raise FileNotFoundError(f"No store report found for {path} under {store_root}")

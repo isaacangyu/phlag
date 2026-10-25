@@ -1069,6 +1069,7 @@ class PhlagHMM(HMM):
         num_iters=50,
         verbose=True,
         outer_iter=None,
+        step_callback=None,
     ):
         from dynamax.utils.utils import ensure_array_has_batch_dim
 
@@ -1115,6 +1116,8 @@ class PhlagHMM(HMM):
         for step in range(num_iters):
             params, m_step_state, marginal_loglik = em_step(params, m_step_state)
             log_probs.append(marginal_loglik)
+            if step_callback is not None:
+                step_callback(params)
             finite = params_all_finite(params)
             last_finite_params = jax.tree_util.tree_map(lambda new, old: jnp.where(finite, new, old), params, last_finite_params)
             last_finite_lp = jnp.where(jnp.isfinite(marginal_loglik), marginal_loglik, last_finite_lp)
