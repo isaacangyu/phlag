@@ -237,6 +237,9 @@ _RE_PHLAG_MTIME = re.compile(r'^Phlag source mtime:\s*([\d.eE+]+)\s*$')
 _RE_CLIP_ACTIVATIONS = re.compile(
     r'^Gradient clip activations:\s*(\d+)\s*\(rate:\s*([-\d.eE+]+),\s*unsafe:\s*(True|False)\)\s*$'
 )
+_RE_COV_FLOOR = re.compile(
+    r"^Covariance floor:\s*([-\d.eE+]+)\s*\(dims below floor: Null (\d+), Outlier (\d+) of \d+\)\s*$"
+)
 _RE_BIC = re.compile(
     r'^BIC:\s*([-\d.eE+]+|-?nan|-?inf)\s*\(log-likelihood=([-\d.eE+]+|-?nan|-?inf),\s*'
     r'k=(\d+)\s*trainable params,\s*n=(\d+)\s*windows\)\s*$'
@@ -345,6 +348,7 @@ def parse_report(report_path):
         "caster_source_mtime": None, "phlag_source_mtime": None,
         "bic": None, "log_likelihood": None, "n_trainable_params": None,
         "clip_activation_count": None, "clip_activation_rate": None, "clip_unsafe": None,
+        "cov_floor": None, "cov_floor_dims_null": None, "cov_floor_dims_alt": None,
     }
 
     with open(report_path, "r") as handle:
@@ -474,6 +478,13 @@ def parse_report(report_path):
                 parsed["clip_activation_count"] = int(m.group(1))
                 parsed["clip_activation_rate"] = float(m.group(2))
                 parsed["clip_unsafe"] = (m.group(3) == "True")
+                continue
+
+            m = _RE_COV_FLOOR.match(line)
+            if m:
+                parsed["cov_floor"] = float(m.group(1))
+                parsed["cov_floor_dims_null"] = int(m.group(2))
+                parsed["cov_floor_dims_alt"] = int(m.group(3))
                 continue
 
             m = _RE_FITTED_MEAN.match(line)
@@ -752,6 +763,9 @@ class RunRecord:
     clip_activation_count: Optional[int] = None
     clip_activation_rate: Optional[float] = None
     clip_unsafe: Optional[bool] = None
+    cov_floor: Optional[float] = None
+    cov_floor_dims_null: Optional[int] = None
+    cov_floor_dims_alt: Optional[int] = None
 
 
 @dataclass
@@ -1175,6 +1189,9 @@ class BenchmarkStats:
         record.clip_activation_count = parsed["clip_activation_count"]
         record.clip_activation_rate = parsed["clip_activation_rate"]
         record.clip_unsafe = parsed["clip_unsafe"]
+        record.cov_floor = parsed["cov_floor"]
+        record.cov_floor_dims_null = parsed["cov_floor_dims_null"]
+        record.cov_floor_dims_alt = parsed["cov_floor_dims_alt"]
 
         record.transition_null_to_null = parsed["transition_null_to_null"]
         record.transition_null_to_alt = parsed["transition_null_to_alt"]
@@ -1471,6 +1488,7 @@ class BenchmarkStats:
         "transition_alt_to_null", "transition_alt_to_alt", "transition_total",
         "bic", "log_likelihood", "n_trainable_params",
         "clip_activation_count", "clip_activation_rate", "clip_unsafe",
+        "cov_floor", "cov_floor_dims_null", "cov_floor_dims_alt",
     ] + RELERR_RUN_COLUMNS + [
         "exclusion", "report_path",
     ]
@@ -1575,6 +1593,9 @@ class BenchmarkStats:
             "clip_activation_count": record.clip_activation_count,
             "clip_activation_rate": record.clip_activation_rate,
             "clip_unsafe": record.clip_unsafe,
+            "cov_floor": record.cov_floor,
+            "cov_floor_dims_null": record.cov_floor_dims_null,
+            "cov_floor_dims_alt": record.cov_floor_dims_alt,
             "exclusion": record.exclusion,
             "report_path": record.report_path,
         }
@@ -2325,6 +2346,9 @@ PHLAG_ARG_SPECS = [
     ("n_iters", "-L", False),
     ("emission_lambda", "--lam", False),
     ("double_variance_init", "--double-variance-init", True),
+    ("floor_fix", "--floor-fix", True),
+    ("no_floor", "--no-floor", True),
+    ("null_majority", "--null-majority", "tristate"),
     ("repulsion_optimizer", "--repulsion-optimizer", False),
     ("annealing", "--annealing", True),
     ("lm_damping", "--mu", False),
@@ -2405,7 +2429,10 @@ def _build_forward_args(args, specs):
     tokens = []
     for dest, flag, is_store_true in specs:
         value = getattr(args, dest)
-        if is_store_true == "bool":
+        if is_store_true == "tristate":
+            if value is not None:
+                tokens.append(flag if value else "--no-" + flag.lstrip("-"))
+        elif is_store_true == "bool":
             tokens.append(flag if value else "--no-" + flag.lstrip("-"))
         elif is_store_true:
             if value:
@@ -2552,7 +2579,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
+        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(
@@ -2571,6 +2598,18 @@ def _build_parser():
     phlag_group.add_argument(
         "--double-variance-init", dest="double_variance_init", action="store_true",
         help="Forwarded to phlag's --double-variance-init.",
+    )
+    parser.add_argument(
+        "--floor-fix", dest="floor_fix", action="store_true",
+        help="Forwarded to phlag's --floor-fix.",
+    )
+    parser.add_argument(
+        "--no-floor", dest="no_floor", action="store_true",
+        help="Forwarded to phlag's --no-floor.",
+    )
+    parser.add_argument(
+        "--null-majority", dest="null_majority", action=argparse.BooleanOptionalAction, default=None,
+        help="Forwarded to phlag's --null-majority/--no-null-majority.",
     )
     phlag_group.add_argument(
         "--repulsion-optimizer", dest="repulsion_optimizer", type=str.lower,
@@ -3138,7 +3177,7 @@ ANALYSIS_METRICS = ["accuracy", "tpr", "fpr", "precision", "f1", "roc_auc"] + ["
 ] + [f"pooled_{c}" for c in TOPO_VAR_COV_COLUMNS] + [f"pooled_{c}" for c in TOPO_WITHIN_COLUMNS] + [
     "transition_null_to_null", "transition_null_to_alt",
     "transition_alt_to_null", "transition_alt_to_alt",
-] + ["bic"] + ["clip_activation_count", "clip_activation_rate"]
+] + ["bic"] + ["clip_activation_count", "clip_activation_rate"] + ["cov_floor_dims_null", "cov_floor_dims_alt"]
 
 
 def compute_analysis(runs_path, out_path=None):

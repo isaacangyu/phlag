@@ -1783,7 +1783,11 @@ class CrossRunAnalysis:
                           logx=None, linthresh=None, normalize=False, legend=True, color=None, agg=()):
         if color is not None and runs is not None:
             raise ValueError("window_ecdf: color= needs the pooled form (no run=)")
-        by = [a for a in agg or () if a] or ["-w"]
+        agg = [agg] if isinstance(agg, str) else list(agg or ())
+        overlay_topology = "topology" in agg
+        if overlay_topology and color is not None:
+            raise ValueError("window_ecdf: agg='topology' doesn't support color=")
+        by = [a for a in agg if a and not (overlay_topology and a in ("topology", "state"))] or ["-w"]
         if len(by) > 1 or by[0] not in _POOLED_SCORE_AXES or (by[0] != "-w" and runs is not None):
             raise ValueError(f"window_ecdf: agg is one of {sorted(_POOLED_SCORE_AXES)} (non '-w' only without run=), got {agg}")
         by = by[0]
@@ -1824,14 +1828,15 @@ class CrossRunAnalysis:
                 if not series:
                     continue
                 n_runs = series[0][3] if by == "-w" else sum(s[3] for s in series)
-                figs.append(_window_ecdf_figure(
+                figs.append((_window_ecdf_topology_figure if overlay_topology else _window_ecdf_figure)(
                     series, cols, topologies, "window mean",
                     title or f"GT window-mean ECDFs pooled over all runs by {'window size' if by == '-w' else by}"
                     + (f", w{format_val(w)}" if w is not None else "")
                     + (f", points colored by {_color_label(color)}" if spec is not None else "")
                     + f" (n runs = {n_runs})" + (f" — {pattern}" if pattern is not None else ""),
                     symlog=(not normalize) if logx is None else logx, linthresh=linthresh, normalize=normalize,
-                    legend=legend, color_by=spec, cmap="Greys" if by in _ORDERED_POOLED_AXES else "tab10"))
+                    legend=legend, **({} if overlay_topology else
+                                      dict(color_by=spec, cmap="Greys" if by in _ORDERED_POOLED_AXES else "tab10"))))
         for label, path in runs or ():
             entries, df = self._ecdf_entries(axes, path, exclude_keywords, None)
             by_pattern = {}
@@ -1850,7 +1855,7 @@ class CrossRunAnalysis:
                 if not series:
                     continue
                 rel = "/".join((_path_after_out(path),) + tuple(tail))
-                figs.append(_window_ecdf_figure(series, cols, topologies, "window mean", title or
+                figs.append((_window_ecdf_topology_figure if overlay_topology else _window_ecdf_figure)(series, cols, topologies, "window mean", title or
                                                 f"{label or rel} ({_branch_length_label(df, windows[0][1].parent)}): GT window-mean ECDFs by window size",
                                                 symlog=bool(logx), linthresh=linthresh, normalize=normalize, legend=legend))
         if not figs:
@@ -4203,6 +4208,46 @@ def _window_ecdf_figure(series, cols, topologies, xlabel, title, symlog=False, l
         _add_color_key(fig, axs, norm)
     if not legend:
         _legend_below_axes(fig, handles, [s[0] for s in series], ncol=min(len(series), 10), fontsize=8)
+    return fig
+
+
+def _window_ecdf_topology_figure(series, cols, topologies, xlabel, title, symlog=False, linthresh=None, normalize=False, legend=True,
+                                 state_labels=("Null", "Outlier")):
+    if normalize:
+        series = [(w, *np.split(_minmax_normalize(np.concatenate([null, alt]), normalize), [len(null)]), *rest)
+                  for w, null, alt, *rest in series]
+        xlabel = f"normalized {xlabel}"
+    colors = [plt.cm.tab10(TOPOLOGY_NAMES.index(t) % 10) for t in topologies]
+    fig, axs = plt.subplots(2, len(series), figsize=(3.4 * len(series), 6.5), sharex=True, sharey=True, squeeze=False)
+    pooled = np.concatenate([v[:, cols].ravel() for _, null, alt, *_ in series for v in (null, alt)])
+    pooled = pooled[np.isfinite(pooled)]
+    lo, hi = np.percentile(pooled, [0.5, 99.5] if symlog else [1, 99]) if len(pooled) else (0, 0)
+    handles = [matplotlib.lines.Line2D([], [], color=c, linewidth=1.6) for c in colors]
+    for si, (w, null, alt, *_) in enumerate(series):
+        for state, vals in enumerate((null, alt)):
+            ax = axs[state][si]
+            entries = []
+            for topo, col, color, handle in zip(topologies, cols, colors, handles):
+                mean, _ = _draw_ecdf(ax, vals[:, col], color=color, linewidth=1.3)
+                if mean is not None:
+                    entries.append((handle, f"{topo}: μ={mean:.3g}"))
+            if symlog:
+                ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                ax.tick_params(axis="x", labelsize=6)
+            if hi > lo:
+                ax.set_xlim(lo, hi)
+            ax.set_ylim(0, 1)
+            ax.grid(alpha=0.25)
+            ax.set_title(f"{w} ({state_labels[state]})", fontsize=9)
+            if state == 1:
+                ax.set_xlabel(xlabel)
+            if si == 0:
+                ax.set_ylabel("proportion")
+            if legend and entries:
+                ax.legend(*zip(*entries), fontsize=6, loc="best")
+    _suptitle(fig, title, fontsize=10)
+    if not legend:
+        _legend_below_axes(fig, handles, list(topologies), ncol=len(topologies), fontsize=8)
     return fig
 
 

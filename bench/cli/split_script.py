@@ -1,5 +1,7 @@
 import argparse
 import collections
+import contextlib
+import io
 import itertools
 import pathlib
 import re
@@ -79,11 +81,34 @@ def group_tokens(tokens, parser):
         elif tok.startswith("-") and (tok in options or (eq and flag in options)):
             name = flag if eq else tok
             groups.append([name, options[name], [value] if eq else []])
+        elif tok.startswith("-") and not _is_number(tok) and not (groups and groups[-1][1] is None):
+            raise SystemExit(f"unrecognized flag {tok}")
         elif groups:
             groups[-1][2].append(tok)
         else:
             positionals.append(tok)
     return positionals, groups
+
+
+def _is_number(tok):
+    try:
+        float(tok)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_argv(argv):
+    parser = get_parser(argv[0])
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            ns = parser.parse_args(argv[1:])
+    except SystemExit:
+        return err.getvalue().strip().splitlines()[-1].split(": error: ", 1)[-1]
+    if hasattr(ns, "rho") and (ns.rho is None) != (ns.beta is None and getattr(ns, "beta_prime", None) is None):
+        return "--rho and --beta/--beta-prime must both be set, or both omitted"
+    return None
 
 
 def _parse_range(raw, type_fn):
@@ -303,10 +328,23 @@ def plan(script, budget=None):
     if budget is None:
         from bench.cli.benchmark import TOTAL_CORE_BUDGET
         budget = TOTAL_CORE_BUDGET
-    lines, runs = [], []
+    lines, runs, errors = [], [], []
     for i, tokens in enumerate(read_commands(script), 1):
         lines.append(shlex.join(tokens))
-        runs += [(i, f"{i:02d}-{name}", argv) for name, argv in split_command(tokens)]
+        try:
+            split = split_command(tokens)
+        except (SystemExit, ValueError, argparse.ArgumentTypeError) as e:
+            errors.append(f"line {i}: {str(e).removeprefix('split_script: ')}\n    {lines[-1]}")
+            continue
+        bad = {}
+        for name, argv in split:
+            msg = validate_argv(argv)
+            if msg:
+                bad.setdefault(msg, []).append(name)
+        errors += [f"line {i}: {msg} ({len(names)} run(s), e.g. {names[0]})\n    {lines[-1]}" for msg, names in bad.items()]
+        runs += [(i, f"{i:02d}-{name}", argv) for name, argv in split]
+    if errors:
+        raise SystemExit(f"split_script: {script} has bad commands, nothing run:\n  " + "\n  ".join(errors))
     if not runs:
         raise SystemExit(f"split_script: no commands in {script}")
     check_duplicates(runs)

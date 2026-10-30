@@ -1,6 +1,7 @@
 import math
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 import jax.random as jr
 import tensorflow_probability.substrates.jax.bijectors as tfb
@@ -462,11 +463,17 @@ class ParamsGaussianHMMEmissions(NamedTuple):
     covariances: Union[Float[Array, "num_states emission_dim emission_dim"], ParameterProperties]
 
 
+COV_FLOOR = 1e-5
+COV_FLOOR_FIX = 1e-7
+
+
 class EmissionParam(Enum):
     FREE = "free"
     REPULSION = "repulsion"
     NULL_ALT_ZERO = "null-alt-zero"
     NULL_ALT_EQUAL = "null-alt-equal"
+    NULL_ALT_EQUAL_NUM = "null-alt-equal-num"
+    NULL_ALT_NUM = "null-alt-num"
     SNR = "snr"
     BL_ANCHOR = "bl-anchor"
 
@@ -487,8 +494,12 @@ class PhlagHMMEmissions(HMMEmissions):
         sigma_min: float = 1e-2,
         anchor_dims: Tuple[int, ...] = (),
         anchor_value: float = 0.0,
+        cov_floor: float = COV_FLOOR,
+        no_floor: bool = False,
     ):
         self.num_states = num_states
+        self.cov_floor = cov_floor
+        self.end_floor = 0.0 if no_floor else cov_floor
         self.emission_dim = emission_dim
         self.penalty_lambda = penalty_lambda
         self.anchor_dims = tuple(anchor_dims)
@@ -639,12 +650,9 @@ class PhlagHMMEmissions(HMMEmissions):
         mu0 = xbar
         L0 = jnp.linalg.cholesky(Sigma_target + eps * jnp.eye(d))
         flat0, unravel = ravel_pytree((mu0, L0))
-        dim = flat0.shape[0]
 
         def flat_obj(flat):
             return neg_objective(unravel(flat))
-
-        grad_flat = jax.grad(flat_obj)
 
         sigma_min = self.sigma_min
 
@@ -659,7 +667,20 @@ class PhlagHMMEmissions(HMMEmissions):
             Sigma_clamped = (eigvecs * eigvals) @ eigvecs.T
             return jnp.linalg.cholesky(Sigma_clamped)
 
-        if self.repulsion_optimizer == "gd":
+        def project(flat):
+            mu_i, L_i = unravel(flat)
+            return ravel_pytree((mu_i, clamp_L(L_i)))[0]
+
+        flat_final, clip_count, clip_attempts = self._minimize(flat_obj, flat0, project, self.repulsion_optimizer)
+        mu, L = unravel(flat_final)
+
+        Sigma = L @ L.T + eps * jnp.eye(d)
+        return mu, Sigma, clip_count, clip_attempts
+
+    def _minimize(self, flat_obj, flat0, project, optimizer):
+        grad_flat = jax.grad(flat_obj)
+        dim = flat0.shape[0]
+        if optimizer == "gd":
             # Plain fixed-step gradient descent -- a genuinely separate route
             # rather than a limiting case of the LM step below: damping=0
             # there is an undamped Newton step (uses the full Hessian), and
@@ -671,8 +692,7 @@ class PhlagHMMEmissions(HMMEmissions):
             gd_lr = 0.05
 
             def gd_step(_, flat):
-                mu_i, L_i = unravel(flat)
-                flat = ravel_pytree((mu_i, clamp_L(L_i)))[0]
+                flat = project(flat)
                 g = grad_flat(flat)
                 return flat - gd_lr * g
 
@@ -736,9 +756,7 @@ class PhlagHMMEmissions(HMMEmissions):
                 )
                 damping_next = jnp.maximum(damping_f * 0.5, 1e-7)
 
-                mu_new, L_new = unravel(flat_f)
-                L_new = clamp_L(L_new)
-                flat_clamped, _ = ravel_pytree((mu_new, L_new))
+                flat_clamped = project(flat_f)
                 # n_tries_f counts only the while_loop's retries -- +1 accounts
                 # for the initial lm_try that seeded its carry before any
                 # retry ran, so every step contributes at least one attempt.
@@ -750,10 +768,46 @@ class PhlagHMMEmissions(HMMEmissions):
                 0, 100, step,
                 (flat0, damping0, jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32)),
             ) # why fixed at 100?
+        return flat_final, clip_count, clip_attempts
 
-        mu, L = unravel(flat_final)
+    def _expand_null_alt_equal(self, mu_r, c_r):
+        a, b = self.anchor_dims
+        i = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
+        mu = jnp.zeros(self.emission_dim).at[a].set(mu_r[0]).at[b].set(mu_r[0]).at[i].set(mu_r[1])
+        Sigma = (jnp.zeros((self.emission_dim, self.emission_dim))
+                 .at[a, a].set(c_r[0]).at[b, b].set(c_r[0])
+                 .at[a, b].set(c_r[1]).at[b, a].set(c_r[1])
+                 .at[a, i].set(c_r[2]).at[i, a].set(c_r[2]).at[b, i].set(c_r[2]).at[i, b].set(c_r[2])
+                 .at[i, i].set(c_r[3]))
+        return mu, Sigma
 
-        Sigma = L @ L.T + eps * jnp.eye(d)
+    def _reduce_null_alt_equal(self, mu, Sigma):
+        a, b = self.anchor_dims
+        i = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
+        mu_r = jnp.array([(mu[a] + mu[b]) / 2, mu[i]])
+        c_r = jnp.array([(Sigma[a, a] + Sigma[b, b]) / 2, (Sigma[a, b] + Sigma[b, a]) / 2,
+                         (Sigma[a, i] + Sigma[i, a] + Sigma[b, i] + Sigma[i, b]) / 4, Sigma[i, i]])
+        return mu_r, c_r
+
+    def map_estimate_null_alt_equal(self, mu_init, Sigma_init, n, xbar, Sxx):
+        Sxx_bar = Sxx / (n + 1e-12)
+        flat0, unravel = ravel_pytree(self._reduce_null_alt_equal(mu_init, Sigma_init))
+
+        def flat_obj(flat):
+            mu, Sigma = self._expand_null_alt_equal(*unravel(flat))
+            L = jnp.linalg.cholesky(Sigma)
+            scatter = Sxx_bar - jnp.outer(xbar, mu) - jnp.outer(mu, xbar) + jnp.outer(mu, mu)
+            logdet = 2 * jnp.sum(jnp.log(jnp.diag(L)))
+            return 0.5 * (logdet + jnp.trace(jax.scipy.linalg.cho_solve((L, True), scatter)))
+
+        def project(flat):
+            mu, Sigma = self._expand_null_alt_equal(*unravel(flat))
+            eigvals, eigvecs = jnp.linalg.eigh(Sigma)
+            Sigma = (eigvecs * jnp.clip(eigvals, a_min=self.cov_floor)) @ eigvecs.T
+            return ravel_pytree(self._reduce_null_alt_equal(mu, Sigma))[0]
+
+        flat_final, clip_count, clip_attempts = self._minimize(flat_obj, project(flat0), project, "lm")
+        mu, Sigma = self._expand_null_alt_equal(*unravel(flat_final))
         return mu, Sigma, clip_count, clip_attempts
 
     def m_step(self, params, props, batch_stats, m_step_state):
@@ -787,8 +841,23 @@ class PhlagHMMEmissions(HMMEmissions):
                 Sxx_s = sum_xxT[s]
                 mode = EmissionParam(self.parameterization[s])
 
-                if mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ZERO, EmissionParam.NULL_ALT_EQUAL,
-                            EmissionParam.SNR, EmissionParam.BL_ANCHOR):
+                if mode is EmissionParam.NULL_ALT_NUM:
+                    a, b = self.anchor_dims
+                    i = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
+                    out_shape = (jax.ShapeDtypeStruct(old_means[s].shape, jnp.float32),
+                                 jax.ShapeDtypeStruct(old_covariances[s].shape, jnp.float32))
+                    mu_s, Sigma_s = jax.pure_callback(
+                        partial(slsqp_null_alt_equal, a=a, b=b, i=i, jitter=self.end_floor), out_shape,
+                        old_means[s], old_covariances[s], xbar_s, Sxx_s / (n_s + 1e-12), n_s,
+                    )
+                elif mode is EmissionParam.NULL_ALT_EQUAL_NUM:
+                    mu_s, Sigma_s, clip_count_s, clip_attempts_s = self.map_estimate_null_alt_equal(
+                        old_means[s], old_covariances[s], n_s, xbar_s, Sxx_s,
+                    )
+                    clip_count = clip_count + clip_count_s
+                    clip_attempts = clip_attempts + clip_attempts_s
+                elif mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ZERO, EmissionParam.NULL_ALT_EQUAL,
+                              EmissionParam.SNR, EmissionParam.BL_ANCHOR):
                     mu_s = xbar_s
                     if mode in (EmissionParam.NULL_ALT_ZERO, EmissionParam.BL_ANCHOR):
                         free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
@@ -803,7 +872,7 @@ class PhlagHMMEmissions(HMMEmissions):
                         anchor = jnp.array(self.anchor_dims)
                         mu_s = xbar_s.at[anchor].set(jnp.mean(xbar_s[anchor]))
                     Sigma_s = (Sxx_s / (n_s + 1e-12) - jnp.outer(xbar_s, mu_s) - jnp.outer(mu_s, xbar_s)
-                               + jnp.outer(mu_s, mu_s) + 1e-5 * jnp.eye(self.emission_dim))
+                               + jnp.outer(mu_s, mu_s) + self.end_floor * jnp.eye(self.emission_dim))
                     if mode is EmissionParam.NULL_ALT_EQUAL:
                         Sigma_s = swap_symmetrize(Sigma_s, self.anchor_dims)
                 elif mode is EmissionParam.REPULSION:
@@ -858,6 +927,76 @@ class PhlagHMMEmissions(HMMEmissions):
                 total_distance += dist
                 num_pairs += 1
         return total_distance / num_pairs
+
+
+def slsqp_null_alt_equal(mu0, Sigma0, xbar, Sxx_bar, n, a, b, i, eps=1e-9, jitter=COV_FLOOR):
+    from scipy.optimize import minimize
+    mu0, Sigma0, xbar, Sxx_bar = (np.asarray(v, dtype=np.float64) for v in (mu0, Sigma0, xbar, Sxx_bar))
+    d = mu0.shape[0]
+    if not (float(n) > 1e-8 and np.all(np.isfinite(Sxx_bar)) and np.all(np.isfinite(xbar))):
+        return mu0.astype(np.float32), Sigma0.astype(np.float32)
+    tril = np.tril_indices(d)
+    scatter_xbar = Sxx_bar - np.outer(xbar, xbar)
+
+    def unpack(x):
+        L = np.zeros((d, d))
+        L[tril] = x[d:]
+        return x[:d], L
+
+    def sigma(L):
+        return L @ L.T + eps * np.eye(d)
+
+    def obj(x):
+        mu, L = unpack(x)
+        S = sigma(L)
+        diff = xbar - mu
+        scatter = scatter_xbar + np.outer(diff, diff)
+        Sinv = np.linalg.inv(S)
+        f = 0.5 * (np.linalg.slogdet(S)[1] + np.trace(Sinv @ scatter))
+        G = 0.5 * (Sinv - Sinv @ scatter @ Sinv)
+        return f, np.concatenate([-Sinv @ diff, (2 * G @ L)[tril]])
+
+    def dsigma(L, j, k):
+        M = np.zeros((d, d))
+        M[j] += L[k]
+        M[k] += L[j]
+        return M[tril]
+
+    def e_mu(j):
+        return np.eye(d)[j]
+
+    def eq_fun(x):
+        mu, L = unpack(x)
+        S = sigma(L)
+        return np.array([mu[a] - mu[b], S[a, a] - S[b, b], S[a, i] - S[b, i]])
+
+    def eq_jac(x):
+        _, L = unpack(x)
+        z_mu, z_L = np.zeros(d), np.zeros(len(tril[0]))
+        return np.array([
+            np.concatenate([e_mu(a) - e_mu(b), z_L]),
+            np.concatenate([z_mu, dsigma(L, a, a) - dsigma(L, b, b)]),
+            np.concatenate([z_mu, dsigma(L, a, i) - dsigma(L, b, i)]),
+        ])
+
+    def ineq_fun(x):
+        return np.array([x[i] - x[a]])
+
+    def ineq_jac(x):
+        return np.concatenate([e_mu(i) - e_mu(a), np.zeros(len(tril[0]))])[None]
+
+    w, V = np.linalg.eigh(0.5 * (Sigma0 + Sigma0.T))
+    L0 = np.linalg.cholesky((V * np.clip(w - jitter, 1e-10, None)) @ V.T)
+    x0 = np.concatenate([mu0, L0[tril]])
+    res = minimize(
+        obj, x0, jac=True, method="SLSQP",
+        constraints=[{"type": "eq", "fun": eq_fun, "jac": eq_jac},
+                     {"type": "ineq", "fun": ineq_fun, "jac": ineq_jac}],
+        options={"maxiter": 200, "ftol": 1e-10},
+    )
+    x = res.x if np.all(np.isfinite(res.x)) else x0
+    mu, L = unpack(x)
+    return mu.astype(np.float32), (sigma(L) + jitter * np.eye(d)).astype(np.float32)
 
 
 def swap_symmetrize(cov, dims):
@@ -938,6 +1077,8 @@ class PhlagHMM(HMM):
                 sigma_min=kwargs.get("sigma_min", 1e-2),
                 anchor_dims=kwargs.get("anchor_dims", ()),
                 anchor_value=kwargs.get("anchor_value", 0.0),
+                cov_floor=kwargs.get("cov_floor", COV_FLOOR),
+                no_floor=kwargs.get("no_floor", False),
             )
         super().__init__(
             num_states=self.num_states,

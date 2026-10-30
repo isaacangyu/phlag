@@ -175,7 +175,7 @@ def build_parser(input_file=True):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -206,6 +206,25 @@ def build_parser(input_file=True):
         dest="double_variance_init",
         action="store_true",
         help="Forwarded to phlag's --double-variance-init.",
+    )
+    parser.add_argument(
+        "--floor-fix",
+        dest="floor_fix",
+        action="store_true",
+        help="Forwarded to phlag's --floor-fix.",
+    )
+    parser.add_argument(
+        "--no-floor",
+        dest="no_floor",
+        action="store_true",
+        help="Forwarded to phlag's --no-floor.",
+    )
+    parser.add_argument(
+        "--null-majority",
+        dest="null_majority",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Forwarded to phlag's --null-majority/--no-null-majority.",
     )
     parser.add_argument(
         "--repulsion-optimizer",
@@ -396,6 +415,12 @@ def main(argv=None):
         phlag_extra_args += ["--lam", str(args.emission_lambda)]
     if args.double_variance_init:
         phlag_extra_args += ["--double-variance-init"]
+    if args.floor_fix:
+        phlag_extra_args += ["--floor-fix"]
+    if args.no_floor:
+        phlag_extra_args += ["--no-floor"]
+    if args.null_majority is not None:
+        phlag_extra_args += ["--null-majority" if args.null_majority else "--no-null-majority"]
     if args.repulsion_optimizer is not None:
         phlag_extra_args += ["--repulsion-optimizer", args.repulsion_optimizer]
     if args.annealing:

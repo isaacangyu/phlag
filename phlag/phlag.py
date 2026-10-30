@@ -908,8 +908,10 @@ class Phlag:
             metrics_str = "N/A (Viterbi decoding failed -- no valid path found)"
         elif self.has_ground_truth:
             y_pred = np.array(paths[0])
-            # Null = anchored state 0 under a constrained --np, else the Viterbi-majority state
-            if (not self.anchor_dims or self.args.null_emission_parameterization == "null-alt-equal-swap") and np.sum(y_pred == 1) > np.sum(y_pred == 0):
+            null_majority = self.args.null_majority
+            if null_majority is None:
+                null_majority = utils.null_majority_default(self.null_np)
+            if null_majority and np.sum(y_pred == 1) > np.sum(y_pred == 0):
                 y_pred = 1 - y_pred
                 flipped_for_eval = True
             self.flipped_for_eval = flipped_for_eval
@@ -1083,7 +1085,7 @@ class Phlag:
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         if getattr(self, "anchor_dims", ()):
-            k_params -= {"snr": 1, "null-alt-equal": 4}.get(self.null_np, len(self.anchor_dims))
+            k_params -= {"snr": 1, "null-alt-equal": 4, "null-alt-equal-num": 4, "null-alt-num": 4}.get(self.null_np, len(self.anchor_dims))
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1097,6 +1099,13 @@ class Phlag:
                 f"Gradient clip activations: {self.clip_activation_count} "
                 f"(rate: {format_number(clip_rate)}, unsafe: {clip_unsafe})"
             )
+        if self.args.model_design == "gaussian" and "repulsion" not in self.emission_parameterization:
+            covs = np.asarray(self.params.emissions.covariances)
+            end_floor = 0.0 if self.args.no_floor else self.cov_floor
+            below = [int(np.sum(np.diagonal(covs[s]) - end_floor < self.cov_floor))
+                     for s in ((1, 0) if flipped_for_eval else (0, 1))]
+            headers.append(f"Covariance floor: {end_floor:g} (dims below floor: Null {below[0]}, "
+                           f"Outlier {below[1]} of {covs.shape[-1]})")
 
         headers.append(f"{metrics_str}")
         relerr_rows = []
@@ -1407,7 +1416,7 @@ class Phlag:
             self.beta_1 = self.beta
             self.psi = jnp.array([[self.alpha_0, self.beta_0], [self.beta_1, self.alpha_1]]) + PSI_EPS
 
-        self.null_np = "null-alt-equal" if self.args.null_emission_parameterization == "null-alt-equal-swap" else self.args.null_emission_parameterization
+        self.null_np = self.args.null_emission_parameterization
         self.emission_parameterization = (
             self.null_np,
             self.args.alt_emission_parameterization,
@@ -1415,7 +1424,8 @@ class Phlag:
 
         self.anchor_dims = ()
         self.anchor_value = 0.0
-        if self.null_np in ("null-alt-zero", "null-alt-equal", "snr", "bl-anchor"):
+        self.cov_floor = hmm.COV_FLOOR_FIX if self.args.floor_fix else hmm.COV_FLOOR
+        if self.null_np in utils.ANCHORED_NP:
             if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
                 raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
             self.anchor_dims = (0, 1)
@@ -1445,6 +1455,8 @@ class Phlag:
             increment_steps=self.args.increment_steps,
             anchor_dims=self.anchor_dims,
             anchor_value=self.anchor_value,
+            cov_floor=self.cov_floor,
+            no_floor=self.args.no_floor,
         )
         if self.args.model_design == "gmm":
             self.hmm.emission_component.mixture_masks = self.mixture_masks
@@ -1455,7 +1467,7 @@ class Phlag:
         data_var = jnp.diag(data_cov)
         null_mean = data_mean
         null_cov = data_cov
-        if self.anchor_dims and self.null_np == "null-alt-equal":
+        if self.anchor_dims and self.null_np in ("null-alt-equal", "null-alt-equal-num", "null-alt-num"):
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(jnp.mean(data_mean[jnp.array(self.anchor_dims)]))
             null_cov = hmm.swap_symmetrize(data_cov, self.anchor_dims)
         elif self.anchor_dims and self.null_np == "snr":
@@ -2410,14 +2422,16 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-swap", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
         help="""Parameterization of the null (background) state's emission distribution
                     (default: free): free (unconstrained MLE), repulsion (pushed away
                     from the alt state's currently fitted distribution),
                     null-alt-zero (free, but the alternative topologies' (ABBA, BABA)
                     means fixed at 0), null-alt-equal (ABBA and BABA share one mean,
-                    one variance and one covariance with AABB), null-alt-equal-swap (null-alt-equal,
-                    but evaluation relabels the Viterbi-majority state as Null like free), snr (ABBA and BABA means tied to their average,
+                    one variance and one covariance with AABB; closed-form M-step), null-alt-equal-num (null-alt-equal
+                    fit by LM over the 2 mean + 4 covariance parameters), null-alt-num (null-alt-equal fit by
+                    scipy SLSQP over the full mean + Cholesky factor, ties as equality constraints and
+                    null AABB mean >= null ABBA/BABA mean as an inequality), snr (ABBA and BABA means tied to their average,
                     capped each EM iteration at the null state's AABB mean / AABB variance),
                     or bl-anchor (like null-alt-zero, but fixed at exp(-t)/3, t = the
                     clade's branch length in coalescent units; admixture uses the
@@ -2439,6 +2453,25 @@ def build_parser():
         type=float,
         default=1.0,
         help="Emission penalty regularizer parameter lambda (default: 1.0)",
+    )
+    hmm_group.add_argument(
+        "--null-majority",
+        dest="null_majority",
+        action=argparse.BooleanOptionalAction,
+        help="Evaluate with the Viterbi-majority state as Null instead of state 0 "
+             "(default: on for free/repulsion --np, off for anchored --np).",
+    )
+    hmm_group.add_argument(
+        "--floor-fix",
+        dest="floor_fix",
+        action="store_true",
+        help="Gaussian M-step covariance floor 1e-7 instead of 1e-5.",
+    )
+    hmm_group.add_argument(
+        "--no-floor",
+        dest="no_floor",
+        action="store_true",
+        help="Don't add the covariance floor to the Gaussian M-step result (closed form, null-alt-num).",
     )
     hmm_group.add_argument(
         "--double-variance-init",
@@ -2877,7 +2910,7 @@ def parse_arguments(argv=None):
     return args
 
 
-EM_ARG_DESTS = ("model_design", *PHLAG_SEGMENT_DEFAULTS, "rho", "beta", "beta_prime")
+EM_ARG_DESTS = ("model_design", *(d for d in PHLAG_SEGMENT_DEFAULTS if d != "null_majority"), "rho", "beta", "beta_prime")
 
 
 def em_args_signature(args):
@@ -2905,7 +2938,9 @@ def fit_matches_args(fit_path, args):
     if not fit_path.exists():
         return False
     with open(fit_path, "rb") as f:
-        return pickle.load(f).get("em_args") == em_args_signature(args)
+        stored = pickle.load(f).get("em_args") or {}
+    want = em_args_signature(args)
+    return {**{k: PHLAG_SEGMENT_DEFAULTS.get(k) for k in want if k not in stored}, **stored} == want
 
 
 def report_line(report, key):

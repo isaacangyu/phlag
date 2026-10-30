@@ -6,7 +6,6 @@ import pathlib
 import pwd
 import resource
 import signal
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -166,9 +165,11 @@ def main(argv=None):
         env = {**os.environ, "PHLAG_JOBSERVER": str(jobserver), "PHLAG_PROGRESS_FILE": str(progress_dir / name)}
         try:
             with open(log_path, "w") as log:
-                code = subprocess.run(cmd, shell=True, executable="/bin/bash", stdout=log,
-                                      stderr=subprocess.STDOUT, env=env,
-                                      preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, CAUGHT)).returncode
+                pid = os.posix_spawn("/bin/bash", ["/bin/bash", "-c", cmd], env,
+                                     file_actions=[(os.POSIX_SPAWN_DUP2, log.fileno(), 1),
+                                                   (os.POSIX_SPAWN_DUP2, log.fileno(), 2)],
+                                     setsigmask=(), setsigdef=(signal.SIGPIPE, signal.SIGXFSZ))
+                code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
         finally:
             if tokens:
                 os.write(jobserver_fd, b"+" * tokens)

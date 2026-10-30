@@ -561,7 +561,7 @@ def get_short_sim_name(sim_name):
 
 _NODE_NAME_PATH_MODIFIERS = {
     "site", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
-    "var2x", "repulsion", "annealing",
+    "var2x", "repulsion", "annealing", "floor-fix", "no-floor", "null-majority", "no-null-majority",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
 _NODE_NAME_RHO_BETA_RE = re.compile(r'^rho[-\d.eE+]+_beta(prime)?[-\d.eE+]+$')
@@ -764,10 +764,13 @@ SIM_CATEGORY_PAIRS = {
 
 PHLAG_SEGMENT_DEFAULTS = {
     "double_variance_init": False,
+    "floor_fix": False,
+    "no_floor": False,
     "alt_emission_parameterization": "free",
     "annealing": False,
     "emission_lambda": 1.0,
     "null_emission_parameterization": "free",
+    "null_majority": None,
     "n_iters": 10,
     "repulsion_optimizer": "lm",
     "lm_damping": 1.0,
@@ -779,13 +782,21 @@ PHLAG_SEGMENT_DEFAULTS = {
     "prior_init_probs": False,
 }
 PHLAG_SEGMENT_BARE_VALUES = {"correct_transition": "auto"}
+ANCHORED_NP = ("null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor")
+
+
+def null_majority_default(null_np):
+    return null_np not in ANCHORED_NP
 _NAMED_SEGMENTS = {
     "var2x": ("double_variance_init", True),
     "repulsion": ("alt_emission_parameterization", "repulsion"),
     "annealing": ("annealing", True),
+    "null-majority": ("null_majority", True),
+    "no-null-majority": ("null_majority", False),
     "null-alt-zero": ("null_emission_parameterization", "null-alt-zero"),
     "null-alt-equal": ("null_emission_parameterization", "null-alt-equal"),
-    "null-alt-equal-swap": ("null_emission_parameterization", "null-alt-equal-swap"),
+    "null-alt-equal-num": ("null_emission_parameterization", "null-alt-equal-num"),
+    "null-alt-num": ("null_emission_parameterization", "null-alt-num"),
     "snr": ("null_emission_parameterization", "snr"),
     "bl-anchor": ("null_emission_parameterization", "bl-anchor"),
 }
@@ -826,6 +837,8 @@ def get_phlag_param_segments(args):
         segments.append(f"rho{float(rho)}_betaprime{float(beta_prime)}")
     for dest, default in PHLAG_SEGMENT_DEFAULTS.items():
         value = phlag_segment_value(args, dest)
+        if dest == "null_majority" and value == null_majority_default(phlag_segment_value(args, "null_emission_parameterization")):
+            continue
         if value != default:
             segments.append(phlag_param_segment(dest, value))
     return segments
