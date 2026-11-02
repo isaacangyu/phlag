@@ -3,7 +3,7 @@ import pathlib
 import argparse
 
 from phlag.caster import int_or_abbrev, step_size_or_fraction
-from phlag.utils import PHLAG_PLOT_CHOICES, is_phlag_plot
+from phlag.utils import PHLAG_PLOT_CHOICES, is_phlag_plot, TopologiesAction, TOPOLOGIES_HELP
 
 CASTER_PLOTS = ["scatter", "dist", "correlation", "topology_pairs", "quartet_counts", "sums", "ecdf", "qq", "qq-gaussian", "qq-exp", "qq-dexp"]
 PHLAG_PLOTS = PHLAG_PLOT_CHOICES + ["em_iters_<N>"]
@@ -78,6 +78,8 @@ def build_parser(input_file=True):
         action="store_true",
         help="Forwarded to caster's --exp-minus.",
     )
+    from phlag.caster import add_signal_args
+    add_signal_args(parser)
     parser.add_argument(
         "--shift-caster",
         dest="shift_caster",
@@ -175,7 +177,7 @@ def build_parser(input_file=True):
         dest="null_emission_parameterization",
         type=str.lower,
         default=None,
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "bl-anchor"],
         help="Forwarded to phlag's --np (default: whatever phlag's own default is).",
     )
     parser.add_argument(
@@ -292,6 +294,14 @@ def build_parser(input_file=True):
         help="Forwarded to phlag's --correct-transition.",
     )
     parser.add_argument(
+        "--topologies",
+        dest="topologies",
+        nargs="+",
+        action=TopologiesAction,
+        default=None,
+        help=f"Forwarded to phlag's --topologies. {TOPOLOGIES_HELP}",
+    )
+    parser.add_argument(
         "--rho",
         dest="rho",
         type=float,
@@ -371,6 +381,8 @@ def main(argv=None):
         caster_extra_args += ["-i"]
     if args.exp_minus:
         caster_extra_args += ["--exp-minus"]
+    if args.signal:
+        caster_extra_args += ["--signal", args.signal]
     if args.chunk_size is not None:
         caster_extra_args += ["--chunk", str(args.chunk_size)]
     if args.chunk_scores is not None:
@@ -439,6 +451,8 @@ def main(argv=None):
         phlag_extra_args += ["--dirichlet-mean"]
     if args.prior_init_probs:
         phlag_extra_args += ["--prior-init-probs"]
+    if args.topologies is not None:
+        phlag_extra_args += ["--topologies", args.topologies]
     if args.rho is not None:
         phlag_extra_args += ["--rho"] + [str(v) for v in args.rho]
     if args.beta is not None:

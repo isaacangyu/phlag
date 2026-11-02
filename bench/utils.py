@@ -47,7 +47,7 @@ from bench.cli.benchmark import (
     parse_report,
     transition_total,
 )
-from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path
+from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path, signal_of_path
 from phlag.utils import (
     ADMIXTURE_DIVERGENCE_THRESHOLD_MYR,
     ECDF_MAX_POINTS,
@@ -185,6 +185,17 @@ _DYNAMIC_ROW_AXES = {
     "category", "subcategory", "merged_category", "em_hd_bin", "em_gt_hd_bin", "pattern",
     "anomaly_fraction", "outlier_pct",
 }
+
+_DERIVED_COLUMNS = {
+    f"{p}_var_alt": (f"{p}_var_ABBA", f"{p}_var_BABA") for p in ("null", "alt", "pooled")
+}
+
+
+def _add_derived_columns(df):
+    for col, sources in _DERIVED_COLUMNS.items():
+        if all(c in df.columns for c in sources):
+            df[col] = df[list(sources)].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    return df
 
 
 NOMINAL_GENOME_SITES = 6_000_000
@@ -339,6 +350,9 @@ _FLAG_TO_DEST = {
     for option_string, action in _PARSER._option_string_actions.items()
     if action.dest in _MIRRORED_DESTS
 }
+for _option_string in [s for s in _FLAG_TO_DEST if s.startswith("--")]:
+    _FLAG_TO_DEST.setdefault(_option_string[2:], _FLAG_TO_DEST[_option_string])
+    _PARSER._option_string_actions.setdefault(_option_string[2:], _PARSER._option_string_actions[_option_string])
 # dest -> its long ("--...") option string, so a short-form token (e.g. "-w")
 # and its long form (e.g. "--window-size") both resolve to the same canonical
 # name -- used to always display/store a flag's long form (see
@@ -606,7 +620,7 @@ class CrossRunAnalysis:
         once, over the whole dataset) -- so this returns those edges'
         labels directly instead of rescanning disk; raises if
         compute_hd_bin_edges hasn't been called yet."""
-        if col in ("em_hd_bin", "em_gt_hd_bin"):
+        if col in ("em_hd_bin", "em_gt_hd_bin") or col in self._bin_specs:
             if col not in self._bin_specs:
                 raise RuntimeError(f"{col!r} needs cra.compute_hd_bin_edges() called first")
             return [label for label, _, _ in self._bin_specs[col][1]]
@@ -643,7 +657,7 @@ class CrossRunAnalysis:
             p = run_dir / "runs.tsv"
             if not p.exists():
                 continue
-            df = pd.read_csv(p, sep="\t")
+            df = _add_derived_columns(pd.read_csv(p, sep="\t"))
             if col in df.columns:
                 values.extend(df[col].dropna().tolist())
         return values
@@ -666,6 +680,13 @@ class CrossRunAnalysis:
         for col, bin_col in (("em_hd", "em_hd_bin"), ("em_gt_hd", "em_gt_hd_bin")):
             values = self._discover_numeric_column(col, exclude_keywords)
             self._bin_specs[bin_col] = (col, _compute_hd_bin_edges(values))
+
+    def add_bin_axis(self, col, n_bins=HD_NUM_BINS, exclude_keywords=()):
+        bin_col = f"{col}_bin"
+        values = pd.to_numeric(pd.Series(self._discover_numeric_column(col, exclude_keywords)), errors="coerce")
+        self._bin_specs[bin_col] = (col, _quantile_bin_edges(values.dropna().to_numpy(), n_bins))
+        _DYNAMIC_ROW_AXES.add(bin_col)
+        return bin_col
 
     def resolve_configs(self, flags_specs, labels=None, exclude_keywords=()):
         """flags_specs: list of {cli_flag: value} dicts, one per config, e.g.
@@ -1473,7 +1494,7 @@ class CrossRunAnalysis:
             windows = axes.get("-w", axes.get("--window-size"))
             if windows is None:
                 raise ValueError("ecdf needs a '-w' axis")
-            variants = {d: bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
+            variants = {d: dests.get(d) if d == "signal" else bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
             is_node = len(rel.parts) == 3
             node_rel = rel if is_node else rel.parent
             entries = []
@@ -1865,7 +1886,7 @@ class CrossRunAnalysis:
 
     def _plot_topology_scatter(self, axes, runs=None, exclude_keywords=(), title="", topologies=TOPOLOGY_NAMES, pattern=None,
                                logx=None, linthresh=None, normalize=False, legend=True, state=None, topology=None, stat="all",
-                               color=None, corr="spearman", percentile=None, agg=()):
+                               color=None, corr="spearman", percentile=None, agg=(), transpose=False):
         agg = [agg] if isinstance(agg, str) else [a for a in agg or () if a]
         flags = [a for a in agg if not (isinstance(a, str) and a in _POOLED_SCORE_AXES)]
         by = [a for a in agg if a not in flags] or ["-w"]
@@ -1905,8 +1926,8 @@ class CrossRunAnalysis:
                 raise ValueError(f"topology_topology_{stat}: no {color!r} values found for any run")
         pairs = [(a, b) for a, b in itertools.combinations(range(len(names)), 2)
                  if (names[a] in picked) + (names[b] in picked) >= min(len(picked), 2)]
-        fig, axs = plt.subplots(len(pairs), len(series), figsize=(3.8 * len(series) + (1.2 if spec else 0), 3.5 * len(pairs)),
-                                squeeze=False)
+        nrows, ncols = (len(series), len(pairs)) if transpose else (len(pairs), len(series))
+        fig, axs = plt.subplots(nrows, ncols, figsize=(3.8 * ncols + (1.2 if spec else 0), 3.5 * nrows), squeeze=False)
         rng = np.random.default_rng(0)
         what = {"all": "window mean", "means": "mean window mean", "variances": "window-mean variance",
                 "covariances": "window-mean covariance", "fitted_all": "window mean", "viterbi_variances": "window-mean variance", "fitted_means": "fitted mean", "fitted_variances": "fitted variance",
@@ -1925,7 +1946,7 @@ class CrossRunAnalysis:
                         bounds[c] = np.nanpercentile(pooled[:, c], percentile)
             codes = [_color_codes(spec, v) if spec else None for v in run_values]
             for ri, (a, b) in enumerate(pairs):
-                ax = axs[ri][ci]
+                ax = axs[ci][ri] if transpose else axs[ri][ci]
                 lines, kept = [], []
                 for name, si, _ in states:
                     xy = (null, alt)[si][:, [a, b]]
@@ -1944,10 +1965,15 @@ class CrossRunAnalysis:
                 if logx:
                     ax.set_xscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
                     ax.set_yscale("symlog", linthresh=linthresh or _WINDOW_ECDF_LINTHRESH)
+                (x0, x1), (y0, y1) = ax.get_xlim(), ax.get_ylim()
+                lo, hi = min(x0, y0), max(x1, y1)
+                ax.plot([lo, hi], [lo, hi], color="red", linewidth=0.8, zorder=0)
+                ax.set_xlim(lo, hi)
+                ax.set_ylim(lo, hi)
                 ax.grid(alpha=0.25)
                 ax.set_title(f"{w}: {names[a]} vs {names[b]}", fontsize=9)
                 ax.set_xlabel(f"{'normalized ' if normalize else ''}{names[a]} {what}")
-                if ci == 0:
+                if transpose or ci == 0:
                     ax.set_ylabel(f"{'normalized ' if normalize else ''}{names[b]} {what}")
         scope = ", ".join("/".join(p) for p in prefixes) or "all runs"
         _suptitle(fig, title or {"all": "GT window-mean", "means": "GT per-run mean window-mean (point = run)",
@@ -2310,7 +2336,7 @@ class CrossRunAnalysis:
         if windows is None:
             raise ValueError("window_ecdf needs a '-w' axis")
         dests = {_FLAG_TO_DEST.get(k): v for k, v in axes.items()}
-        variants = {d: bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
+        variants = {d: dests.get(d) if d == "signal" else bool(dests.get(d)) for d in _SCORES_VARIANT_DESTS if d != "chunk_size"}
         roots = []
         for w in windows if isinstance(windows, (list, tuple)) else [windows]:
             w = _typed_value("-w", w)
@@ -2707,7 +2733,7 @@ class CrossRunAnalysis:
                 - ({"fit"} if dist_metric in ("ecdf_all", "ecdf_all_hmm") else set()) \
                 - ({"logy"} if dist_metric == "mean_all_vs_bl" else set()) \
                 - ({"per_window"} if dist_metric == "gap_ecdf" else set()) \
-                - ({"state", "topology", "corr", "percentile"} if dist_metric in _TOPOLOGY_SCATTER_METRICS else set())
+                - ({"state", "topology", "corr", "percentile", "transpose"} if dist_metric in _TOPOLOGY_SCATTER_METRICS else set())
             if unknown:
                 raise ValueError(f"{dist_metric}: unknown options {sorted(unknown)} (takes {sorted(_DIST_OPTIONS)})")
             opts = {"pattern": None, "topologies": TOPOLOGY_NAMES, "logx": None, "linthresh": None, "normalize": False,
@@ -3931,7 +3957,7 @@ _ECDF_TOPO_COLORS = {"ABBA": "#1F77B4", "BABA": "#D62728", "AABB": "#2CA02C"}
 _RE_STATE_OCCUPANCY = re.compile(r"^State occupancy \(posterior, windows\): Null ([-\d.eE+na]+), (?:Alt|Outlier) ([-\d.eE+na]+)")
 
 
-_SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus")
+_SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus", "signal")
 
 
 def _scores_with_truth(scores_path, pattern):
@@ -3976,7 +4002,7 @@ def _report_window_labels(report, scores_path, pattern):
     return scores, y_true, y_pred, occupancy
 
 
-_CASTER_VARIANT_DIRS = {"site", "pair", "ilr", "normalize", "norm-eps", "exp-minus"}
+_CASTER_VARIANT_DIRS = {"site", "pair", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"}
 _WINDOW_ECDF_LINTHRESH = 1e-2
 
 
@@ -4736,10 +4762,10 @@ def _recorded_from_report_path(report):
     mode, window, step, is_site, is_z, is_ilr, is_norm, norm_eps = parse_ws_from_path(report)
     parts = report.parent.parts
     size_idx = next(i for i, part in enumerate(parts) if _OUT_SIZE_SEGMENT.match(part))
-    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "ilr", "normalize", "norm-eps", "exp-minus")]
+    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus")]
     recorded = {
         "window_size": window, "step_size": step, "site": is_site, "zscale": is_z, "ilr": is_ilr,
-        "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "pair": mode == "c" and not is_site,
+        "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "signal": signal_of_path(report), "pair": mode == "c" and not is_site,
         "rho": None, "beta": None, "beta_prime": None, **PHLAG_SEGMENT_DEFAULTS, "emission_lambda": None,
     }
     if rest:
@@ -5723,6 +5749,8 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
         df["merged_category"] = _merged_category(df["category"], df["subcategory"])
     if not df.empty and "pattern" in df.columns:
         df["outlier_pct"] = _outlier_pct(df["pattern"])
+    if not df.empty:
+        _add_derived_columns(df)
     if not df.empty and bin_specs:
         for bin_col, (source_col, edges) in bin_specs.items():
             if source_col in df.columns:
@@ -5754,6 +5782,17 @@ def _load_configs_runs(configs, row_filters=None, bin_specs=None, get_args=None)
                 df = df[df[col] == value]
         result[label] = df
     return result
+
+
+def _quantile_bin_edges(values, n_bins):
+    if not len(values):
+        return []
+    qs = np.unique(np.quantile(values, np.linspace(0, 1, n_bins + 1)))
+    edges = []
+    for i, (lo, hi) in enumerate(zip(qs[:-1], qs[1:])):
+        label = f"[{lo:.3g},{hi:.3g}]" if i == 0 else f"({lo:.3g},{hi:.3g}]"
+        edges.append((label, np.nextafter(lo, -np.inf) if i == 0 else lo, hi))
+    return edges
 
 
 def _compute_hd_bin_edges(values):

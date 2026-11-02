@@ -474,7 +474,6 @@ class EmissionParam(Enum):
     NULL_ALT_EQUAL = "null-alt-equal"
     NULL_ALT_EQUAL_NUM = "null-alt-equal-num"
     NULL_ALT_NUM = "null-alt-num"
-    SNR = "snr"
     BL_ANCHOR = "bl-anchor"
 
 
@@ -857,17 +856,11 @@ class PhlagHMMEmissions(HMMEmissions):
                     clip_count = clip_count + clip_count_s
                     clip_attempts = clip_attempts + clip_attempts_s
                 elif mode in (EmissionParam.FREE, EmissionParam.NULL_ALT_ZERO, EmissionParam.NULL_ALT_EQUAL,
-                              EmissionParam.SNR, EmissionParam.BL_ANCHOR):
+                              EmissionParam.BL_ANCHOR):
                     mu_s = xbar_s
                     if mode in (EmissionParam.NULL_ALT_ZERO, EmissionParam.BL_ANCHOR):
                         free = jnp.ones(self.emission_dim, dtype=bool).at[jnp.array(self.anchor_dims)].set(False)
                         mu_s = jnp.where(free, xbar_s, self.anchor_value)
-                    elif mode is EmissionParam.SNR:
-                        anchor = jnp.array(self.anchor_dims)
-                        ils = next(d for d in range(self.emission_dim) if d not in self.anchor_dims)
-                        var_ils = Sxx_s[ils, ils] / (n_s + 1e-12) - xbar_s[ils] ** 2
-                        ceiling = xbar_s[ils] / (var_ils + 1e-12)
-                        mu_s = xbar_s.at[anchor].set(jnp.minimum(jnp.mean(xbar_s[anchor]), ceiling))
                     elif mode is EmissionParam.NULL_ALT_EQUAL:
                         anchor = jnp.array(self.anchor_dims)
                         mu_s = xbar_s.at[anchor].set(jnp.mean(xbar_s[anchor]))

@@ -527,6 +527,18 @@ struct Quadripartition{
 			return counts;
 		}
 
+		array<double, 3> signalMoments() {
+			array<double, 3> m = {0, 0, 0};
+			for (int iKernal = 0; iKernal < nKernal; iKernal++){
+				array<score_t, 3> temp = kernal[iKernal].score(pi);
+				double dMax = (double) temp[0] - max((double) temp[1], (double) temp[2]);
+				m[0] += dMax;
+				m[1] += dMax * dMax;
+				m[2] += (double) temp[0] - ((double) temp[1] + (double) temp[2]) / 2;
+			}
+			return m;
+		}
+
 		// dstar.cpp's quartetCnt() analog: per site, the product of each
 		// of the 4 groups' depth (total valid-base count across that
 		// group's individuals at this site, i.e. sum of kernal.cnt[g][0..3]

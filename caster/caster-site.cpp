@@ -249,6 +249,12 @@ struct Workflow {
         // chunkQuartetCnt/chunkSignCounts stay separately named internally
         // on purpose, to not confuse this file's own two features.
         map<pair<int, int>, long long> chunkQuartetCnt;
+        map<pair<int, int>, array<double, 3> > chunkSignal;
+        const string signalMode = ARG.getStringArg("signal");
+        if (signalMode != "" && signalMode != "snr" && signalMode != "signal-max" && signalMode != "signal-avg"){
+            cerr << "Error: --signal must be snr, signal-max or signal-avg, not '" << signalMode << "'.\n";
+            exit(1);
+        }
         map<int, vector<int> > locusChunks;
         for (size_t a = 0; a < quad.genes.size(); a++){
             array<score_t, 3> s = quad.genes[a].scoreCnt();
@@ -262,6 +268,11 @@ struct Workflow {
                     accSc[t][c] += sc[2 - t][c];
             chunkSiteCount[key] += quad.genes[a].nSite;
             chunkQuartetCnt[key] += quad.genes[a].quartetCount();
+            if (signalMode != ""){
+                array<double, 3> sm = quad.genes[a].signalMoments();
+                array<double, 3> &accSm = chunkSignal[key];
+                for (int t = 0; t < 3; t++) accSm[t] += sm[t];
+            }
             locusChunks[geneLocus[a]].push_back(geneChunk[a]);
         }
 
@@ -292,7 +303,7 @@ struct Workflow {
             exit(1);
         }
         const string &inputFile = ARG.getStringArg("input");
-        fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tQuartetCnt\n";
+        fout << "file\tpos\tc*ABBA\tc*BABA\tc*AABB\tQuartetCnt" << (signalMode != "" ? "\tSignal" : "") << "\n";
         // Diagnostic-only quartet-counts companion file (sign-classified per-
         // site scores, see Gene::signCounts()): same row/pos values as
         // chunk-scores above so the two can be joined by 'pos'. These are
@@ -309,6 +320,7 @@ struct Workflow {
                 array<array<long long, 3>, 3> signSum = {};
                 long long siteSum = 0;
                 long long quartetCntSum = 0;
+                array<double, 3> signalSum = {0, 0, 0};
                 for (int j = 0; j < windowChunks; j++){
                     pair<int, int> key = make_pair(locusId, chunks[i + j]);
                     array<score_t, 3> &s = chunkScores[key];
@@ -319,12 +331,27 @@ struct Workflow {
                             signSum[t][c] += sc[t][c];
                     siteSum += chunkSiteCount[key];
                     quartetCntSum += chunkQuartetCnt[key];
+                    if (signalMode != ""){
+                        array<double, 3> &sm = chunkSignal[key];
+                        for (int t = 0; t < 3; t++) signalSum[t] += sm[t];
+                    }
                 }
                 long long pos = (long long) chunks[i] * chunkSizeArg;
                 double denom = (siteSum > 0) ? (double) siteSum : 1.0;
                 fout << inputFile << "\t" << pos << "\t"
                      << (double) sum[0] / denom << "\t" << (double) sum[1] / denom << "\t" << (double) sum[2] / denom
-                     << "\t" << (double) quartetCntSum / denom << "\n";
+                     << "\t" << (double) quartetCntSum / denom;
+                if (signalMode != ""){
+                    double meanMax = signalSum[0] / denom;
+                    double signal = meanMax;
+                    if (signalMode == "signal-avg") signal = signalSum[2] / denom;
+                    else if (signalMode == "snr"){
+                        double var = signalSum[1] / denom - meanMax * meanMax;
+                        signal = (var > 0) ? meanMax / sqrt(var) : 0.0;
+                    }
+                    fout << "\t" << signal;
+                }
+                fout << "\n";
                 fQuartetCounts << inputFile << "\t" << pos << "\t"
                       << signSum[0][0] << "\t" << signSum[0][1] << "\t" << signSum[0][2] << "\t"
                       << signSum[1][0] << "\t" << signSum[1][1] << "\t" << signSum[1][2] << "\t"
@@ -371,6 +398,9 @@ int main(int argc, char** argv){
     ARG.addStringArg(0, "quartet-counts", "quartet_counts.tsv", "Output TSV path for --branch-mapping's diagnostic per-window, "
         "per-topology raw per-site score quartet counts, sign-classified (zero/negative/positive). Same 'pos' values "
         "as --chunk-scores' output, for joining. Purely diagnostic -- never affects --chunk-scores or the tree search.");
+    ARG.addStringArg(0, "signal", "", "--branch-mapping: add a 'Signal' column per window from per-site d_max = AABB - max(ABBA, BABA) "
+        "and d_avg = AABB - (ABBA + BABA) / 2: snr = mean(d_max) / std(d_max), signal-max = mean(d_max), signal-avg = mean(d_avg). "
+        "Empty (default): no column.");
     ARG.addIntArg(0, "window", 0, "--branch-mapping's sliding window size, in multiples of --chunk, rolling that "
         "many consecutive chunks (sliding by 1 chunk each row, so windows overlap when > 1 chunk) into each output "
         "row and dividing by that window's total informative-site count instead of --chunk's raw per-chunk sum. "

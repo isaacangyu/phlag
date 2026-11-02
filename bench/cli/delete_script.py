@@ -37,6 +37,7 @@ def phlag_targets(argv):
     variant_flags = {"pair": "--pair", "zscale": "-z", "normalize": "-n",
                      "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus"}
     variant_tokens = tuple(f for d, f in variant_flags.items() if getattr(args, d))
+    variant_tokens += ("--signal", args.signal) if args.signal else ()
     if args.site is not None:
         variant_tokens += ("--site" if args.site else "--no-site",)
     base = resolve_phlag_input(str(args.caster_scores[0]), variant_tokens)

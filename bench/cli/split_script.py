@@ -305,7 +305,8 @@ def check_duplicates(runs):
     from phlag.utils import get_data_dir
     work_items = None
     phlag_owner, caster_owner, problems = {}, {}, []
-    for line, name, argv in runs:
+    deps = collections.defaultdict(set)
+    for i, (line, name, argv) in enumerate(runs):
         if argv[0] != "benchmark":
             continue
         if work_items is None:
@@ -314,14 +315,12 @@ def check_duplicates(runs):
             if out_dir in phlag_owner:
                 problems.append(f"phlag: {name} and {phlag_owner[out_dir]} both run {out_dir}")
             phlag_owner.setdefault(out_dir, name)
-            shared = collections.Counter(caster_owner[path] for path in pending if path in caster_owner)
-            for other, n in shared.items():
-                problems.append(f"caster: {name} and {other} both compute {n} missing scores.tsv "
-                                f"(e.g. {next(p for p in pending if caster_owner.get(p) == other).parent})")
+            deps[i] |= {caster_owner[path] for path in pending if path in caster_owner}
             for path in pending:
-                caster_owner.setdefault(path, name)
+                caster_owner.setdefault(path, i)
     if problems:
         raise SystemExit("split_script: duplicate work across runs:\n  " + "\n  ".join(problems))
+    return deps
 
 
 def plan(script, budget=None):
@@ -347,7 +346,7 @@ def plan(script, budget=None):
         raise SystemExit(f"split_script: {script} has bad commands, nothing run:\n  " + "\n  ".join(errors))
     if not runs:
         raise SystemExit(f"split_script: no commands in {script}")
-    check_duplicates(runs)
+    deps = check_duplicates(runs)
     parallel = min(len(runs), budget)
     cores = max(1, budget // parallel)
     seen, planned = {}, []
@@ -359,7 +358,9 @@ def plan(script, budget=None):
         threads = 1 if argv[0] == "benchmark" else cores
         env = f"PHLAG_BENCH_JOBS={parallel} OMP_NUM_THREADS={threads} OPENBLAS_NUM_THREADS={threads} MKL_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads}"
         planned.append((line, name, f"{env} {shlex.join(argv)}", 0 if argv[0] == "benchmark" else threads))
-    return parallel, lines, planned
+    waits_for = {planned[i][1]: sorted(planned[j][1] for j in owners) for i, owners in deps.items() if owners}
+    planned.sort(key=lambda item: item[1] in waits_for)
+    return parallel, lines, planned, waits_for
 
 
 def main(argv=None):
@@ -367,10 +368,10 @@ def main(argv=None):
     ap.add_argument("script", nargs="?", default="bench/script.sh")
     ap.add_argument("--budget", type=int, default=None)
     args = ap.parse_args(argv)
-    parallel, _, planned = plan(args.script, args.budget)
+    parallel, _, planned, waits_for = plan(args.script, args.budget)
     print(parallel)
     for _, name, cmd, _ in planned:
-        print(f"{name}\t{cmd}")
+        print(f"{name}\t{cmd}" + (f"\t# after {','.join(waits_for[name])}" if name in waits_for else ""))
 
 if __name__ == "__main__":
     main(sys.argv[1:])

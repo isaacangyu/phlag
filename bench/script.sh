@@ -1,18 +1,12 @@
-# # dominant and alternative topologies
-# benchmark -w 50-50k --np null-alt-num --floor-fix 
-# benchmark -w 50-50k --np null-alt-num --floor-fix --rho 0.9 --beta 4
-# benchmark -w 50-50k --floor-fix # free, rerun with lower floor
-# benchmark -w 50-50k --np null-alt-equal --floor-fix --null-majority
-# benchmark -w 50-50k --np null-alt-equal --floor-fix --null-majority --rho 0.9 --beta 4
-# benchmark -w 50-50k --np null-alt-equal --floor-fix # rerun just alternative with lower floor
-# benchmark -w 50-50k --np null-alt-equal --floor-fix --rho 0.9 --beta 4 # rerun just alternative with lower floor
-
-
-benchmark -w 50-50k --np null-alt-num --floor-fix --null-majority
-benchmark -w 50-50k --np null-alt-num --floor-fix --null-majority --rho 0.9 --beta 4
-benchmark -w 50-50k --np null-alt-equal --no-floor
-benchmark -w 50-50k --np null-alt-equal --no-floor --rho 0.9 --beta 4
-benchmark -w 50-50k --np null-alt-equal --no-floor --null-majority
-benchmark -w 50-50k --np null-alt-equal --no-floor --null-majority --rho 0.9 --beta 4
-benchmark -w 50-50k --no-floor
-benchmark -w 50-50k --no-floor --rho 0.9 --beta 4
+# keeping floor fix since regularizer still better
+benchmark -w 50-50k --topologies AABB --floor-fix --rho 0.9 --beta 4
+benchmark -w 50-50k --topologies ABBA AABB --floor-fix --rho 0.9 --beta 4
+benchmark -w 50-50k --topologies ABBA BABA --floor-fix --rho 0.9 --beta 4
+benchmark -w 100-25k --snr --floor-fix 
+benchmark -w 100-25k --snr --rho 0.9 --beta 4 --floor-fix 
+# done per site but same either way
+benchmark -w 100-25k --signal-avg --floor-fix 
+benchmark -w 100-25k --signal-avg --rho 0.9 --beta 4 --floor-fix 
+# done per site
+benchmark -w 100-25k --signal-max --floor-fix 
+benchmark -w 100-25k --signal-max --rho 0.9 --beta 4 --floor-fix 

@@ -135,7 +135,23 @@ def substitute_ws_in_path(path, new_val, new_step):
     return None
 
 
-VARIANT_MARKERS = ("site", "ilr", "normalize", "norm-eps", "exp-minus")
+SIGNAL_MODES = ("snr", "signal-max", "signal-avg")
+VARIANT_MARKERS = ("site", *SIGNAL_MODES, "ilr", "normalize", "norm-eps", "exp-minus")
+
+
+def signal_of_path(path):
+    return next((p for p in pathlib.Path(path).parts if p in SIGNAL_MODES), None)
+
+
+def add_signal_args(parser):
+    parser.add_argument(
+        "--signal", dest="signal", choices=SIGNAL_MODES, default=None,
+        help="Per-window 1D score from per-site d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA) / 2 "
+             "(--site only): snr = mean(d_max) / std(d_max), signal-max = mean(d_max), signal-avg = mean(d_avg). "
+             "Written as a 'Signal' column under its own nested '<mode>' cache entry; phlag fits it as a 1D Gaussian.",
+    )
+    for mode in SIGNAL_MODES:
+        parser.add_argument(f"--{mode}", dest="signal", action="store_const", const=mode, help=f"Same as --signal {mode}.")
 
 
 def variant_of_path(path):
@@ -147,6 +163,7 @@ def variant_of_path(path):
     return {
         "pair": mode == "c" and not site, "site": site, "zscale": zscale, "ilr": ilr,
         "normalize": normalize, "norm_eps": norm_eps and normalize, "exp_minus": "exp-minus" in path.parts,
+        "signal": signal_of_path(path),
     }
 
 
@@ -160,6 +177,8 @@ def substitute_variant_in_path(path, variant):
             while j < len(parts) and parts[j] in VARIANT_MARKERS:
                 j += 1
             nested = ["site"] if variant["site"] else []
+            if variant.get("signal"):
+                nested.append(variant["signal"])
             if variant["ilr"]:
                 nested.append("ilr")
             elif variant["normalize"]:
@@ -190,6 +209,8 @@ def adhoc_scores_path(repo_root, args, cats, node_rel, normalize_flag, ilr_flag)
     path = path / node_rel / size_dir
     if args.site:
         path = path / "site"
+    if getattr(args, "signal", None):
+        path = path / args.signal
     if ilr_flag:
         path = path / "ilr"
     elif normalize_flag:
@@ -579,7 +600,7 @@ class CasterPlotter:
         if ws:
             mode, _, _, is_site, is_zscale, is_ilr, is_normalize, _ = ws
             source = "site" if (mode == "c" and is_site) else ("pair" if mode == "c" else "dstar")
-            transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize), ("exp-minus", "exp-minus" in pathlib.Path(scores_file).parts)) if on]
+            transform_bits = [b for b, on in (("zscaled", is_zscale), ("ilr", is_ilr), ("normalized", is_normalize), ("exp-minus", "exp-minus" in pathlib.Path(scores_file).parts), (signal_of_path(scores_file), bool(signal_of_path(scores_file)))) if on]
             tag_parts = [source] + (transform_bits or ["raw"])
         else:
             # Path doesn't encode a recognizable size-dir segment (e.g. a
@@ -1929,6 +1950,7 @@ def build_parser():
              "(after -n/-i/-z). Reuses the untransformed sibling scores.tsv if "
              "present; writes to its own nested 'exp-minus' cache entry."
     )
+    add_signal_args(parser)
     parser.add_argument(
         "-s",
         dest="step_size",
@@ -2371,6 +2393,7 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         "--quartet-counts", str(quartet_counts_path.resolve()),
         "--chunk", str(site_step),
         "--window", str(window_size),
+        *(["--signal", args.signal] if getattr(args, "signal", None) else []),
         str(args.fasta_file.resolve()),
     ]
     try:
@@ -2491,6 +2514,8 @@ def canonical_scores_path(args, normalize_flag, ilr_flag):
         caster_root = data_dir / "caster" / f"c{format_val(chunk)}_s{step_str}{zscale_suffix}"
         if args.site:
             caster_root = caster_root / "site"
+        if getattr(args, "signal", None):
+            caster_root = caster_root / args.signal
     else:
         caster_root = data_dir / "caster" / f"w{window_str}_s{step_str}{zscale_suffix}"
     if ilr_flag:
@@ -2570,6 +2595,8 @@ def main(argv=None):
 
     if args.ilr and args.zscale:
         sys.exit("Error: --ilr and --zscale are mutually exclusive.")
+    if args.signal and (not args.site or args.zscale or args.ilr or args.normalize or args.exp_minus):
+        sys.exit(f"Error: --{args.signal} needs --site and no -z/-i/-n/--exp-minus.")
 
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
@@ -2658,6 +2685,7 @@ def main(argv=None):
             args.normalize = is_normalize
             args.norm_eps = norm_eps
             args.exp_minus = "exp-minus" in regen_output_path.parts
+            args.signal = signal_of_path(regen_output_path)
             if mode == "c" and is_site:
                 args.site = True
                 args.pair = False

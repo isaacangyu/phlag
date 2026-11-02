@@ -64,7 +64,7 @@ def main(argv=None):
     ap.add_argument("--log-dir", type=pathlib.Path, default=pathlib.Path("logs/batch"))
     args = ap.parse_args(argv)
 
-    parallel, lines, planned = plan(args.script)
+    parallel, lines, planned, waits_for = plan(args.script)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     (args.log_dir / "runs.tsv").write_text("".join(f"{name}\t{cmd}\n" for _, name, cmd, _ in planned))
     progress_dir = args.log_dir / "progress"
@@ -77,6 +77,9 @@ def main(argv=None):
 
     print(f"{len(planned)} runs from {len(lines)} line(s), {parallel} at a time, "
           f"{TOTAL_CORE_BUDGET} cores shared -- logs in {args.log_dir}/")
+    for name, owners in waits_for.items():
+        print(f"  {name} waits for {', '.join(owners)} (shared missing caster scores)")
+    finished_event = {name: threading.Event() for _, name, _, _ in planned}
     per_line = collections.Counter(line for line, _, _, _ in planned)
     width = min(60, max(len(text) for text in lines))
     bars = {
@@ -151,7 +154,15 @@ def main(argv=None):
                     refresh(line)
 
     def run(item):
+        try:
+            run_one(item)
+        finally:
+            finished_event[item[1]].set()
+
+    def run_one(item):
         line, name, cmd, tokens = item
+        for owner in waits_for.get(name, ()):
+            finished_event[owner].wait()
         with acquire_lock:
             got = 0
             while got < tokens:

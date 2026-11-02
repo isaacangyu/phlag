@@ -117,7 +117,7 @@ def get_title_locus(caster_scores, output_file):
     return get_locus_description(caster_scores)
 
 
-def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, n_clusters=2):
+def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_threshold, output_dir, n_clusters=2, topology_names=None):
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,7 +130,7 @@ def determine_optimal_mixtures(caster_scores_path, Y, pos_to_caster, silhouette_
 
     print("\n=== K-means Clustering & Silhouette Scores ===")
 
-    topology_names = get_topology_names(Y.shape[-1])
+    topology_names = topology_names or get_topology_names(Y.shape[-1])
 
     # Topologies are always clustered together (shared multivariate mixture
     # components with full covariance across dims), never per-dimension.
@@ -410,6 +410,7 @@ class Phlag:
         self.source_fasta_path = None
         self.used_pair_scores = False
         self.used_ilr_scores = False
+        self.used_signal_scores = False
 
         with open(path, "r") as f:
             header = f.readline()
@@ -433,7 +434,11 @@ class Phlag:
                     ilr_idx_by_num[int(m.group(1))] = i
             ilr_indices = [ilr_idx_by_num[k] for k in sorted(ilr_idx_by_num)] if ilr_idx_by_num else None
 
-            if abba_idx is not None and baba_idx is not None and aabb_idx is not None:
+            signal_idx = lower_parts.index("signal") if "signal" in lower_parts else None
+            if signal_idx is not None:
+                score_indices = [signal_idx]
+                self.used_signal_scores = True
+            elif abba_idx is not None and baba_idx is not None and aabb_idx is not None:
                 score_indices = [abba_idx, baba_idx, aabb_idx]
             elif ilr_indices:
                 score_indices = ilr_indices
@@ -441,6 +446,16 @@ class Phlag:
                 score_indices = [lower_parts.index("q1"), lower_parts.index("q2"), lower_parts.index("q3")]
             else:
                 score_indices = [2, 3, 4] if (is_file_header or is_locus_header) else [1, 2, 3]
+
+            self.topology_idx = list(range(len(score_indices)))
+            self.topology_names = ["Signal"] if self.used_signal_scores else get_topology_names(len(score_indices))
+            topologies = getattr(self.args, "topologies", None)
+            if topologies:
+                if score_indices == ilr_indices or len(score_indices) != 3:
+                    sys.exit(f"Error: --topologies needs ABBA/BABA/AABB score columns, not '{path}'")
+                self.topology_idx = [utils.TOPOLOGY_NAMES.index(t) for t in topologies.split(",")]
+                self.topology_names = [utils.TOPOLOGY_NAMES[i] for i in self.topology_idx]
+                score_indices = [score_indices[i] for i in self.topology_idx]
 
             self.pos_to_caster = defaultdict(partial(jnp.zeros, len(score_indices)))
 
@@ -499,7 +514,7 @@ class Phlag:
                     break
             if size_dir_idx is not None and "caster" not in parts:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     variant_end += 1
                 if "out" in parts[:size_dir_idx]:
                     prefix_start = len(parts[:size_dir_idx]) - parts[:size_dir_idx][::-1].index("out")
@@ -515,7 +530,7 @@ class Phlag:
                 )
             if size_dir_idx is not None:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     variant_end += 1
                 locus = parts[variant_end:-1]
                 if len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS:
@@ -585,7 +600,7 @@ class Phlag:
                 # too, or it leaks into out_dir the same way 'norm-eps'
                 # would have (see phlag/caster.py's own naming-convention
                 # note in _derive_output_path).
-                while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while rel_parts and rel_parts[0] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -618,6 +633,7 @@ class Phlag:
             self.args.silhouette_threshold,
             output_dir,
             n_clusters=self.args.n_clusters,
+            topology_names=self.topology_names,
         )
 
         self.num_mixtures = int(np.max(num_mixtures_matrix))
@@ -1085,7 +1101,7 @@ class Phlag:
         marginal_ll = float(self.hmm.marginal_log_prob(self.params, self.Y))
         k_params = count_trainable_params(self.params, self.props)
         if getattr(self, "anchor_dims", ()):
-            k_params -= {"snr": 1, "null-alt-equal": 4, "null-alt-equal-num": 4, "null-alt-num": 4}.get(self.null_np, len(self.anchor_dims))
+            k_params -= {"null-alt-equal": 4, "null-alt-equal-num": 4, "null-alt-num": 4}.get(self.null_np, len(self.anchor_dims))
         n_obs = int(self.Y.shape[0])
         bic = k_params * np.log(n_obs) - 2 * marginal_ll
         headers.append(
@@ -1110,7 +1126,7 @@ class Phlag:
         headers.append(f"{metrics_str}")
         relerr_rows = []
         if self.ground_truth_fits:
-            topology_names = get_topology_names(self.Y.shape[-1])
+            topology_names = self.topology_names
             headers.append("Topology\tState\tFittedMean\tFittedStd\tGTMean\tGTStd\tKL")
             # State index 0/1 is an arbitrary EM cluster label, not a fixed
             # Null/Alt identity -- flipped_for_eval (established above from
@@ -1192,14 +1208,17 @@ class Phlag:
                     var_vals = [format_number(v) for v in gt_stats[within_var_key]]
                     headers.append(f"{utils.STATE_LABELS[within_label]} within-window variance (ABBA, BABA, AABB): {var_vals}")
 
-            if "Hellinger2" in gt_stats:
+            sliced = self.args.topologies is not None or self.used_signal_scores
+            if "Hellinger2" in gt_stats and not sliced:
                 gt_hellinger2_joint = gt_stats["Hellinger2"]
                 headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
                 self.gt_hellinger2 = float(gt_hellinger2_joint)
             else:
-                if "Null" in gt_stats and "Alt" in gt_stats:
-                    mu_null_gt_joint, cov_null_gt_joint = gt_stats["Null"]
-                    mu_alt_gt_joint, cov_alt_gt_joint = gt_stats["Alt"]
+                if "Null" in gt_stats and "Alt" in gt_stats and not self.used_signal_scores:
+                    idx = np.array(self.topology_idx)
+                    (mu_null_gt_joint, cov_null_gt_joint), (mu_alt_gt_joint, cov_alt_gt_joint) = [
+                        (np.asarray(m)[idx], np.asarray(c)[np.ix_(idx, idx)])
+                        for m, c in (gt_stats["Null"], gt_stats["Alt"])]
                     have_gt_joint = True
                 else:
                     null_vals = Y_np[y_true == 0]
@@ -1427,7 +1446,7 @@ class Phlag:
         self.cov_floor = hmm.COV_FLOOR_FIX if self.args.floor_fix else hmm.COV_FLOOR
         if self.null_np in utils.ANCHORED_NP:
             if self.args.model_design != "gaussian" or self.Y.shape[-1] != 3:
-                raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and 3 topology columns")
+                raise ValueError(f"--np {self.args.null_emission_parameterization} needs -d gaussian and all 3 topologies (no --topologies)")
             self.anchor_dims = (0, 1)
         if self.args.null_emission_parameterization == "bl-anchor":
             from .utils import get_simulation_clade, get_cu_branch_length_from_population_info
@@ -1463,17 +1482,13 @@ class Phlag:
 
         # Compute empirical moments from CASTER data over genomic positions
         data_mean = jnp.mean(self.Y, axis=0)
-        data_cov = jnp.cov(self.Y, rowvar=False)
+        data_cov = jnp.atleast_2d(jnp.cov(self.Y, rowvar=False))
         data_var = jnp.diag(data_cov)
         null_mean = data_mean
         null_cov = data_cov
         if self.anchor_dims and self.null_np in ("null-alt-equal", "null-alt-equal-num", "null-alt-num"):
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(jnp.mean(data_mean[jnp.array(self.anchor_dims)]))
             null_cov = hmm.swap_symmetrize(data_cov, self.anchor_dims)
-        elif self.anchor_dims and self.null_np == "snr":
-            ceiling = data_mean[2] / (data_var[2] + 1e-12)
-            null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(
-                jnp.minimum(jnp.mean(data_mean[jnp.array(self.anchor_dims)]), ceiling))
         elif self.anchor_dims:
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(self.anchor_value)
 
@@ -1633,7 +1648,7 @@ class Phlag:
         self.save_fit(fit_path_for(self.output_file))
 
     def _store_scores_path(self):
-        from .caster import parse_ws_from_path, recover_source_fasta, canonical_scores_path
+        from .caster import parse_ws_from_path, recover_source_fasta, canonical_scores_path, signal_of_path
         from .utils import get_data_dir, get_repo_root
         src = pathlib.Path(self.args.caster_scores).resolve()
         caster_root = (get_data_dir() / "caster").resolve()
@@ -1649,7 +1664,7 @@ class Phlag:
         ns = argparse.Namespace(
             fasta_file=fasta, window_size=val, step_size=step,
             pair=(mode == "c" and not is_site), site=is_site, chunk_size=(val if mode == "c" else None),
-            zscale=is_zscale, norm_eps=norm_eps, exp_minus="exp-minus" in src.parts, left=0, right=None,
+            zscale=is_zscale, norm_eps=norm_eps, exp_minus="exp-minus" in src.parts, signal=signal_of_path(src), left=0, right=None,
         )
         return canonical_scores_path(ns, is_normalize, is_ilr).resolve(), caster_root
 
@@ -1663,7 +1678,7 @@ class Phlag:
         if src != store_scores and not filecmp.cmp(src, store_scores, shallow=False):
             return None
         rel_parts = list(store_scores.relative_to(caster_root).parts[1:-1])
-        while rel_parts and rel_parts[0] in ("site", "ilr", "normalize", "norm-eps", "exp-minus"):
+        while rel_parts and rel_parts[0] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
             rel_parts.pop(0)
         if not rel_parts:
             return None
@@ -1750,7 +1765,7 @@ class PhlagPlotter:
         """Extracts genomic filename, dimension, and styles configuration."""
         self.input_path = pathlib.Path(self.phlag.args.caster_scores)
         self.emission_dim = self.phlag.Y.shape[-1]
-        self.topology_names = get_topology_names(self.emission_dim)
+        self.topology_names = self.phlag.topology_names
 
         # Define premium color palette and labels
         self.colors = {
@@ -2404,6 +2419,8 @@ def build_parser():
     variant_group.add_argument("--norm-eps", dest="norm_eps", action="store_true")
     variant_group.add_argument("-i", "--ilr", dest="ilr", action="store_true")
     variant_group.add_argument("--exp-minus", dest="exp_minus", action="store_true")
+    from .caster import add_signal_args
+    add_signal_args(variant_group)
 
     parser.add_argument(
         "--agg",
@@ -2422,7 +2439,7 @@ def build_parser():
         dest="null_emission_parameterization",
         type=str.lower,
         default="free",
-        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
+        choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "bl-anchor"],
         help="""Parameterization of the null (background) state's emission distribution
                     (default: free): free (unconstrained MLE), repulsion (pushed away
                     from the alt state's currently fitted distribution),
@@ -2431,8 +2448,7 @@ def build_parser():
                     one variance and one covariance with AABB; closed-form M-step), null-alt-equal-num (null-alt-equal
                     fit by LM over the 2 mean + 4 covariance parameters), null-alt-num (null-alt-equal fit by
                     scipy SLSQP over the full mean + Cholesky factor, ties as equality constraints and
-                    null AABB mean >= null ABBA/BABA mean as an inequality), snr (ABBA and BABA means tied to their average,
-                    capped each EM iteration at the null state's AABB mean / AABB variance),
+                    null AABB mean >= null ABBA/BABA mean as an inequality),
                     or bl-anchor (like null-alt-zero, but fixed at exp(-t)/3, t = the
                     clade's branch length in coalescent units; admixture uses the
                     first node in the simulation name).""",
@@ -2628,6 +2644,14 @@ def build_parser():
         help="Initial state probs = (rho, 1-rho) when --rho is set (default: start in null, [1, 0]).",
     )
     hmm_group.add_argument(
+        "--topologies",
+        dest="topologies",
+        nargs="+",
+        action=utils.TopologiesAction,
+        default=None,
+        help=utils.TOPOLOGIES_HELP,
+    )
+    hmm_group.add_argument(
         "--correct-transition",
         dest="correct_transition",
         nargs="?",
@@ -2655,12 +2679,12 @@ def parse_arguments(argv=None):
         parser.error("-i/--ilr and -z/--zscale are mutually exclusive")
     if args.norm_eps and not args.normalize:
         parser.error("--norm-eps requires -n")
-    variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus")
+    variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus", "signal")
     explicit_variant = args.site is not None or any(getattr(args, d) for d in variant_dests)
     if args.site is None:
         args.site = not args.pair
-    variant = {d: bool(getattr(args, d)) for d in variant_dests} if explicit_variant else None
-    default_variant = {d: d == "site" for d in variant_dests}
+    variant = {d: getattr(args, d) if d == "signal" else bool(getattr(args, d)) for d in variant_dests} if explicit_variant else None
+    default_variant = {d: None if d == "signal" else d == "site" for d in variant_dests}
     if variant and variant["ilr"]:
         variant["normalize"] = variant["norm_eps"] = False
 
@@ -2836,7 +2860,7 @@ def parse_arguments(argv=None):
         def is_variant(sfile):
             ws = parse_ws_from_path(sfile)
             return (ws is None or any(ws[3:])
-                    or bool({"site", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
+                    or bool({"site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
 
         def ws_config(sfile):
             ws = parse_ws_from_path(sfile)
@@ -2920,6 +2944,7 @@ def em_args_signature(args):
         if isinstance(val, list):
             val = val[0] if len(val) == 1 else tuple(val)
         sig[dest] = val
+    sig["topologies"] = utils.normalize_topologies(getattr(args, "topologies", None))
     sig["model_design"] = sig["model_design"] or "gaussian"
     if sig["beta"] is not None:
         sig["beta_prime"] = None

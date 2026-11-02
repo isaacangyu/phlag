@@ -977,7 +977,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                 norm_eps=False, exp_minus=False, errorbar="sd"):
+                 norm_eps=False, exp_minus=False, signal=None, errorbar="sd"):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -1000,6 +1000,7 @@ class BenchmarkStats:
         self.ilr = ilr
         self.norm_eps = norm_eps
         self.exp_minus = exp_minus
+        self.signal = signal
         self.errorbar = errorbar
 
         self.runs = []
@@ -1157,7 +1158,7 @@ class BenchmarkStats:
             leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
             pair=self.pair, site=self.site, chunk_size=self.chunk_size,
             normalize=self.normalize, zscale=self.zscale, ilr=self.ilr, norm_eps=self.norm_eps,
-            exp_minus=self.exp_minus,
+            exp_minus=self.exp_minus, signal=self.signal,
         )
         gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
         for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
@@ -2331,6 +2332,7 @@ CASTER_ARG_SPECS = [
     ("normalize", "-n", True),
     ("norm_eps", "--norm-eps", True),
     ("exp_minus", "--exp-minus", True),
+    ("signal", "--signal", False),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
     ("site", "--site", "bool"),
@@ -2358,6 +2360,7 @@ PHLAG_ARG_SPECS = [
     ("correct_transition", "--correct-transition", False),
     ("dirichlet_mean", "--dirichlet-mean", True),
     ("prior_init_probs", "--prior-init-probs", True),
+    ("topologies", "--topologies", False),
     ("rho", "--rho", False),
     ("beta", "--beta", False),
     ("beta_prime", "--beta-prime", False),
@@ -2547,6 +2550,8 @@ def _build_parser():
         help="Forwarded to caster's --exp-minus: topology columns x -> exp(-x), "
              "cached under its own nested 'exp-minus' entry.",
     )
+    from phlag.caster import add_signal_args
+    add_signal_args(caster_group)
     caster_group.add_argument(
         "--shift-caster", dest="shift_caster", action="store_true",
         help="Forwarded to caster's --shift-caster.",
@@ -2579,7 +2584,7 @@ def _build_parser():
     phlag_group = parser.add_argument_group("phlag flags", "Forwarded to phlag.")
     phlag_group.add_argument(
         "--np", dest="null_emission_parameterization", type=str.lower,
-        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor"],
+        default="free", choices=["free", "repulsion", "null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "bl-anchor"],
         help="Forwarded to phlag's --np (default: free).",
     )
     phlag_group.add_argument(
@@ -2647,6 +2652,11 @@ def _build_parser():
     phlag_group.add_argument(
         "--prior-init-probs", dest="prior_init_probs", action="store_true",
         help="Forwarded to phlag's --prior-init-probs.",
+    )
+    from phlag.utils import TopologiesAction, TOPOLOGIES_HELP
+    phlag_group.add_argument(
+        "--topologies", dest="topologies", nargs="+", action=TopologiesAction, default=None,
+        help=f"Forwarded to phlag's --topologies. {TOPOLOGIES_HELP}",
     )
     phlag_group.add_argument(
         "--rho", dest="rho", type=float, default=None,
@@ -2760,7 +2770,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                                 pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                                norm_eps=False, exp_minus=False):
+                                norm_eps=False, exp_minus=False, signal=None):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2807,6 +2817,8 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
     base = get_data_dir() / "caster" / size_prefix
     if site:
         base = base / "site"
+    if signal:
+        base = base / signal
     if ilr:
         base = base / "ilr"
     elif normalize:
@@ -2823,14 +2835,14 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                              pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                             norm_eps=False, exp_minus=False):
+                             norm_eps=False, exp_minus=False, signal=None):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
         pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale, ilr=ilr,
-        norm_eps=norm_eps, exp_minus=exp_minus,
+        norm_eps=norm_eps, exp_minus=exp_minus, signal=signal,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2924,7 +2936,7 @@ def scores_path_for(args, fasta_path, leaf_dir):
         fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
         pair=args.pair, site=args.site, chunk_size=args.chunk_size,
         normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
-        exp_minus=args.exp_minus,
+        exp_minus=args.exp_minus, signal=args.signal,
     )
 
 
@@ -3305,6 +3317,8 @@ def default_create_path(args):
         parts.append(f"k{args.n_clusters}")
     parts.append(f"w{format_val(args.window_size)}_s{format_val(args.step_size)}" + ("_z" if args.zscale else ""))
     parts += [seg for flag, seg in (("pair", "pair"), ("site", "site"), ("shift_caster", "shift-caster")) if getattr(args, flag)]
+    if args.signal:
+        parts.append(args.signal)
     if args.ilr:
         parts.append("ilr")
     elif args.normalize:
@@ -3496,6 +3510,7 @@ def main(argv=None):
             ilr=for_args.ilr,
             norm_eps=for_args.norm_eps,
             exp_minus=for_args.exp_minus,
+            signal=for_args.signal,
             errorbar=for_args.errorbar,
         )
 

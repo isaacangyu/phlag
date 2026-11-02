@@ -560,7 +560,7 @@ def get_short_sim_name(sim_name):
 
 
 _NODE_NAME_PATH_MODIFIERS = {
-    "site", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
+    "site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
     "var2x", "repulsion", "annealing", "floor-fix", "no-floor", "null-majority", "no-null-majority",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
@@ -574,6 +574,7 @@ def _is_node_name_path_modifier(segment):
         or _NODE_NAME_WINDOW_RE.match(segment)
         or _NODE_NAME_RHO_BETA_RE.match(segment)
         or _NODE_NAME_LAM_RE.match(segment)
+        or segment.startswith("topologies=")
     )
 
 
@@ -780,9 +781,34 @@ PHLAG_SEGMENT_DEFAULTS = {
     "correct_transition": None,
     "dirichlet_mean": False,
     "prior_init_probs": False,
+    "topologies": None,
 }
+TOPOLOGY_NAMES = ("ABBA", "BABA", "AABB")
+TOPOLOGIES_HELP = ("Fit Null/Outlier Gaussians on only these score columns, e.g. "
+                   "'--topologies ABBA AABB' or 'ABBA,AABB' (default: all of ABBA BABA AABB).")
+
+
+def normalize_topologies(value):
+    if not value:
+        return None
+    tokens = [value] if isinstance(value, str) else value
+    wanted = {t.upper() for tok in tokens for t in tok.split(",") if t}
+    unknown = wanted - set(TOPOLOGY_NAMES)
+    if unknown or not wanted:
+        raise ValueError(f"pick from {', '.join(TOPOLOGY_NAMES)} (got {', '.join(sorted(unknown)) or 'none'})")
+    if len(wanted) == len(TOPOLOGY_NAMES):
+        return None
+    return ",".join(t for t in TOPOLOGY_NAMES if t in wanted)
+
+
+class TopologiesAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            setattr(namespace, self.dest, normalize_topologies(values))
+        except ValueError as e:
+            parser.error(f"{option_string}: {e}")
 PHLAG_SEGMENT_BARE_VALUES = {"correct_transition": "auto"}
-ANCHORED_NP = ("null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "snr", "bl-anchor")
+ANCHORED_NP = ("null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "bl-anchor")
 
 
 def null_majority_default(null_np):
@@ -797,7 +823,6 @@ _NAMED_SEGMENTS = {
     "null-alt-equal": ("null_emission_parameterization", "null-alt-equal"),
     "null-alt-equal-num": ("null_emission_parameterization", "null-alt-equal-num"),
     "null-alt-num": ("null_emission_parameterization", "null-alt-num"),
-    "snr": ("null_emission_parameterization", "snr"),
     "bl-anchor": ("null_emission_parameterization", "bl-anchor"),
 }
 
