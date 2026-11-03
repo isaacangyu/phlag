@@ -135,23 +135,17 @@ def substitute_ws_in_path(path, new_val, new_step):
     return None
 
 
-SIGNAL_MODES = ("snr", "signal-max", "signal-avg")
+from .utils import SIGNAL_MODES
 VARIANT_MARKERS = ("site", *SIGNAL_MODES, "ilr", "normalize", "norm-eps", "exp-minus")
 
 
 def signal_of_path(path):
-    return next((p for p in pathlib.Path(path).parts if p in SIGNAL_MODES), None)
-
-
-def add_signal_args(parser):
-    parser.add_argument(
-        "--signal", dest="signal", choices=SIGNAL_MODES, default=None,
-        help="Per-window 1D score from per-site d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA) / 2 "
-             "(--site only): snr = mean(d_max) / std(d_max), signal-max = mean(d_max), signal-avg = mean(d_avg). "
-             "Written as a 'Signal' column under its own nested '<mode>' cache entry; phlag fits it as a 1D Gaussian.",
-    )
-    for mode in SIGNAL_MODES:
-        parser.add_argument(f"--{mode}", dest="signal", action="store_const", const=mode, help=f"Same as --signal {mode}.")
+    for p in pathlib.Path(path).parts:
+        if p in SIGNAL_MODES:
+            return p
+        if p.startswith("topologies=") and p.partition("=")[2] in SIGNAL_MODES:
+            return p.partition("=")[2]
+    return None
 
 
 def variant_of_path(path):
@@ -572,11 +566,10 @@ def missing_plots(plots, out_dir):
 
 
 class CasterPlotter:
-    def __init__(self, scores_file, distribution='gaussian', data_dir=None, topologies=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, plot_ecdf=False, plot_qq=(), locus_pattern=None, predicted_intervals=None):
+    def __init__(self, scores_file, distribution='gaussian', data_dir=None, plot_scores=True, plot_dist=False, plot_correlation=False, plot_topology_pairs=False, plot_quartet_counts=False, plot_sums=False, plot_ecdf=False, plot_qq=(), locus_pattern=None, predicted_intervals=None):
         self.scores_file = scores_file
         self.distribution = distribution
         self.data_dir = data_dir if data_dir is not None else str(pathlib.Path(scores_file).parent)
-        self.topologies = topologies
         self.locus_pattern = locus_pattern
         self.predicted_intervals = predicted_intervals
 
@@ -806,7 +799,7 @@ class CasterPlotter:
         return np.linspace(lo, hi, n_bins + 1)
 
     @staticmethod
-    def resolve_topology_columns(df, topologies=None):
+    def resolve_topology_columns(df):
         """
         Shared topology-column resolution for both the scatter plot and
         write_ground_truth_stats: caster-pair's chunk_scores.tsv carries both
@@ -833,20 +826,10 @@ class CasterPlotter:
                 avg_cols = pair_cols
                 rename_map = {'q1': 'ABBA', 'q2': 'BABA', 'q3': 'AABB'}
 
-        if topologies is not None:
-            filtered_cols = []
-            for col in avg_cols:
-                mapped_name = rename_map.get(col, col)
-                for t in topologies:
-                    if t.lower() in mapped_name.lower():
-                        filtered_cols.append(col)
-                        break
-            avg_cols = filtered_cols
-
         return avg_cols, rename_map
 
     def plot_topology_scatter(self):
-        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
+        avg_cols, rename_map = self.resolve_topology_columns(self.df)
 
         if not avg_cols:
             print("No matching topology columns found to scatter plot.")
@@ -921,7 +904,7 @@ class CasterPlotter:
         locus pattern... else eval skips, not errors") rather than the old
         code's sys.exit.
         """
-        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
+        avg_cols, rename_map = self.resolve_topology_columns(self.df)
         if not avg_cols:
             print("No matching topology columns found to plot distributions for.")
             return
@@ -1143,7 +1126,7 @@ class CasterPlotter:
         need exactly the three raw topology axes (not the 2D c*ILR1/c*ILR2
         columns an --ilr file carries instead).
         """
-        avg_cols, rename_map = self.resolve_topology_columns(self.df, self.topologies)
+        avg_cols, rename_map = self.resolve_topology_columns(self.df)
         topo_order = ['ABBA', 'BABA', 'AABB']
         col_for_topo = {}
         for col in avg_cols:
@@ -1690,7 +1673,7 @@ class CasterPlotter:
         split = "Null (dashed) vs Outlier (solid) " if len(series['ABBA']) > 1 else ""
         self._save_topology_grid(fig, f'{split}Topology-Score QQ vs Fitted {label}: {self.gene_name}', f'qq-{dist}.png', f'topology QQ ({dist}) plot')
 
-def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topologies=None, dist_type="gaussian", merge=False):
+def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, dist_type="gaussian", merge=False):
     """
     Writes gt_stats.txt (Null/Alt/Overall mean+covariance across the 3
     topology dimensions, ABBA/BABA/AABB order, plus each label's per-topology
@@ -1735,7 +1718,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, topolo
     except Exception:
         return
 
-    avg_cols, rename_map = CasterPlotter.resolve_topology_columns(df, topologies)
+    avg_cols, rename_map = CasterPlotter.resolve_topology_columns(df)
     topo_order = ['ABBA', 'BABA', 'AABB']
     col_for_topo = {}
     for col in avg_cols:
@@ -1920,8 +1903,8 @@ def build_parser():
         dest="window_size",
         type=int_or_abbrev,
         nargs="+",
-        default=[50000],
-        help="Window size (default: 50000 / 50k). Multiple space-separated "
+        default=[10000],
+        help="Window size (default: 10000 / 10k). Multiple space-separated "
              "values run one caster command per value (cartesian product "
              "with -s if it also has multiple values)."
     )
@@ -1950,7 +1933,6 @@ def build_parser():
              "(after -n/-i/-z). Reuses the untransformed sibling scores.tsv if "
              "present; writes to its own nested 'exp-minus' cache entry."
     )
-    add_signal_args(parser)
     parser.add_argument(
         "-s",
         dest="step_size",
@@ -2022,13 +2004,17 @@ def build_parser():
              "--plot with no choices requests that same default set, in "
              "either mode)",
     )
+    from .utils import TopologiesAction
     parser.add_argument(
-        "-t",
         "--topologies",
         dest="topologies",
         nargs="+",
+        action=TopologiesAction,
         default=None,
-        help="List of topologies to plot (default: all)"
+        help="snr, signal-max or signal-avg (--site only): write a 1D per-window 'Signal' column from per-site "
+             "d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA) / 2 (snr = mean(d_max) / std(d_max), "
+             "signal-max = mean(d_max), signal-avg = mean(d_avg)) under its own nested '<mode>' cache entry. "
+             "Column subsets (ABBA AABB, ...) are a phlag fit option; caster always writes all three.",
     )
     parser.add_argument(
         "-d",
@@ -2162,6 +2148,7 @@ def build_parser():
              "exclusive with -z/--zscale (rescaling before ILR corrupts the composition; "
              "rescaling the resulting ILR coordinates themselves is not supported)."
     )
+    parser.set_defaults(signal=None)
     return parser
 
 
@@ -2299,7 +2286,6 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
         scores_file=str(chunk_scores_path.resolve()),
         output_dir=str(plot_data_dir.resolve()),
         locus_pattern=locus_pattern,
-        topologies=args.topologies,
         dist_type=args.dist_type,
     )
 
@@ -2312,7 +2298,6 @@ def run_caster_pair(args, repo_root, data_dir, final_output_path, locus_pattern)
             scores_file=str(chunk_scores_path.resolve()),
             distribution=args.dist_type,
             data_dir=str(plot_data_dir.resolve()),
-            topologies=args.topologies,
             plot_scores=("scatter" in args.plot),
             plot_dist=("dist" in args.plot),
             plot_correlation=("correlation" in args.plot),
@@ -2432,7 +2417,6 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
         scores_file=str(chunk_scores_path.resolve()),
         output_dir=str(plot_data_dir.resolve()),
         locus_pattern=locus_pattern,
-        topologies=args.topologies,
         dist_type=args.dist_type,
     )
 
@@ -2445,7 +2429,6 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
             scores_file=str(chunk_scores_path.resolve()),
             distribution=args.dist_type,
             data_dir=str(plot_data_dir.resolve()),
-            topologies=args.topologies,
             plot_scores=("scatter" in args.plot),
             plot_dist=("dist" in args.plot),
             plot_correlation=("correlation" in args.plot),
@@ -2595,8 +2578,10 @@ def main(argv=None):
 
     if args.ilr and args.zscale:
         sys.exit("Error: --ilr and --zscale are mutually exclusive.")
+    if args.topologies and not args.signal:
+        sys.exit(f"Error: caster --topologies takes {', '.join(SIGNAL_MODES)}; column subsets ({args.topologies}) are a phlag option.")
     if args.signal and (not args.site or args.zscale or args.ilr or args.normalize or args.exp_minus):
-        sys.exit(f"Error: --{args.signal} needs --site and no -z/-i/-n/--exp-minus.")
+        sys.exit(f"Error: --topologies {args.signal} needs --site and no -z/-i/-n/--exp-minus.")
 
     # Inject defaults for CLI flags if not provided
     if args.step_size is None:
@@ -2763,7 +2748,6 @@ def main(argv=None):
             scores_file=str(final_output_path.resolve()),
             output_dir=str(plot_data_dir.resolve()),
             locus_pattern=locus_pattern,
-            topologies=args.topologies,
             dist_type=args.dist_type,
         )
         if args.plot:
@@ -2771,7 +2755,6 @@ def main(argv=None):
                 scores_file=str(final_output_path.resolve()),
                 distribution=args.dist_type,
                 data_dir=str(plot_data_dir.resolve()),
-                topologies=args.topologies,
                 plot_scores=("scatter" in args.plot),
                 plot_dist=("dist" in args.plot),
                 plot_correlation=("correlation" in args.plot),
@@ -2804,7 +2787,6 @@ def main(argv=None):
                     scores_file=str(store_path.resolve()),
                     output_dir=str(store_path.parent.resolve()),
                     locus_pattern=locus_pattern,
-                    topologies=args.topologies,
                     dist_type=args.dist_type,
                     merge=True,
                 )

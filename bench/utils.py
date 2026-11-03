@@ -49,6 +49,7 @@ from bench.cli.benchmark import (
 )
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path, signal_of_path
 from phlag.utils import (
+    TopologiesAction, normalize_topologies,
     ADMIXTURE_DIVERGENCE_THRESHOLD_MYR,
     ECDF_MAX_POINTS,
     PHLAG_SEGMENT_DEFAULTS,
@@ -189,6 +190,10 @@ _DYNAMIC_ROW_AXES = {
 _DERIVED_COLUMNS = {
     f"{p}_var_alt": (f"{p}_var_ABBA", f"{p}_var_BABA") for p in ("null", "alt", "pooled")
 }
+
+
+_TOP_CONFIGS_COLUMNS = ("exclusion", "fraction_bin", "in_panel_a", "in_panel_b", "x_bin",
+                        "category", "branch_length_cu")
 
 
 def _add_derived_columns(df):
@@ -422,6 +427,7 @@ class CrossRunAnalysis:
         self._color_cache = {}
         self._bin_specs = {}
         self._args_json_cache = {}
+        self._top_score_cache = {}
         self._match_cache = {}
 
     def pick_nodes_by_em_gt_hd(self, quantiles=(0.05, 0.35, 0.65, 0.95), dist_type="gaussian",
@@ -452,6 +458,7 @@ class CrossRunAnalysis:
         keep serving stale answers for dirs whose args.json changed or is new."""
         self._leaf_dirs = None
         self._args_json_cache = {}
+        self._top_score_cache = {}
         self._match_cache = {}
         _windowless_runs_df.cache_clear()
 
@@ -1140,6 +1147,7 @@ class CrossRunAnalysis:
             specs = spec if isinstance(spec, list) else [spec]
             bounds = [set(self._threshold_flag_values(flag, s, exclude_keywords)) for s in specs if is_threshold(s)]
             allowed[flag] = [s for s in specs if not is_threshold(s)] + (list(set.intersection(*bounds)) if bounds else [])
+        columns = {metric, *_DERIVED_COLUMNS.get(metric, ()), *_TOP_CONFIGS_COLUMNS}
         rows = []
         for d in self._all_leaf_dirs():
             if any(kw in str(d) for kw in exclude_keywords):
@@ -1147,8 +1155,13 @@ class CrossRunAnalysis:
             recorded = self._get_args(d)
             if not all(any(_matches_flags(recorded, {f: v}) for v in vs) for f, vs in allowed.items()):
                 continue
-            df = _load_raw_config_df([d], self._get_args)
-            score = df[metric].dropna().mean() if metric in df.columns else float("nan")
+            p = Path(d) / "runs.tsv"
+            key = (d, metric, p.stat().st_mtime_ns if p.exists() else None)
+            score = self._top_score_cache.get(key)
+            if score is None:
+                df = _load_raw_config_df([d], self._get_args, columns=columns)
+                score = df[metric].dropna().mean() if metric in df.columns else float("nan")
+                self._top_score_cache[key] = score
             rows.append((str(Path(d).relative_to(self.root)), score))
         df = pd.DataFrame(rows, columns=["config", metric])
         return df.sort_values(metric, ascending=ascending, na_position="last").head(k).reset_index(drop=True)
@@ -5095,6 +5108,8 @@ def _typed_value(flag, raw_value):
     if isinstance(raw_value, bool):
         return raw_value
     action = _PARSER._option_string_actions.get(flag)
+    if action is not None and isinstance(action, TopologiesAction):
+        return normalize_topologies(raw_value.split() if isinstance(raw_value, str) else raw_value)
     type_fn = action.type if action and action.type else (lambda v: v)
     try:
         return type_fn(raw_value)
@@ -5701,7 +5716,7 @@ def _drop_hidden_admixture(df):
     return df
 
 
-def _load_raw_config_df(dirs, get_args, bin_specs=None):
+def _load_raw_config_df(dirs, get_args, bin_specs=None, columns=None):
     """Concats `dirs`' runs.tsv into one frame, tagging every row with its
     source dir's window_size as "_window_size" (a config's dirs, see
     resolve_configs_cartesian, can span several window sizes when -w is a
@@ -5722,7 +5737,7 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None):
         if source is not None:
             frame = _windowless_runs_df(source).copy()
         elif p.exists():
-            frame = pd.read_csv(p, sep="\t")
+            frame = pd.read_csv(p, sep="\t", usecols=(lambda c: c in columns) if columns else None)
         else:
             continue
         frame["_window_size"] = get_args(d).get("window_size")

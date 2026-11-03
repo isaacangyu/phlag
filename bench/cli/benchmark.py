@@ -90,8 +90,8 @@ def report_progress(done, total):
     os.replace(tmp, path)
 
 DEFAULT_DIST_TYPE = "gaussian"
-DEFAULT_WINDOW_SIZE = 50000
-DEFAULT_STEP_SIZE = 1000
+DEFAULT_WINDOW_SIZE = 10000
+DEFAULT_STEP_SIZE = 10000
 
 TOPOLOGY_NAMES = ["ABBA", "BABA", "AABB"]
 RELERR_STATES = ["Null", "Alt"]
@@ -2332,7 +2332,7 @@ CASTER_ARG_SPECS = [
     ("normalize", "-n", True),
     ("norm_eps", "--norm-eps", True),
     ("exp_minus", "--exp-minus", True),
-    ("signal", "--signal", False),
+    ("signal", "--topologies", False),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
     ("site", "--site", "bool"),
@@ -2522,8 +2522,8 @@ def _build_parser():
         "caster flags", "Forwarded to caster (and, when both stages run, to phlagster)."
     )
     caster_group.add_argument(
-        "-w", "--window-size", dest="window_size", type=int_or_abbrev, default=50000,
-        help="Forwarded to caster's -w (default: 50000 / 50k).",
+        "-w", "--window-size", dest="window_size", type=int_or_abbrev, default=10000,
+        help="Forwarded to caster's -w (default: 10000 / 10k).",
     )
     caster_group.add_argument(
         "-s", "--step-size", dest="step_size", type=int_or_abbrev, default=None,
@@ -2550,8 +2550,6 @@ def _build_parser():
         help="Forwarded to caster's --exp-minus: topology columns x -> exp(-x), "
              "cached under its own nested 'exp-minus' entry.",
     )
-    from phlag.caster import add_signal_args
-    add_signal_args(caster_group)
     caster_group.add_argument(
         "--shift-caster", dest="shift_caster", action="store_true",
         help="Forwarded to caster's --shift-caster.",
@@ -2679,6 +2677,7 @@ def _build_parser():
         help="Short description of what's different in this run compared to earlier ones; "
              "written to report.txt in the run's output folder, alongside how long the run took",
     )
+    parser.set_defaults(signal=None)
     return parser
 
 
@@ -3317,8 +3316,6 @@ def default_create_path(args):
         parts.append(f"k{args.n_clusters}")
     parts.append(f"w{format_val(args.window_size)}_s{format_val(args.step_size)}" + ("_z" if args.zscale else ""))
     parts += [seg for flag, seg in (("pair", "pair"), ("site", "site"), ("shift_caster", "shift-caster")) if getattr(args, flag)]
-    if args.signal:
-        parts.append(args.signal)
     if args.ilr:
         parts.append("ilr")
     elif args.normalize:

@@ -784,29 +784,45 @@ PHLAG_SEGMENT_DEFAULTS = {
     "topologies": None,
 }
 TOPOLOGY_NAMES = ("ABBA", "BABA", "AABB")
+SIGNAL_MODES = ("snr", "signal-max", "signal-avg")
 TOPOLOGIES_HELP = ("Fit Null/Outlier Gaussians on only these score columns, e.g. "
-                   "'--topologies ABBA AABB' or 'ABBA,AABB' (default: all of ABBA BABA AABB).")
+                   "'--topologies ABBA AABB' or 'ABBA,AABB' (default: all of ABBA BABA AABB). "
+                   "Or one 1D per-window signal (--site only): snr = mean(d_max)/std(d_max), "
+                   "signal-max = mean(d_max), signal-avg = mean(d_avg), with per-site "
+                   "d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA)/2.")
 
 
 def normalize_topologies(value):
     if not value:
         return None
     tokens = [value] if isinstance(value, str) else value
-    wanted = {t.upper() for tok in tokens for t in tok.split(",") if t}
+    raw = [t for tok in tokens for t in tok.split(",") if t]
+    signals = {t.lower() for t in raw if t.lower() in SIGNAL_MODES}
+    if signals:
+        if len(raw) != 1:
+            raise ValueError(f"{', '.join(SIGNAL_MODES)} can't be combined with other topologies")
+        return signals.pop()
+    wanted = {t.upper() for t in raw}
     unknown = wanted - set(TOPOLOGY_NAMES)
     if unknown or not wanted:
-        raise ValueError(f"pick from {', '.join(TOPOLOGY_NAMES)} (got {', '.join(sorted(unknown)) or 'none'})")
+        raise ValueError(f"pick from {', '.join(TOPOLOGY_NAMES + SIGNAL_MODES)} (got {', '.join(sorted(unknown)) or 'none'})")
     if len(wanted) == len(TOPOLOGY_NAMES):
         return None
     return ",".join(t for t in TOPOLOGY_NAMES if t in wanted)
 
 
+def signal_of_topologies(value):
+    return value if value in SIGNAL_MODES else None
+
+
 class TopologiesAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         try:
-            setattr(namespace, self.dest, normalize_topologies(values))
+            value = normalize_topologies(values)
         except ValueError as e:
             parser.error(f"{option_string}: {e}")
+        setattr(namespace, self.dest, value)
+        namespace.signal = signal_of_topologies(value)
 PHLAG_SEGMENT_BARE_VALUES = {"correct_transition": "auto"}
 ANCHORED_NP = ("null-alt-zero", "null-alt-equal", "null-alt-equal-num", "null-alt-num", "bl-anchor")
 

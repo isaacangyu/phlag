@@ -78,8 +78,6 @@ def build_parser(input_file=True):
         action="store_true",
         help="Forwarded to caster's --exp-minus.",
     )
-    from phlag.caster import add_signal_args
-    add_signal_args(parser)
     parser.add_argument(
         "--shift-caster",
         dest="shift_caster",
@@ -325,6 +323,7 @@ def build_parser(input_file=True):
         default=None,
         help="Forwarded to phlag's --beta-prime (default: whatever phlag's own default is).",
     )
+    parser.set_defaults(signal=None)
     return parser
 
 
@@ -382,7 +381,7 @@ def main(argv=None):
     if args.exp_minus:
         caster_extra_args += ["--exp-minus"]
     if args.signal:
-        caster_extra_args += ["--signal", args.signal]
+        caster_extra_args += ["--topologies", args.signal]
     if args.chunk_size is not None:
         caster_extra_args += ["--chunk", str(args.chunk_size)]
     if args.chunk_scores is not None:

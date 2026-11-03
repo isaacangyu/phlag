@@ -450,7 +450,10 @@ class Phlag:
             self.topology_idx = list(range(len(score_indices)))
             self.topology_names = ["Signal"] if self.used_signal_scores else get_topology_names(len(score_indices))
             topologies = getattr(self.args, "topologies", None)
-            if topologies:
+            if utils.signal_of_topologies(topologies):
+                if not self.used_signal_scores:
+                    sys.exit(f"Error: --topologies {topologies} needs a caster scores.tsv with a Signal column, not '{path}'")
+            elif topologies:
                 if score_indices == ilr_indices or len(score_indices) != 3:
                     sys.exit(f"Error: --topologies needs ABBA/BABA/AABB score columns, not '{path}'")
                 self.topology_idx = [utils.TOPOLOGY_NAMES.index(t) for t in topologies.split(",")]
@@ -525,7 +528,7 @@ class Phlag:
                 else:
                     prefix_start = size_dir_idx - 1
                 return (
-                    get_out_root() / pathlib.Path(*parts[prefix_start:variant_end])
+                    get_out_root() / pathlib.Path(*(p for p in parts[prefix_start:variant_end] if p not in utils.SIGNAL_MODES))
                     / segments
                 )
             if size_dir_idx is not None:
@@ -534,7 +537,7 @@ class Phlag:
                     variant_end += 1
                 locus = parts[variant_end:-1]
                 if len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS:
-                    return get_out_root() / pathlib.Path(*locus, *parts[size_dir_idx:variant_end]) / segments
+                    return get_out_root() / pathlib.Path(*locus, *(p for p in parts[size_dir_idx:variant_end] if p not in utils.SIGNAL_MODES)) / segments
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
             elif "caster" in input_path.parts:
@@ -1730,7 +1733,6 @@ class Phlag:
             tmp_path = store_report.with_name(f".{store_report.name}.tmp")
             tmp_path.write_text(merged)
             os.replace(tmp_path, store_report)
-            print(f"Added {len(missing)} line(s) to '{store_report}': {[l.split(': ', 1)[0] for l in missing]}")
 
 
 class PhlagPlotter:
@@ -2350,12 +2352,13 @@ def build_parser():
         "--plot",
         nargs="*",
         type=utils.phlag_plot_choice,
-        default=["em", "states"],
+        default=None,
         help="List of plots to generate (choices: em, states, relerr, "
-             "correlations, topologies_3d, em_iters_<N>. Default: em and states; relerr is "
+             "correlations, topologies_3d, em_iters_<N>. Default: em, states and "
+             "correlations (em and states with --bench); relerr is "
              "opt-in, saving relerr.png -- fitted-vs-ground-truth relative error "
-             "per topology/state/statistic, requires ground truth; correlations "
-             "and topologies_3d are opt-in too; em_iters_<N> saves em_iters_<N>.png, "
+             "per topology/state/statistic, requires ground truth; "
+             "topologies_3d is opt-in too; em_iters_<N> saves em_iters_<N>.png, "
              "ECDFs of the HMM-assigned split after every inner EM step of the "
              "first N outer iterations (one row per outer iteration; always reruns EM). "
              "Passing --plot with no choices explicitly requests all but em_iters).",
@@ -2405,22 +2408,14 @@ def build_parser():
              "caster_scores' own window."
     )
 
-    variant_group = parser.add_argument_group(
-        "Caster scores variant",
-        "Same flags as caster.py: select which caster output to read. Any of "
-        "these set -> the scores.tsv for exactly that flag combination (unset "
-        "ones off); none set -> caster_scores as given (a FASTA/locus spec "
-        "prefers the plain sibling)."
-    )
-    variant_group.add_argument("--pair", dest="pair", action="store_true")
-    variant_group.add_argument("--site", dest="site", action=argparse.BooleanOptionalAction, default=None)
-    variant_group.add_argument("-z", "--zscale", dest="zscale", action="store_true")
-    variant_group.add_argument("-n", dest="normalize", action="store_true")
-    variant_group.add_argument("--norm-eps", dest="norm_eps", action="store_true")
-    variant_group.add_argument("-i", "--ilr", dest="ilr", action="store_true")
-    variant_group.add_argument("--exp-minus", dest="exp_minus", action="store_true")
-    from .caster import add_signal_args
-    add_signal_args(variant_group)
+    hidden = argparse.SUPPRESS
+    parser.add_argument("--pair", dest="pair", action="store_true", help=hidden)
+    parser.add_argument("--site", dest="site", action=argparse.BooleanOptionalAction, default=None, help=hidden)
+    parser.add_argument("-z", "--zscale", dest="zscale", action="store_true", help=hidden)
+    parser.add_argument("-n", dest="normalize", action="store_true", help=hidden)
+    parser.add_argument("--norm-eps", dest="norm_eps", action="store_true", help=hidden)
+    parser.add_argument("-i", "--ilr", dest="ilr", action="store_true", help=hidden)
+    parser.add_argument("--exp-minus", dest="exp_minus", action="store_true", help=hidden)
 
     parser.add_argument(
         "--agg",
@@ -2659,7 +2654,7 @@ def build_parser():
         default=None,
         help="Fix the transition matrix to ground truth (or explicit p0,p1) and freeze it during EM",
     )
-    parser.set_defaults(**PHLAG_SEGMENT_DEFAULTS)
+    parser.set_defaults(**PHLAG_SEGMENT_DEFAULTS, signal=None)
     return parser
 
 
@@ -2723,6 +2718,8 @@ def parse_arguments(argv=None):
               f"flags taking precedence.")
         return parse_arguments(recovered_tokens + override_tokens)
 
+    if args.plot is None:
+        args.plot = ["em", "states"] + ([] if args.bench else ["correlations"])
     if args.plot == []:
         # Bare "--plot" (no choices given): plot everything, same as
         # caster.py's own --plot (see phlag/caster.py's main()).
@@ -3022,8 +3019,16 @@ def _run_single(args):
             return phlag.output_file
         print(f"Found existing report '{phlag.output_file}' with matching fit -- rerunning EM for {args.plot}.")
 
-    store_report = None if args.bench or not reuse_fit else phlag.find_store_report()
-    if store_report is not None and fit_path_for(store_report).exists() and not utils.em_iters_counts(args.plot):
+    out_fit = None
+    if reuse_fit and not args.bench and not utils.em_iters_counts(args.plot):
+        out_fit = fit_path_for(phlag.get_default_out_dir() / "report.tsv")
+        if not fit_matches_args(out_fit, args):
+            out_fit = None
+    store_report = None if args.bench or not reuse_fit or out_fit else phlag.find_store_report()
+    if out_fit is not None:
+        print(f"Found fit '{out_fit}' -- skipping EM.")
+        phlag.load_fit(out_fit)
+    elif store_report is not None and fit_path_for(store_report).exists() and not utils.em_iters_counts(args.plot):
         print(f"Found benchmarked fit for '{store_report}' -- skipping EM.")
         phlag.load_fit(fit_path_for(store_report))
     else:
@@ -3151,10 +3156,14 @@ def expand_toggles_and_multi(raw_argv, parser, prog):
 
 
 def main(argv=None):
+    run(argv)
+
+
+def run(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     runs = expand_toggles_and_multi(raw_argv, build_parser(), "phlag")
     if runs is not None:
-        return [main(run_argv) for run_argv in runs]
+        return [run(run_argv) for run_argv in runs]
 
     from .utils import expand_node_specs
     raw_specs = build_parser().parse_args(raw_argv).caster_scores or []
@@ -3166,7 +3175,7 @@ def main(argv=None):
         for spec in specs:
             print(f"[phlag] multi-input -- running {spec}...")
             try:
-                results.append(main([str(spec)] + rest))
+                results.append(run([str(spec)] + rest))
             except SystemExit as e:
                 if not isinstance(e.code, str):
                     raise
