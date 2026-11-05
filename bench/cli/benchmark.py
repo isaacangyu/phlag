@@ -192,9 +192,11 @@ _RE_METRICS_WITH_PRECISION_AUC = re.compile(
     r'F1:\s*([-\d.eE+]+),\s*Accuracy:\s*([-\d.eE+]+),\s*(?:ROC-)?AUC:\s*([-\d.eE+]+)\s*$'
 )
 _RE_RELERR_ROW = re.compile(
-    r'^(\w+)\t(Null|Alt|Outlier)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\t([-\d.eE+]+|nan)\s*$',
+    r'^(\w+)\s*\t(Null|Alt|Outlier)\s*\t([-\d.eE+]+|nan)\s*\t([-\d.eE+]+|nan)\s*\t([-\d.eE+]+|nan)\s*\t([-\d.eE+]+|nan)(?:\s*\t([-\d.eE+]+|nan))?(?:\s*\t([-\d.eE+]+|nan))?\s*$',
     re.IGNORECASE,
 )
+_RE_TABLE_HEADER = re.compile(r'^Topology\s*\tState\s*\t.*\t(KL|GTHD)$')
+_RE_JOINT_HD_ROW = re.compile(r'^Joint(?:\s*\t-){5}\s*\t([-\d.eE+]+|nan|-)\s*\t([-\d.eE+]+|nan|-)$')
 _RE_EM_DIVERGENCE = re.compile(
     r'^em_hd:\s*([-\d.eE+]+)\s*$'
 )
@@ -339,6 +341,7 @@ def parse_report(report_path):
         "em_hd": None,
         "em_gt_hd": None,
         "em_gt_hd_is_joint": False,
+        "topology_hd": {},
         "transition_null_to_null": None, "transition_null_to_alt": None,
         "transition_alt_to_null": None, "transition_alt_to_alt": None,
         "gt_transition_null_to_null": None, "gt_transition_null_to_alt": None,
@@ -351,10 +354,25 @@ def parse_report(report_path):
         "cov_floor": None, "cov_floor_dims_null": None, "cov_floor_dims_alt": None,
     }
 
+    table_metric = "KL"
     with open(report_path, "r") as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if not line:
+                continue
+
+            m = _RE_TABLE_HEADER.match(line)
+            if m:
+                table_metric = m.group(1)
+                continue
+
+            m = _RE_JOINT_HD_ROW.match(line)
+            if m:
+                if m.group(1) != "-":
+                    parsed["em_hd"] = float(m.group(1))
+                if m.group(2) != "-":
+                    parsed["em_gt_hd"] = float(m.group(2))
+                    parsed["em_gt_hd_is_joint"] = True
                 continue
 
             if _RE_STATE_PATH.match(line):
@@ -431,13 +449,11 @@ def parse_report(report_path):
                 # New KL-table row shape: one row per (topology, state), no
                 # separate mean/std rows any more -- KL is a property of the
                 # pair of full Gaussians, not a per-statistic quantity.
-                topology, state, _fitted_mean_str, _fitted_std_str, gt_mean_str, gt_std_str, kl_str = m.groups()
-                try:
-                    value = float(kl_str)
-                except ValueError:
-                    value = None
-                if value is not None and not math.isnan(value):
-                    parsed["rel_err"][(topology, _report_state(state))] = value
+                topology, state, _fitted_mean_str, _fitted_std_str, gt_mean_str, gt_std_str, kl_str, gt_hd_str = m.groups()
+                if table_metric == "KL" and kl_str is not None and not math.isnan(float(kl_str)):
+                    parsed["rel_err"][(topology, _report_state(state))] = float(kl_str)
+                elif table_metric == "GTHD" and kl_str is not None:
+                    parsed["topology_hd"][topology] = (float(kl_str), float(gt_hd_str))
                 try:
                     gt_mean_value = float(gt_mean_str)
                 except ValueError:

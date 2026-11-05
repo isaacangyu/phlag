@@ -1,9 +1,7 @@
-import time
 import argparse
 import math
 import re
 
-from functools import wraps
 
 def format_number(value):
     """
@@ -54,15 +52,6 @@ def format_adaptive(value, *others, min_decimals=2, max_decimals=8):
         return s
     return f"{f:.{max_decimals}f}"
 
-
-def count_lines(filepath):
-    try:
-        with open(filepath, "r") as f:
-            line_count = sum(1 for line in f)
-        return line_count
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        raise e
 
 def parse_pattern_string(pattern_str, block_size_bp=500000, total_span=None):
     """
@@ -642,46 +631,11 @@ def get_clade_info_path(filename):
     (clade_cu.csv, population-information.tsv, 63K.tre), checking the repo root
     first and the configured data dir as a fallback. Returns None if not found.
     """
-    import pathlib
     candidates = [
         get_repo_root() / "clade-info" / filename,
         get_data_dir() / "clade-info" / filename,
     ]
     return next((c for c in candidates if c.exists()), None)
-
-
-def get_cu_branch_length(candidate_names, csv_path=None):
-    """
-    Looks up the coalescent-units branch length of an exact species name in
-    clade-info/clade_cu.csv, trying each candidate in candidate_names in order.
-    Does not infer via MRCA/internal-node reconstruction or fuzzy matching --
-    only a literal species-name match against the CSV counts (the CSV is
-    species/leaf-level only, so clade-level names like 'Strigiformes' will not
-    match; this mirrors the exact-match-only policy the old tree lookup used).
-    Returns (matched_name, branch_length), or (None, None) if no candidate
-    matched or the CSV could not be resolved.
-    """
-    import csv
-    import pathlib
-
-    csv_path = pathlib.Path(csv_path) if csv_path else get_clade_info_path("clade_cu.csv")
-    if not csv_path or not csv_path.exists():
-        return None, None
-
-    lengths = {}
-    with open(csv_path, "r", newline="") as f:
-        for row in csv.DictReader(f):
-            species = row.get("species")
-            if species and species not in lengths:
-                try:
-                    lengths[species] = float(row["cu_branch_length"])
-                except (TypeError, ValueError):
-                    lengths[species] = None
-
-    for name in candidate_names:
-        if name in lengths:
-            return name, lengths[name]
-    return None, None
 
 
 def get_population_info(label, tsv_path=None):
@@ -1114,64 +1068,6 @@ def parse_filename_to_dir_structure(filename):
         }
     return None
 
-def integer_pair(arg_str):
-    try:
-        parts = arg_str.split(",")
-        if len(parts) != 2:
-            raise ValueError(
-                "Argument must contain exactly two integers separated by a comma."
-            )
-        int1 = int(parts[0].strip())
-        int2 = int(parts[1].strip())
-        return [int1, int2]
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(f"Invalid integer pair format: {arg_str}. {e}")
-
-
-def is_float(val):
-    try:
-        return float(val) == float(val)
-    except (ValueError, TypeError):
-        return False
-
-
-def limited_float(min_val, max_val):
-    def check_range(value):
-        fvalue = float(value)
-        if not (min_val <= fvalue <= max_val):
-            raise ValueError(
-                f"Argument must be between {min_val} and {max_val} (inclusive)."
-            )
-        return fvalue
-
-    return check_range
-
-
-def limited_int(min_val, max_val):
-    def check_range(value):
-        ivalue = int(value)
-        if not (min_val <= ivalue <= max_val):
-            raise ValueError(
-                f"Argument must be between {min_val} and {max_val} (inclusive)."
-            )
-        return ivalue
-
-    return check_range
-
-
-def timeit(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        execution_time = end_time - start_time
-        print(f"Function {func.__name__} took {execution_time:.4f} seconds to execute.")
-        return result
-
-    return wrapper
-
-
 def get_repo_root():
     import os
     import pathlib
@@ -1334,7 +1230,6 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
             except Exception:
                 pass
 
-    # Deduplicate search_dirs
     seen_dirs = set()
     unique_dirs = []
     for d in search_dirs:
@@ -1395,10 +1290,8 @@ def resolve_input_file(path_input, default_subdirs=None, default_exts=None):
                 if tdir.name == "simulated" or tdir.parent.name == "simulated":
                     continue
                 files = list(tdir.glob("*.fa")) + list(tdir.glob("*.fasta")) + list(tdir.glob("*.fa.gz"))
-                # Exclude any files under a simulated subfolder
                 files = [f for f in files if "simulated" not in f.parts]
                 if files:
-                    # Pull most recent FASTA file in concat/ or directory
                     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
                     return files[0].resolve()
 
@@ -1481,7 +1374,6 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
     Finds the most recently created or modified file in store/scores, store/msa/concat,
     or specified subdirectories, ignoring report output files.
     """
-    import os
     import pathlib
 
     repo_root = get_repo_root()
@@ -1553,6 +1445,5 @@ def get_most_recent_file(default_subdirs=None, default_exts=None, exclude_prefix
             pass
 
     return newest_file
-
 
 

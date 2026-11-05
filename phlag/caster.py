@@ -606,7 +606,6 @@ class CasterPlotter:
         self.data_tag = ", ".join(tag_parts) if tag_parts else None
 
         if self.df is not None:
-            # High-contrast, vibrant, and highly distinguishable color palette for the 3 topologies
             self.topo_colors = {
                 'ABBA': '#1F77B4',    # Bold Royal Blue
                 'BABA': '#D62728',    # Vivid Crimson Red
@@ -724,29 +723,6 @@ class CasterPlotter:
             lbl = 'Predicted Alt' if not shaded else None
             ax.axvspan(start_pos, end_pos, color='#F4D03F', alpha=0.18, label=lbl)
             shaded = True
-
-    def calculate_summary_statistics(self, series):
-        """Calculates summary statistics, returns and sets self.params dict for scipy.stats."""
-        if self.distribution:
-            dist_name = self.distribution.lower()
-            if dist_name in ['gaussian', 'normal']:
-                dist_name = 'norm'
-
-            import scipy.stats as stats_module
-            dist_class = getattr(stats_module, dist_name)
-            fit_vals = dist_class.fit(series)
-
-            param_names = []
-            if dist_class.shapes:
-                param_names.extend([s.strip() for s in dist_class.shapes.split(',')])
-            param_names.extend(['loc', 'scale'])
-            self.params = dict(zip(param_names, fit_vals))
-        else:
-            self.params = {
-                'loc': series.mean(),
-                'scale': series.std()
-            }
-        return self.params
 
     @staticmethod
     def _needs_log_scale(values, ratio_threshold=100.0):
@@ -875,7 +851,6 @@ class CasterPlotter:
         self._shade_locus_pattern(plt.gca())
         self._shade_predicted_intervals(plt.gca())
 
-        # Format names for cleaner legend and title
         title = f'Genomic Topology Profile: {self.gene_name}'
         if self.data_tag:
             title += f' ({self.data_tag})'
@@ -2583,7 +2558,6 @@ def main(argv=None):
     if args.signal and (not args.site or args.zscale or args.ilr or args.normalize or args.exp_minus):
         sys.exit(f"Error: --topologies {args.signal} needs --site and no -z/-i/-n/--exp-minus.")
 
-    # Inject defaults for CLI flags if not provided
     if args.step_size is None:
         args.step_size = args.window_size
     elif isinstance(args.step_size, float):

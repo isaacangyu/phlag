@@ -15,7 +15,6 @@ from tqdm import tqdm
 import scipy.stats as stats
 import matplotlib.pyplot as plt
 import seaborn as sns
-import matplotlib.transforms as transforms
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
@@ -24,10 +23,8 @@ from . import utils
 from .caster import step_size_or_fraction, CasterPlotter
 from .utils import PHLAG_SEGMENT_DEFAULTS, parse_phlag_param_segment
 
-E_STEP_EPS = 0.0001
 PSI_EPS = 1e-9 # lowered from 1e-3, increased from 1e-9 since denominator is in thousands
 NUM_STATES = 2
-BETA_PRIME = 0.0025
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
 # Chosen independently of any observed run's data: clipping engaging on more
 # than a quarter of all LM step attempts over a fit means the optimizer is
@@ -71,11 +68,11 @@ def format_report_value(value):
     return format_number(value)
 
 
-def kl_divergence_1d(mu1, std1, mu2, std2):
-    """KL(N(mu1, std1) || N(mu2, std2)) for two 1D Gaussians. NaN if either std is non-positive."""
+def hellinger2_1d(mu1, std1, mu2, std2):
     if std1 <= 0 or std2 <= 0:
         return float('nan')
-    return math.log(std2 / std1) + (std1 ** 2 + (mu1 - mu2) ** 2) / (2 * std2 ** 2) - 0.5
+    v = std1 ** 2 + std2 ** 2
+    return max(1.0 - math.sqrt(2 * std1 * std2 / v) * math.exp(-(mu1 - mu2) ** 2 / (4 * v)), 0.0)
 
 
 def count_trainable_params(params, props):
@@ -409,7 +406,6 @@ class Phlag:
         import re
         self.source_fasta_path = None
         self.used_pair_scores = False
-        self.used_ilr_scores = False
         self.used_signal_scores = False
 
         with open(path, "r") as f:
@@ -488,8 +484,6 @@ class Phlag:
         raw_scores = np.array(raw_scores, dtype=np.float64)
         if has_q123:
             self.used_pair_scores = True
-        if ilr_indices:
-            self.used_ilr_scores = True
 
         for pos_key, score_vec in zip(pos_keys, raw_scores):
             self.pos_to_caster[pos_key] = jnp.array(score_vec, dtype=jnp.float32)
@@ -1043,8 +1037,6 @@ class Phlag:
         )
 
         headers.append("State divergence: " + emission_divergence_str)
-        if em_hellinger2_distance is not None:
-            headers.append(f"em_hd: {format_number(em_hellinger2_distance)}")
         headers.append(f"Outer EM iterations: {self.n_iters}")
         headers.append(f"Inner EM iterations: {self.increment_steps}")
         def _empirical_transition_matrix(state_path, null_state, alt_state, pair_mask=None):
@@ -1130,29 +1122,18 @@ class Phlag:
         relerr_rows = []
         if self.ground_truth_fits:
             topology_names = self.topology_names
-            headers.append("Topology\tState\tFittedMean\tFittedStd\tGTMean\tGTStd\tKL")
-            # State index 0/1 is an arbitrary EM cluster label, not a fixed
-            # Null/Alt identity -- flipped_for_eval (established above from
-            # which orientation matches y_true) says which physical state
-            # behaves like Null vs Alt, so route each into the ground-truth
-            # comparison it actually corresponds to instead of assuming
-            # state 0 is always Null.
             null_state, alt_state = (1, 0) if flipped_for_eval else (0, 1)
+            table = [("Topology", "State", "FittedMean", "FittedStd", "GTMean", "GTStd", "HD", "GTHD")]
             for d in sorted(self.ground_truth_fits.keys()):
                 mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt = self.ground_truth_fits[d]
                 mu_null_fit, std_null_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, null_state, d, np.array([0.0]))
                 mu_alt_fit, std_alt_fit, _ = get_state_mu_sigma_pdf(self.params, self.args.model_design, alt_state, d, np.array([0.0]))
-                # KL(Fitted || GroundTruth) for the 1D marginal Gaussian at this
-                # topology/state -- how much the fitted distribution diverges
-                # from the true one, playing the "error" role Rel.err used to.
-                kl_null = kl_divergence_1d(mu_null_fit, std_null_fit, mu_null_gt, std_null_gt)
-                kl_alt = kl_divergence_1d(mu_alt_fit, std_alt_fit, mu_alt_gt, std_alt_gt)
                 topo_name = topology_names[d] if d < len(topology_names) else f"Coord {d+1}"
-                headers.append(f"{topo_name}\tNull\t{format_report_value(mu_null_fit)}\t{format_report_value(std_null_fit)}\t{format_report_value(mu_null_gt)}\t{format_report_value(std_null_gt)}\t{format_report_value(kl_null)}")
-                headers.append(f"{topo_name}\tOutlier\t{format_report_value(mu_alt_fit)}\t{format_report_value(std_alt_fit)}\t{format_report_value(mu_alt_gt)}\t{format_report_value(std_alt_gt)}\t{format_report_value(kl_alt)}")
-                # (fitted - ground_truth) / ground_truth per topology/state/statistic --
-                # the metric the KL/Hellinger divergence above replaced as the report's
-                # primary error measure; kept available here only to feed --plot relerr.
+                fmt = lambda *vals: tuple(str(format_report_value(v)) for v in vals)
+                table.append((topo_name, "Null", *fmt(mu_null_fit, std_null_fit, mu_null_gt, std_null_gt,
+                                                    hellinger2_1d(mu_null_fit, std_null_fit, mu_alt_fit, std_alt_fit),
+                                                    hellinger2_1d(mu_null_gt, std_null_gt, mu_alt_gt, std_alt_gt))))
+                table.append((topo_name, "Outlier", *fmt(mu_alt_fit, std_alt_fit, mu_alt_gt, std_alt_gt), "", ""))
                 relerr_rows.append((
                     topo_name,
                     (mu_null_fit - mu_null_gt) / mu_null_gt if mu_null_gt != 0 else float('nan'),
@@ -1160,21 +1141,41 @@ class Phlag:
                     (mu_alt_fit - mu_alt_gt) / mu_alt_gt if mu_alt_gt != 0 else float('nan'),
                     (std_alt_fit - std_alt_gt) / std_alt_gt if std_alt_gt != 0 else float('nan'),
                 ))
-            # Joint (all-topologies-at-once) ground-truth squared Hellinger
-            # distance -- including cross-topology covariance, unlike the
-            # per-topology marginal fits above -- so it's directly comparable
-            # to the fitted EM divergence (hmm.PhlagHMMEmissions.em_divergence),
-            # which is also a joint, full-covariance Hellinger distance
-            # between the two states. Prefer caster's own gt_stats.txt
-            # (written alongside caster_scores by write_ground_truth_stats)
-            # when present -- same Null/Alt split, computed once by caster
-            # instead of every phlag run re-loading and re-splitting
-            # caster_scores itself. Falls back to computing it here from
-            # Y_np/y_true when gt_stats.txt is missing (e.g. an older
-            # scores.tsv from before caster started writing it).
             from .utils import read_gt_stats_file
             gt_stats_path = pathlib.Path(self.args.caster_scores).parent / "gt_stats.txt"
             gt_stats = read_gt_stats_file(gt_stats_path)
+
+            have_gt_joint = False
+            if "Null" in gt_stats and "Alt" in gt_stats and not self.used_signal_scores:
+                idx = np.array(self.topology_idx)
+                (mu_null_gt_joint, cov_null_gt_joint), (mu_alt_gt_joint, cov_alt_gt_joint) = [
+                    (np.asarray(m)[idx], np.asarray(c)[np.ix_(idx, idx)])
+                    for m, c in (gt_stats["Null"], gt_stats["Alt"])]
+                have_gt_joint = True
+            else:
+                null_vals = Y_np[y_true == 0]
+                alt_vals = Y_np[y_true == 1]
+                if len(null_vals) > 1 and len(alt_vals) > 1:
+                    emission_dim = Y_np.shape[-1]
+                    mu_null_gt_joint = null_vals.mean(axis=0)
+                    mu_alt_gt_joint = alt_vals.mean(axis=0)
+                    cov_null_gt_joint = np.cov(null_vals, rowvar=False).reshape(emission_dim, emission_dim)
+                    cov_alt_gt_joint = np.cov(alt_vals, rowvar=False).reshape(emission_dim, emission_dim)
+                    have_gt_joint = True
+
+            sliced = self.args.topologies is not None or self.used_signal_scores
+            if "Hellinger2" in gt_stats and not sliced:
+                self.gt_hellinger2 = float(gt_stats["Hellinger2"])
+            elif have_gt_joint:
+                self.gt_hellinger2 = float(hmm.gaussian_hellinger2(
+                    jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
+                    jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint)))
+
+            table.append(("Joint", "-", "-", "-", "-", "-",
+                          "-" if em_hellinger2_distance is None else str(format_report_value(em_hellinger2_distance)),
+                          "-" if self.gt_hellinger2 is None else str(self.gt_hellinger2)))
+            widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
+            headers.extend("\t".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in table)
 
             # Ground-truth per-topology (ABBA/BABA/AABB) Fisher-Pearson
             # skewness (g1 = m3/m2^1.5), read straight from gt_stats.txt
@@ -1211,36 +1212,9 @@ class Phlag:
                     var_vals = [format_number(v) for v in gt_stats[within_var_key]]
                     headers.append(f"{utils.STATE_LABELS[within_label]} within-window variance (ABBA, BABA, AABB): {var_vals}")
 
-            sliced = self.args.topologies is not None or self.used_signal_scores
-            if "Hellinger2" in gt_stats and not sliced:
-                gt_hellinger2_joint = gt_stats["Hellinger2"]
-                headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
-                self.gt_hellinger2 = float(gt_hellinger2_joint)
-            else:
-                if "Null" in gt_stats and "Alt" in gt_stats and not self.used_signal_scores:
-                    idx = np.array(self.topology_idx)
-                    (mu_null_gt_joint, cov_null_gt_joint), (mu_alt_gt_joint, cov_alt_gt_joint) = [
-                        (np.asarray(m)[idx], np.asarray(c)[np.ix_(idx, idx)])
-                        for m, c in (gt_stats["Null"], gt_stats["Alt"])]
-                    have_gt_joint = True
-                else:
-                    null_vals = Y_np[y_true == 0]
-                    alt_vals = Y_np[y_true == 1]
-                    have_gt_joint = len(null_vals) > 1 and len(alt_vals) > 1
-                    if have_gt_joint:
-                        emission_dim = Y_np.shape[-1]
-                        mu_null_gt_joint = null_vals.mean(axis=0)
-                        mu_alt_gt_joint = alt_vals.mean(axis=0)
-                        cov_null_gt_joint = np.cov(null_vals, rowvar=False).reshape(emission_dim, emission_dim)
-                        cov_alt_gt_joint = np.cov(alt_vals, rowvar=False).reshape(emission_dim, emission_dim)
-
-                if have_gt_joint:
-                    gt_hellinger2_joint = hmm.gaussian_hellinger2(
-                        jnp.array(mu_null_gt_joint), jnp.array(cov_null_gt_joint),
-                        jnp.array(mu_alt_gt_joint), jnp.array(cov_alt_gt_joint),
-                    )
-                    headers.append(f"em_gt_hd: {float(gt_hellinger2_joint)}")
-                    self.gt_hellinger2 = float(gt_hellinger2_joint)
+        elif em_hellinger2_distance is not None:
+            headers.append("Topology\tState\tFittedMean\tFittedStd\tGTMean\tGTStd\tHD\tGTHD")
+            headers.append(f"Joint\t-\t-\t-\t-\t-\t{format_report_value(em_hellinger2_distance)}\t-")
         for idx, l in enumerate(path_likelihoods):
             headers.append(f"Path {idx + 1} final joint log-likelihood: {format_number(l[-1])}")
 
@@ -1253,7 +1227,6 @@ class Phlag:
             effective_path = (1 - path) if flipped_for_eval else path
             self.output_str += "\n" + ",".join(map(str, effective_path.tolist()))
 
-        # Generate the visual plot if configured: states
         if self.args.plot and "states" in self.args.plot:
             try:
                 import matplotlib.pyplot as plt
@@ -1280,7 +1253,6 @@ class Phlag:
                     path = paths[idx]
                     plot_path_data = (1 - path) if flipped_for_eval else path
                     color = colors[idx]
-                    line_style = "-" if idx == 0 else ("--" if idx == 1 else "-.")
                     ax1.plot(positions_kb, plot_path_data, linestyle="none", marker="o", markersize=3, color=color, zorder=3)
                 
                 if self.has_ground_truth and self.anomaly_intervals:
@@ -1358,7 +1330,6 @@ class Phlag:
                 except Exception as e:
                     print(f"Warning: Could not overlay predictions onto scatter.png: {e}")
 
-        # Generate the visual plot if configured: relerr
         if self.args.plot and "relerr" in self.args.plot:
             if not relerr_rows:
                 print("Warning: --plot relerr requested but no ground truth available -- skipping.")
@@ -1495,7 +1466,6 @@ class Phlag:
         elif self.anchor_dims:
             null_mean = data_mean.at[jnp.array(self.anchor_dims)].set(self.anchor_value)
 
-        # alt variance = double null variance if --double-variance-init, else same as null
         alt_variance_mult = 2.0 if self.args.double_variance_init else 1.0
         initial_probs = INITIAL_PROBS
         if self.args.prior_init_probs and self.rho is not None:
@@ -1749,10 +1719,8 @@ class PhlagPlotter:
     def __init__(self, phlag):
         self.phlag = phlag
 
-        # Ingest and configure metadata parameters
         self.extract_metadata()
 
-        # Generate the visual distribution charts
         plots = self.phlag.args.plot
         if "em" in plots:
             self.plot_distributions()
@@ -1769,7 +1737,6 @@ class PhlagPlotter:
         self.emission_dim = self.phlag.Y.shape[-1]
         self.topology_names = self.phlag.topology_names
 
-        # Define premium color palette and labels
         self.colors = {
             0: {
                 'line': '#2B4C7E',    # Deep Steel Blue
@@ -1859,7 +1826,7 @@ class PhlagPlotter:
                 self._style_axis(ax, row_title, d, "Topology Score", "Proportion")
             self._apply_log_scales(axes[i])
 
-        legend = self._finalize_legend(fig, axes, ncol=2)
+        self._finalize_legend(fig, axes, ncol=2)
         locus_desc = get_title_locus(self.phlag.args.caster_scores, getattr(self.phlag, "output_file", None))
         title = "EM Inner-Step ECDFs (light \u2192 dark = inner step)"
         fig.suptitle(f"{title} | {locus_desc}" if locus_desc else title, fontsize=13, fontweight="bold", y=0.995)
@@ -2699,7 +2666,16 @@ def parse_arguments(argv=None):
         dist_idx = next((i for i in range(len(parts) - 1, -1, -1) if parts[i] in ("gaussian", "gmm")), None)
         if dist_idx is None:
             parser.error(f"'{report_arg}' has no gaussian/gmm segment to recover its config from")
-        recovered_tokens = [str(pathlib.Path(*parts[:dist_idx]) / "scores.tsv"), "-d", parts[dist_idx]]
+        scores_path = pathlib.Path(*parts[:dist_idx]) / "scores.tsv"
+        out_idx = next((i for i in range(dist_idx - 1, -1, -1) if parts[i] == "out"), None)
+        ws_idx = next((i for i in range(dist_idx - 1, -1, -1)
+                       if re.match(r'^[wc]\d+[km]?_s\d+[km]?', parts[i], re.IGNORECASE)), None)
+        if out_idx is not None and ws_idx is not None and out_idx + 2 <= ws_idx:
+            canonical = pathlib.Path(*parts[:out_idx], "caster", *parts[ws_idx:dist_idx],
+                                     *parts[out_idx + 2:ws_idx], "scores.tsv")
+            if canonical.exists() or not scores_path.exists():
+                scores_path = canonical
+        recovered_tokens = [str(scores_path), "-d", parts[dist_idx]]
         flag_for = {a.dest: a.option_strings[-1] for a in parser._actions if a.option_strings}
         for seg in parts[dist_idx + 1:]:
             parsed = parse_phlag_param_segment(seg)
@@ -2730,10 +2706,7 @@ def parse_arguments(argv=None):
     repo_root = get_repo_root()
     data_dir = get_data_dir()
 
-    dist_type = getattr(args, "model_design", "gaussian")
-
     def resolve_model_scores(target_name=None, return_all=False):
-        from .utils import get_phlag_output_base
         # Canonical bases (--bench's shared tree) key scores.tsv under a
         # 'caster' ancestor directory, so candidates there are filtered on
         # that. scores.tsv lives in its own store/caster/w<W>_s<S>/... tree

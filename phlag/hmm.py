@@ -144,7 +144,6 @@ def hmm_two_filter_smoother(
         transition_matrix, log_likelihoods, transition_fn
     )
 
-    # Compute smoothed probabilities
     smoothed_probs = filtered_probs * backward_pred_probs
     norm = smoothed_probs.sum(axis=1, keepdims=True)
     smoothed_probs /= norm
@@ -157,7 +156,6 @@ def hmm_two_filter_smoother(
         initial_probs=smoothed_probs[0],
     )
 
-    # Compute the transition probabilities if specified
     if compute_trans_probs:
         trans_probs = compute_transition_probs(transition_matrix, posterior, transition_fn)
         posterior = posterior._replace(trans_probs=trans_probs)
@@ -621,11 +619,9 @@ class PhlagHMMEmissions(HMMEmissions):
         penalty_lambda = self.penalty_lambda if penalty_lambda is None else penalty_lambda
         d = xbar.shape[0]
         eps = 1e-6
-        # precomputed before optimization
         weighted_scatter_about_xbar = Sxx - n * jnp.outer(xbar, xbar)
 
         def neg_objective(params):
-            # abstract params
             mu, L = params # joint update
             Sigma = L @ L.T + eps * jnp.eye(d)
             Sigma_inv = jnp.linalg.inv(Sigma)
