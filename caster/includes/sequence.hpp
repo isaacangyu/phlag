@@ -527,14 +527,16 @@ struct Quadripartition{
 			return counts;
 		}
 
-		array<double, 3> signalMoments() {
-			array<double, 3> m = {0, 0, 0};
+		array<double, 4> signalMoments() {
+			array<double, 4> m = {0, 0, 0, 0};
 			for (int iKernal = 0; iKernal < nKernal; iKernal++){
 				array<score_t, 3> temp = kernal[iKernal].score(pi);
 				double dMax = (double) temp[0] - max((double) temp[1], (double) temp[2]);
 				m[0] += dMax;
 				m[1] += dMax * dMax;
-				m[2] += (double) temp[0] - ((double) temp[1] + (double) temp[2]) / 2;
+				double dAvg = (double) temp[0] - ((double) temp[1] + (double) temp[2]) / 2;
+				m[2] += dAvg;
+				m[3] += dAvg * dAvg;
 			}
 			return m;
 		}

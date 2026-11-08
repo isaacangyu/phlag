@@ -249,10 +249,10 @@ struct Workflow {
         // chunkQuartetCnt/chunkSignCounts stay separately named internally
         // on purpose, to not confuse this file's own two features.
         map<pair<int, int>, long long> chunkQuartetCnt;
-        map<pair<int, int>, array<double, 3> > chunkSignal;
+        map<pair<int, int>, array<double, 4> > chunkSignal;
         const string signalMode = ARG.getStringArg("signal");
-        if (signalMode != "" && signalMode != "snr" && signalMode != "signal-max" && signalMode != "signal-avg"){
-            cerr << "Error: --signal must be snr, signal-max or signal-avg, not '" << signalMode << "'.\n";
+        if (signalMode != "" && signalMode != "snr-max" && signalMode != "snr-avg" && signalMode != "signal-max" && signalMode != "signal-avg"){
+            cerr << "Error: --signal must be snr-max, snr-avg, signal-max or signal-avg, not '" << signalMode << "'.\n";
             exit(1);
         }
         map<int, vector<int> > locusChunks;
@@ -269,9 +269,9 @@ struct Workflow {
             chunkSiteCount[key] += quad.genes[a].nSite;
             chunkQuartetCnt[key] += quad.genes[a].quartetCount();
             if (signalMode != ""){
-                array<double, 3> sm = quad.genes[a].signalMoments();
-                array<double, 3> &accSm = chunkSignal[key];
-                for (int t = 0; t < 3; t++) accSm[t] += sm[t];
+                array<double, 4> sm = quad.genes[a].signalMoments();
+                array<double, 4> &accSm = chunkSignal[key];
+                for (int t = 0; t < 4; t++) accSm[t] += sm[t];
             }
             locusChunks[geneLocus[a]].push_back(geneChunk[a]);
         }
@@ -320,7 +320,7 @@ struct Workflow {
                 array<array<long long, 3>, 3> signSum = {};
                 long long siteSum = 0;
                 long long quartetCntSum = 0;
-                array<double, 3> signalSum = {0, 0, 0};
+                array<double, 4> signalSum = {0, 0, 0, 0};
                 for (int j = 0; j < windowChunks; j++){
                     pair<int, int> key = make_pair(locusId, chunks[i + j]);
                     array<score_t, 3> &s = chunkScores[key];
@@ -332,8 +332,8 @@ struct Workflow {
                     siteSum += chunkSiteCount[key];
                     quartetCntSum += chunkQuartetCnt[key];
                     if (signalMode != ""){
-                        array<double, 3> &sm = chunkSignal[key];
-                        for (int t = 0; t < 3; t++) signalSum[t] += sm[t];
+                        array<double, 4> &sm = chunkSignal[key];
+                        for (int t = 0; t < 4; t++) signalSum[t] += sm[t];
                     }
                 }
                 long long pos = (long long) chunks[i] * chunkSizeArg;
@@ -342,12 +342,12 @@ struct Workflow {
                      << (double) sum[0] / denom << "\t" << (double) sum[1] / denom << "\t" << (double) sum[2] / denom
                      << "\t" << (double) quartetCntSum / denom;
                 if (signalMode != ""){
-                    double meanMax = signalSum[0] / denom;
-                    double signal = meanMax;
-                    if (signalMode == "signal-avg") signal = signalSum[2] / denom;
-                    else if (signalMode == "snr"){
-                        double var = signalSum[1] / denom - meanMax * meanMax;
-                        signal = (var > 0) ? meanMax / sqrt(var) : 0.0;
+                    bool useAvg = signalMode == "signal-avg" || signalMode == "snr-avg";
+                    double mean = signalSum[useAvg ? 2 : 0] / denom;
+                    double signal = mean;
+                    if (signalMode == "snr-max" || signalMode == "snr-avg"){
+                        double var = signalSum[useAvg ? 3 : 1] / denom - mean * mean;
+                        signal = (var > 0) ? mean / sqrt(var) : 0.0;
                     }
                     fout << "\t" << signal;
                 }
@@ -399,7 +399,7 @@ int main(int argc, char** argv){
         "per-topology raw per-site score quartet counts, sign-classified (zero/negative/positive). Same 'pos' values "
         "as --chunk-scores' output, for joining. Purely diagnostic -- never affects --chunk-scores or the tree search.");
     ARG.addStringArg(0, "signal", "", "--branch-mapping: add a 'Signal' column per window from per-site d_max = AABB - max(ABBA, BABA) "
-        "and d_avg = AABB - (ABBA + BABA) / 2: snr = mean(d_max) / std(d_max), signal-max = mean(d_max), signal-avg = mean(d_avg). "
+        "and d_avg = AABB - (ABBA + BABA) / 2: mean/std over the window's sites: snr-max = mean(d_max) / std(d_max), snr-avg = mean(d_avg) / std(d_avg), signal-max = mean(d_max), signal-avg = mean(d_avg). "
         "Empty (default): no column.");
     ARG.addIntArg(0, "window", 0, "--branch-mapping's sliding window size, in multiples of --chunk, rolling that "
         "many consecutive chunks (sliding by 1 chunk each row, so windows overlap when > 1 chunk) into each output "

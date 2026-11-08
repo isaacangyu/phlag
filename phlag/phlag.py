@@ -25,6 +25,7 @@ from .utils import PHLAG_SEGMENT_DEFAULTS, parse_phlag_param_segment
 
 PSI_EPS = 1e-9 # lowered from 1e-3, increased from 1e-9 since denominator is in thousands
 NUM_STATES = 2
+DEFAULT_WINDOW_SIZE = 10000
 INITIAL_PROBS = jnp.array([1.0000, 0.0000], dtype=jnp.float32)
 # Chosen independently of any observed run's data: clipping engaging on more
 # than a quarter of all LM step attempts over a fit means the optimizer is
@@ -511,7 +512,7 @@ class Phlag:
                     break
             if size_dir_idx is not None and "caster" not in parts:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     variant_end += 1
                 if "out" in parts[:size_dir_idx]:
                     prefix_start = len(parts[:size_dir_idx]) - parts[:size_dir_idx][::-1].index("out")
@@ -527,10 +528,10 @@ class Phlag:
                 )
             if size_dir_idx is not None:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     variant_end += 1
                 locus = parts[variant_end:-1]
-                if len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS:
+                if (len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS) or (len(locus) == 3 and locus[0] == utils.NULL_SIM_CATEGORY):
                     return get_out_root() / pathlib.Path(*locus, *(p for p in parts[size_dir_idx:variant_end] if p not in utils.SIGNAL_MODES)) / segments
             if parsed:
                 node_name = get_short_sim_name(parsed["alt"])
@@ -597,7 +598,7 @@ class Phlag:
                 # too, or it leaks into out_dir the same way 'norm-eps'
                 # would have (see phlag/caster.py's own naming-convention
                 # note in _derive_output_path).
-                while rel_parts and rel_parts[0] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -1259,6 +1260,15 @@ class Phlag:
                     for start_bp, end_bp in self.anomaly_intervals:
                         ax1.axvspan(start_bp / 1000.0, end_bp / 1000.0, color='#E05638', alpha=0.12, zorder=1)
 
+                count_lines = []
+                if self.has_ground_truth:
+                    gt_arr = np.asarray(y_true)
+                    count_lines.append(f"Ground truth: $N_o$ (Outlier) = {int((gt_arr == 1).sum())}, $N_b$ (Null) = {int((gt_arr == 0).sum())}")
+                primary_counts = np.asarray((1 - paths[0]) if flipped_for_eval else paths[0])
+                count_lines.append(f"Viterbi path 1: $N_o$ (Outlier) = {int((primary_counts == 1).sum())}, $N_b$ (Null) = {int((primary_counts == 0).sum())}")
+                ax1.text(0.99, 0.5, "\n".join(count_lines), transform=ax1.transAxes, ha="right", va="center", fontsize=9,
+                         linespacing=1.5, zorder=4, bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7"))
+
                 if ax_hist is not None:
                     edges = list(range(0, len(positions_kb), agg))
                     centers = []
@@ -1638,6 +1648,7 @@ class Phlag:
             fasta_file=fasta, window_size=val, step_size=step,
             pair=(mode == "c" and not is_site), site=is_site, chunk_size=(val if mode == "c" else None),
             zscale=is_zscale, norm_eps=norm_eps, exp_minus="exp-minus" in src.parts, signal=signal_of_path(src), left=0, right=None,
+            mapping=utils.null_sim_mapping(utils.get_simulation_node_name(src)) if utils.is_null_sim_fasta(fasta) else None,
         )
         return canonical_scores_path(ns, is_normalize, is_ilr).resolve(), caster_root
 
@@ -1651,7 +1662,7 @@ class Phlag:
         if src != store_scores and not filecmp.cmp(src, store_scores, shallow=False):
             return None
         rel_parts = list(store_scores.relative_to(caster_root).parts[1:-1])
-        while rel_parts and rel_parts[0] in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+        while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
             rel_parts.pop(0)
         if not rel_parts:
             return None
@@ -1839,12 +1850,12 @@ class PhlagPlotter:
         if legend is None:
             return
         param_states = (1, 0) if self.phlag.flipped_for_eval else (0, 1)
-        assigned = np.array(self.phlag.hmm.most_likely_states(self.phlag.params, self.phlag.Y))
+        occ = self.phlag.state_occupancy()
         lines = []
         if self.phlag.ground_truth_fits:
             y_true = np.array(self.phlag.y_true)
             lines.append(f"Ground truth: $N_o$ (Outlier) = {int((y_true == 1).sum())}, $N_b$ (Null) = {int((y_true == 0).sum())}")
-        lines.append(f"After EM: $N_o$ (Outlier) = {int((assigned == param_states[1]).sum())}, $N_b$ (Null) = {int((assigned == param_states[0]).sum())}")
+        lines.append(f"Posterior occupancy: $N_o$ (Outlier) = {occ[param_states[1]]:.1f}, $N_b$ (Null) = {occ[param_states[0]]:.1f}")
         fig.canvas.draw()
         box = legend.get_window_extent().transformed(fig.transFigure.inverted())
         fig.text(box.x0 - 0.01, box.y1, "\n".join(lines), ha="right", va="top", fontsize=9, linespacing=1.5)
@@ -2348,8 +2359,8 @@ def build_parser():
         help="Window size(s) to substitute into caster_scores' 'w<...>_s<...>'/"
              "'c<...>_s<...>' path segment (see caster.py's own -w), locating a "
              "sibling scores.tsv for the same node/pattern instead of the one "
-             "given -- unset by default (uses caster_scores exactly as given/"
-             "resolved). Multiple space-separated values run one phlag run per "
+             "given (default: 10000 / 10k, overriding caster_scores' own window; "
+             "inputs without such a segment are used as given). Multiple space-separated values run one phlag run per "
              "value (cartesian product with -s if it also has multiple values); "
              "omitted -s defaults each -w value's step to itself (ratio 1.0, "
              "non-overlapping -- see -s). Errors if caster_scores has no such "
@@ -2364,15 +2375,14 @@ def build_parser():
         required=False,
         default=None,
         help="Genomic step size (in rows/positions), matching caster.py's own "
-             "-s (default: unset -- caster_scores used as given). Used, like -w, "
+             "-s (default: 1.0, step == -w). Used, like -w, "
              "to substitute into caster_scores' path segment when explicitly "
              "passed. A value with a decimal point (e.g. 1.0) is a ratio of "
              "each combo's -w value, resolved per-combo like caster.py's own "
              "-s (1.0 -> that window's own non-overlapping step); a whole "
              "value (e.g. 1000, 1k) is a literal step. Multiple space-separated "
              "values run one phlag run per value (cartesian product with -w "
-             "if it also has multiple values); omitted -w keeps "
-             "caster_scores' own window."
+             "if it also has multiple values)."
     )
 
     hidden = argparse.SUPPRESS
@@ -2442,8 +2452,8 @@ def build_parser():
     hmm_group.add_argument(
         "--floor-fix",
         dest="floor_fix",
-        action="store_true",
-        help="Gaussian M-step covariance floor 1e-7 instead of 1e-5.",
+        action=argparse.BooleanOptionalAction,
+        help="Gaussian M-step covariance floor 1e-7 instead of 1e-5 (default: on).",
     )
     hmm_group.add_argument(
         "--no-floor",
@@ -2621,7 +2631,7 @@ def build_parser():
         default=None,
         help="Fix the transition matrix to ground truth (or explicit p0,p1) and freeze it during EM",
     )
-    parser.set_defaults(**PHLAG_SEGMENT_DEFAULTS, signal=None)
+    parser.set_defaults(**{**PHLAG_SEGMENT_DEFAULTS, "floor_fix": True}, signal=None)
     return parser
 
 
@@ -2676,13 +2686,19 @@ def parse_arguments(argv=None):
             if canonical.exists() or not scores_path.exists():
                 scores_path = canonical
         recovered_tokens = [str(scores_path), "-d", parts[dist_idx]]
-        flag_for = {a.dest: a.option_strings[-1] for a in parser._actions if a.option_strings}
+        actions = {a.dest: a for a in parser._actions if a.option_strings}
+        recovered = {"floor_fix": False}
         for seg in parts[dist_idx + 1:]:
             parsed = parse_phlag_param_segment(seg)
             if parsed is None:
                 parser.error(f"'{report_arg}': unrecognized config segment '{seg}'")
-            for dest, value in parsed.items():
-                recovered_tokens += [flag_for[dest]] if value is True else [flag_for[dest], str(value)]
+            recovered.update(parsed)
+        for dest, value in recovered.items():
+            a = actions[dest]
+            if isinstance(a, argparse.BooleanOptionalAction):
+                recovered_tokens += [a.option_strings[0] if value else a.option_strings[1]]
+            else:
+                recovered_tokens += [a.option_strings[-1]] if value is True else [a.option_strings[-1], str(value)]
         raw_argv = list(argv) if argv is not None else sys.argv[1:]
         override_tokens = list(raw_argv)
         try:
@@ -2793,7 +2809,7 @@ def parse_arguments(argv=None):
                     return candidates[0].resolve()
         return all_matches if return_all else None
 
-    def resolve_sibling_scores(fasta_path, variant=None):
+    def resolve_sibling_scores(fasta_path, variant=None, null_node=None):
         """
         Given a raw source FASTA (not caster's own scores.tsv/chunk_scores.tsv
         output), locates the scores.tsv caster.py already produced from it --
@@ -2815,7 +2831,9 @@ def parse_arguments(argv=None):
         from .caster import recover_source_fasta
 
         parsed = parse_filename_to_dir_structure(fasta_path.stem)
-        if parsed:
+        if null_node:
+            node_name = f"{utils.NULL_SIM_CATEGORY}/{null_node}"
+        elif parsed:
             node_name = get_short_sim_name(parsed["alt"])
         else:
             node_name = get_simulation_node_name(fasta_path) or fasta_path.stem
@@ -2830,7 +2848,7 @@ def parse_arguments(argv=None):
         def is_variant(sfile):
             ws = parse_ws_from_path(sfile)
             return (ws is None or any(ws[3:])
-                    or bool({"site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
+                    or bool({"site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
 
         def ws_config(sfile):
             ws = parse_ws_from_path(sfile)
@@ -2849,6 +2867,9 @@ def parse_arguments(argv=None):
             candidates = [c for c in candidates if variant_of_path(c) == variant]
         elif args.window_size is not None or args.step_size is not None:
             candidates = sorted(candidates, key=lambda c: any((variant_of_path(c) or {"": True}).values()))
+        steps = args.step_size if isinstance(args.step_size, list) else [1.0 if args.step_size is None else args.step_size]
+        wanted = {(w, s if isinstance(s, int) else max(1, round(s * w))) for w in (args.window_size or [DEFAULT_WINDOW_SIZE]) for s in steps}
+        candidates = sorted(candidates, key=lambda c: tuple((parse_ws_from_path(c) or (None,) * 3)[1:3]) not in wanted)
         newest = next((c for c in candidates if matches_fasta(c)), None)
         if newest is None:
             return None
@@ -2867,13 +2888,15 @@ def parse_arguments(argv=None):
             )
         if recent_file is None or not recent_file.exists():
             sys.exit("Error: No score file found in store/phlag or candidate data directories.")
-        print(f"Using most recent score file: {recent_file}")
+        print(f"[phlag] Using most recent score file: {recent_file}")
         args.caster_scores = recent_file
     else:
         from .utils import resolve_locus_spec
         spec_fasta = resolve_locus_spec(args.caster_scores) if not pathlib.Path(args.caster_scores).exists() else None
+        spec_parts = pathlib.PurePath(args.caster_scores).parts
+        null_node = spec_parts[1] if spec_fasta is not None and spec_parts[0] == utils.NULL_SIM_CATEGORY else None
         if spec_fasta is not None:
-            print(f"Resolved locus spec '{args.caster_scores}' -> '{spec_fasta}'")
+            print(f"[phlag] Resolved locus spec '{args.caster_scores}' -> '{spec_fasta}'")
             args.caster_scores = spec_fasta
         resolved = resolve_input_file(args.caster_scores, default_subdirs=["scores", "msa", "store/scores", "store/phlag"], default_exts=[".tsv", ".txt"])
         if resolved.exists() and resolved.is_file() and resolved.suffix.lower() in (".fa", ".fasta", ".fna"):
@@ -2882,11 +2905,11 @@ def parse_arguments(argv=None):
             # it already produced (see resolve_sibling_scores) instead of
             # erroring out later at -w/-s substitution (which needs an
             # existing 'w<...>_s<...>' path segment a raw FASTA never has).
-            sibling = resolve_sibling_scores(resolved, variant or default_variant)
+            sibling = resolve_sibling_scores(resolved, variant or default_variant, null_node)
             if sibling is None:
                 which = f" matching {[d for d, v in (variant or default_variant).items() if v]}"
                 sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv{which} found for it yet -- run caster.py on it first.")
-            print(f"'{resolved}' is a FASTA file -- using its sibling scores: {sibling}")
+            print(f"[phlag] '{resolved}' is a FASTA; using caster scores already computed from it: {sibling}")
             args.caster_scores = sibling
         elif resolved.exists() and resolved.is_file():
             args.caster_scores = resolved
@@ -3128,7 +3151,14 @@ def expand_toggles_and_multi(raw_argv, parser, prog):
     return runs
 
 
+def pinned_ws_args(scores_path):
+    from .caster import parse_ws_from_path
+    ws = parse_ws_from_path(pathlib.Path(scores_path))
+    return ["-w", str(ws[1]), "-s", str(ws[2])] if ws else []
+
+
 def main(argv=None):
+    print(f"[phlag] running phlag: {' '.join(sys.argv[1:] if argv is None else map(str, argv))}", flush=True)
     run(argv)
 
 
@@ -3163,36 +3193,35 @@ def run(argv=None):
     import copy
     import itertools
 
-    window_sizes = args.window_size
-    step_sizes = args.step_size
-    batch_w = window_sizes is not None
-    batch_s = isinstance(step_sizes, list)
+    from .caster import parse_ws_from_path, substitute_ws_in_path
+
+    explicit_w = args.window_size is not None
+    window_sizes = args.window_size or [DEFAULT_WINDOW_SIZE]
+    step_sizes = args.step_size if isinstance(args.step_size, list) else [1.0]
 
     ws_combos = [None]
-    if batch_w or batch_s:
-        from .caster import parse_ws_from_path, substitute_ws_in_path
-
-        base_path = pathlib.Path(args.caster_scores)
-        ws = parse_ws_from_path(base_path)
-        if ws is None:
-            sys.exit(f"Error: -w/-s requires a 'w<...>_s<...>'/'c<...>_s<...>' "
-                      f"path segment in '{base_path}' to substitute into, none found.")
-        orig_val = ws[1]
-
-        w_list = window_sizes if batch_w else [orig_val]
-        # Omitted -s defaults to ratio 1.0 (non-overlapping, step==that combo's
-        # own -w) rather than reusing caster_scores' own literal step -- the
-        # standard sweep convention (see feedback_standard_window_sizes) pairs
-        # step with window per size, not one fixed absolute step across sizes.
-        s_list = step_sizes if batch_s else [1.0]
-
+    base_path = pathlib.Path(args.caster_scores)
+    if parse_ws_from_path(base_path) is not None:
         ws_combos = []
-        for w, s in itertools.product(w_list, s_list):
+        for w, s in itertools.product(window_sizes, step_sizes):
             step = s if isinstance(s, int) else max(1, round(s * w))
             new_path = substitute_ws_in_path(base_path, w, step)
             if not new_path.exists():
-                sys.exit(f"Error: no scores file found at '{new_path}' for -w {w} -s {s} (step={step}).")
+                seg_dir = next(pathlib.Path(*base_path.parts[:i]) for i in range(len(base_path.parts), 0, -1) if parse_ws_from_path(pathlib.Path(*base_path.parts[:i])) is None)
+                have = sorted(d.name for d in seg_dir.iterdir() if d.is_dir() and parse_ws_from_path(d)) if seg_dir.is_dir() else []
+                sys.exit(f"[phlag] Error: caster has not been run at window {w} / step {step} for this locus.\n"
+                         f"  expected: {new_path}\n"
+                         f"  windows that exist: {', '.join(have) or 'none'}\n"
+                         f"  fix: run caster with -w {w} -s {s} first, or pass phlag a -w that exists"
+                         + ("" if explicit_w else f" (-w defaults to {DEFAULT_WINDOW_SIZE})") + ".")
             ws_combos.append((w, step, new_path))
+    elif explicit_w or isinstance(args.step_size, list):
+        sys.exit(f"Error: -w/-s requires a 'w<...>_s<...>'/'c<...>_s<...>' "
+                  f"path segment in '{base_path}' to substitute into, none found.")
+
+    if len(ws_combos) == 1 and ws_combos[0] is not None and (args.output_file is None or not (explicit_w or isinstance(args.step_size, list))):
+        args.window_size, args.step_size, args.caster_scores = ws_combos[0]
+        ws_combos = [None]
 
     # --beta overrides --beta-prime, so crossing both would just repeat runs.
     beta_primes = [None] if args.beta else (args.beta_prime or [None])

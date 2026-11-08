@@ -34,12 +34,15 @@ from bench.cli.benchmark import (
     FRACTION_BIN_EDGES,
     FRACTION_BINS,
     HD_NUM_BINS,
+    CASTER_ARG_SPECS,
     PHLAG_ARG_SPECS,
     TOPOLOGY_NAMES,
     BenchmarkStats,
     _RE_STATE_PATH,
     _build_parser,
     _read_args_json,
+    default_create_path,
+    parse_arguments,
     assign_bin,
     discover_leaf_dirs,
     get_expected_scores_path,
@@ -47,6 +50,7 @@ from bench.cli.benchmark import (
     parse_report,
     transition_total,
 )
+from bench.cli.split_script import parse_commands, split_command
 from phlag.caster import format_val, int_or_abbrev, parse_ws_from_path, signal_of_path
 from phlag.utils import (
     TopologiesAction, normalize_topologies, gaussian_hellinger2_nd,
@@ -200,6 +204,11 @@ def _add_derived_columns(df):
     for col, sources in _DERIVED_COLUMNS.items():
         if all(c in df.columns for c in sources):
             df[col] = df[list(sources)].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    if all(c in df.columns for c in ("tp", "fp", "fn", "tn")):
+        tp, fp, fn, tn = (pd.to_numeric(df[c], errors="coerce") for c in ("tp", "fp", "fn", "tn"))
+        n = (tp + fp + fn + tn).where(lambda v: v > 0)
+        df["alt_prop_gt"] = (tp + fn) / n
+        df["alt_prop_pred"] = (tp + fp) / n
     return df
 
 
@@ -391,6 +400,24 @@ def _match_cache_key(flags):
     """Canonical, order-independent, hashable key for a find_matching_leaf_dirs
     `flags` dict -- used to memoize its result (see find_matching_leaf_dirs)."""
     return tuple(sorted(flags.items()))
+
+
+def _args_to_flags(recorded):
+    flags, seen = [], set()
+    for dest, flag, kind in CASTER_ARG_SPECS + PHLAG_ARG_SPECS:
+        if flag in seen or dest not in recorded:
+            continue
+        seen.add(flag)
+        value = recorded[dest]
+        if kind in ("bool", "tristate"):
+            if value is not None:
+                flags.append(flag if value else "--no-" + flag[2:])
+        elif kind is True:
+            if value:
+                flags.append(flag)
+        elif value is not None:
+            flags.append(f"{flag} {format_val(value) if flag in ('-w', '-s') else value}")
+    return " ".join(flags)
 
 
 class CrossRunAnalysis:
@@ -1167,6 +1194,34 @@ class CrossRunAnalysis:
         df = pd.DataFrame(rows, columns=["config", metric])
         return df.sort_values(metric, ascending=ascending, na_position="last").head(k).reset_index(drop=True)
 
+    def list_config(self, path):
+        if path.lstrip().startswith("-"):
+            path = "benchmark " + path.lstrip()
+        commands = [c for c in parse_commands(path) if c[0] == "benchmark"]
+        if commands:
+            for tokens in commands:
+                for _, argv in split_command(tokens):
+                    args = parse_arguments(argv[1:])
+                    rel = Path(args.create or default_create_path(args))
+                    rel = rel.relative_to("store/phlag") if rel.is_relative_to("store/phlag") else rel
+                    d = Path(self.root) / rel
+                    recorded = self._get_args(d) if (d / "args.json").exists() else None
+                    flags = _args_to_flags(recorded if recorded is not None else vars(args))
+                    print(f"{rel}{'' if recorded is not None else ' (not run)'}: {flags}")
+            return
+        norm = lambda part: part.split("=", 1)[-1]
+        target = Path(path)
+        target = target.relative_to(self.root) if target.is_relative_to(self.root) else target
+        if (Path(self.root) / target / "args.json").exists():
+            dirs = [Path(self.root) / target]
+        else:
+            want = sorted(norm(p) for p in target.parts)
+            dirs = [d for d in self._all_leaf_dirs() if sorted(norm(p) for p in d.relative_to(self.root).parts) == want]
+        if not dirs:
+            raise FileNotFoundError(f"No run dir matches {path} under {self.root}")
+        for d in dirs:
+            print(f"{d.relative_to(self.root)}: {_args_to_flags(self._get_args(d))}")
+
     # ---- cross-run PNG-metric grids ----
 
     def _plot_tpr_fpr_grid(self, configs, title="TPR/FPR", full=False):
@@ -1315,6 +1370,10 @@ class CrossRunAnalysis:
                         d = dfs[label]
                         if d.empty:
                             continue
+                        if "roc_auc" in d.columns:
+                            n_runs = ax.__dict__.setdefault("_n_runs", {})
+                            lv_key = axis_val(label, agg_idx)
+                            n_runs[lv_key] = n_runs.get(lv_key, 0) + int(d["roc_auc"].notna().sum())
                         d = d[_is_true(d["in_panel_b"])]
                         if d.empty:
                             continue
@@ -2388,7 +2447,8 @@ class CrossRunAnalysis:
                 for leg in legends:
                     leg.set_title("")
                     for text in leg.get_texts():
-                        text.set_text(re.sub(r"\s*\([^()]*±[^()]*\)$", "", text.get_text()))
+                        t = re.sub(r"\(((?:f1|ROC-AUC)=[^()±]*)±[^()]*\)$", r"(\1)", text.get_text())
+                        text.set_text(re.sub(r"\s*\([^()]*±[^()]*\)$", "", t))
                     if all(text.get_text() == "all" for text in leg.get_texts()):
                         leg.remove()
                 if getattr(fig, "_legend_params", "") and fig.legends:
@@ -2411,7 +2471,8 @@ class CrossRunAnalysis:
         def spy(ax, pos, vals, color, width, plot_type, errorbar="default"):
             before = set(ax.get_children())
             out = draw(ax, pos, vals, color, width, plot_type, errorbar)
-            calls.append((ax, pos, width, color, [a for a in ax.get_children() if a not in before]))
+            calls.append((ax, pos, width, color, [a for a in ax.get_children() if a not in before],
+                          int(pd.Series(vals).notna().sum())))
             return out
 
         globals()["_draw_stat"], plt.show = spy, lambda *a, **k: None
@@ -2444,19 +2505,28 @@ class CrossRunAnalysis:
         paper_idx = next(i for i, t in enumerate(legend.get_texts()) if t.get_text().startswith(PAPER_SOURCE))
         paper_hex = to_hex(legend.legend_handles[paper_idx].get_facecolor())
         rows = list(PHLAG_PAPER_F1)
-        for ax, pos, width, color, artists in calls:
+        tick_of = lambda ax, pos: int(np.argmin(np.abs(ax.get_xticks() - pos)))
+        ours = {}
+        for ax, pos, _, color, _, n in calls:
+            if to_hex(color) != paper_hex and n:
+                ours.setdefault((ax, tick_of(ax, pos)), []).append(n)
+        paper_means, paper_weights = [], []
+        for ax, pos, width, color, artists, n in calls:
             if to_hex(color) != paper_hex:
                 continue
             for a in artists:
                 a.remove()
             spec = ax.get_subplotspec()
-            ticks = ax.get_xticks()
-            label = ax.get_xticklabels()[int(np.argmin(np.abs(ticks - pos)))].get_text()
+            tick = tick_of(ax, pos)
+            label = ax.get_xticklabels()[tick].get_text()
             mean, err = paper_of(rows[spec.rowspan.start], _MERGED_CATEGORY_ORDER[spec.colspan.start], label)
+            paper_means.append(mean)
+            paper_weights.append(np.mean(ours.get((ax, tick), [n or 1])))
             ax.bar(pos, mean, width=width * 0.92, color=paper_hex, zorder=2)
             if err and errorbar is not None:
                 ax.errorbar(pos, mean, yerr=err, fmt="none", ecolor="black", elinewidth=1.0, capsize=2, zorder=3)
-        legend.get_texts()[paper_idx].set_text("Phlag (paper)")
+        legend.get_texts()[paper_idx].set_text(
+            f"Phlag (paper) ({metric}={np.average(paper_means, weights=paper_weights):.4f})" if paper_means else "Phlag (paper)")
         spread = {"default": "SEM", "sem": "SEM", "sd": "SD"}.get(errorbar)
         if plot_type == "violin":
             note = ("Violin: KDE of values inside 1.5·IQR, truncated at their min/max; "
@@ -2482,6 +2552,7 @@ class CrossRunAnalysis:
                    for t, h in zip(source_legend.get_texts(), source_legend.legend_handles)]
         paper_hex = next(c for label, c in entries if label.startswith(PAPER_SOURCE))
         rows = list(PHLAG_PAPER_FPR_TPR)
+        paper_aucs, paper_weights = [], []
         for ax in fig.axes:
             if ax.get_subplotspec() is None:
                 continue
@@ -2493,14 +2564,20 @@ class CrossRunAnalysis:
                     line.remove()
             spec = ax.get_subplotspec()
             fpr, tpr = PHLAG_PAPER_FPR_TPR[rows[spec.rowspan.start]][_MERGED_CATEGORY_ORDER[spec.colspan.start]]
+            n_runs = getattr(ax, "_n_runs", {})
+            ours = [n for k, n in n_runs.items() if n and not str(k).startswith(PAPER_SOURCE)]
+            paper_aucs.append((tpr + 1 - fpr) / 2)
+            paper_weights.append(np.mean(ours) if ours else max(sum(n_runs.values()), 1))
             ax.scatter(fpr, tpr, marker="*", s=180, color=paper_hex, edgecolor="black", linewidth=0.6, zorder=6)
-        handles = [Line2D([], [], marker="*", ls="", ms=12, color=paper_hex, mec="black", label="Phlag (paper)")]
+        paper_label = (f"Phlag (paper) (ROC-AUC≈{np.average(paper_aucs, weights=paper_weights):.4f})"
+                       if paper_aucs else "Phlag (paper)")
+        handles = [Line2D([], [], marker="*", ls="", ms=12, color=paper_hex, mec="black", label=paper_label)]
         handles += [Line2D([], [], marker="o", ls="", color=c, label=label) for label, c in entries if not label.startswith(PAPER_SOURCE)]
         fig.legend(handles=handles, loc="upper right", fontsize=8)
         source_legend.remove()
         return fig
 
-    def _plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type="bar", grid_by=None,
+    def _plot(self, axes, run=None, metrics=None, agg=(), exclude_keywords=(), plot_type=None, grid_by=None,
               title="", options=None, show_config_suffix=True, logy=False, dir="store", shared=False, agg_idx=0,
               errorbar="default", color=None, scalex=False, scaley=False):
         """`run` (a directory, e.g. "out/10X/down/N276/37-62") makes this a
@@ -2741,6 +2818,10 @@ class CrossRunAnalysis:
         by caster/benchmark before phlag's EM ever runs) so the title
         doesn't imply a dependency that isn't there."""
         assert metrics is not None, "metrics is required"
+        xy = color is not None and run is None and len(metrics) == 2 and not any(
+            isinstance(m, tuple) or m == "tpr_fpr" or m in _DIST_METRICS for m in metrics)
+        xy_violin = xy and plot_type == "violin"
+        plot_type = plot_type or ("scatter" if xy else "bar")
         self._gt_hd_topologies = None
         dist_metric = next((m for m in metrics if m in _DIST_METRICS), None)
         if dist_metric is not None:
@@ -2808,8 +2889,9 @@ class CrossRunAnalysis:
         self._last_configs = configs
         suffix = self._title_suffix(configs) if show_config_suffix else ""
         params, suffix = (_compose_title(suffix), "") if title else ("", suffix)
-        if plot_type == "scatter":
-            return _tag_legend_params([self._plot_metric_scatter(configs, metrics, suffix, title, options, color)], params)
+        if plot_type == "scatter" or xy_violin:
+            return _tag_legend_params([self._plot_metric_scatter(configs, metrics, suffix, title, options, color,
+                                                                 violin=xy_violin)], params)
         kw = dict(plot_type=plot_type, grid_by=grid_by, title=title, options=options, logx=logx, logy=logy,
                   interp=interp, agg_idx=agg_idx, errorbar=errorbar, color=color, scalex=scalex, scaley=scaley)
         levels = max((len(self._config_axes.get(label, [])) for label, _ in configs), default=0)
@@ -2828,11 +2910,15 @@ class CrossRunAnalysis:
                      for value in order]
         return _tag_legend_params([list(row) for row in zip(*per_group)], params)
 
-    def _plot_metric_scatter(self, configs, metrics, suffix, title, options, color):
+    def _plot_metric_scatter(self, configs, metrics, suffix, title, options, color, violin=False):
         """metrics=[x, y] (runs.tsv columns, "bl" = branch_length_cu), one
-        point per run row; hue = config, or `color` (a runs.tsv column)."""
+        point per run row; hue = config, or `color` (a runs.tsv column).
+        violin=True (plot_type="violin" + color): adds a violin of y per
+        distinct x value and jitters the points. options={"diagonal": True}
+        draws y=x."""
+        kind = "violin" if violin else "scatter"
         if len(metrics) != 2 or any(isinstance(m, tuple) for m in metrics):
-            raise ValueError(f"plot_type='scatter' takes metrics=[x, y], got {metrics}")
+            raise ValueError(f"plot_type={kind!r} takes metrics=[x, y], got {metrics}")
         x, y = (_SCATTER_COLUMN_ALIASES.get(m, m) for m in metrics)
         c = _SCATTER_COLUMN_ALIASES.get(color, color)
         dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args, self._gt_hd_topologies)
@@ -2841,38 +2927,81 @@ class CrossRunAnalysis:
                 raise ValueError(f"{col!r} is not a runs.tsv column (see cra.columns)")
         spec = _color_spec([v for d in dfs.values() if c in d.columns for v in d[c]], color, log=color == "bl",
                            cmap="viridis") if c else None
-        fig, ax = plt.subplots(figsize=(6.5 + (1.2 if spec else 0), 5))
+        facet = options.get("facet")
+        if facet and not any(facet in d.columns for d in dfs.values()):
+            raise ValueError(f"facet={facet!r} is not a runs.tsv column (see cra.columns)")
+        facets = sorted({v for d in dfs.values() if facet in d.columns for v in d[facet].dropna()}) if facet else [None]
+        ncols = min(len(facets), 3)
+        nrows = -(-len(facets) // ncols)
+        fig, axs = plt.subplots(nrows, ncols, figsize=((6.5 if ncols == 1 else 4.5 * ncols) + (1.2 if spec else 0), 5 if nrows == 1 else 4 * nrows),
+                                sharex=True, sharey=True, squeeze=False)
+        for a in axs.flat[len(facets):]:
+            a.set_visible(False)
         handles, labels = [], []
-        for i, (label, d) in enumerate(dfs.items()):
-            if d.empty or x not in d.columns or y not in d.columns:
+        for i, (label, d_all) in enumerate(dfs.items()):
+            if d_all.empty or x not in d_all.columns or y not in d_all.columns:
                 continue
-            d = d[np.isfinite(d[x].astype(float)) & np.isfinite(d[y].astype(float))]
-            if d.empty:
+            rhos = []
+            for ax, fv in zip(axs.flat, facets):
+                d = d_all if facet is None else d_all[d_all[facet] == fv] if facet in d_all.columns else d_all.iloc[:0]
+                d = d[np.isfinite(d[x].astype(float)) & np.isfinite(d[y].astype(float))]
+                if d.empty:
+                    continue
+                colors = [_color_of(spec, v) for v in _color_codes(spec, list(d[c]))] if spec else [_config_color(i)] * len(d)
+                xs = d[x].astype(float).to_numpy()
+                if violin:
+                    levels = np.unique(xs)
+                    width = 0.8 * (np.diff(levels).min() if len(levels) > 1 else 1.0)
+                    groups = [d[y].astype(float).to_numpy()[xs == v] for v in levels]
+                    keep = [k for k, g in enumerate(groups) if len(g) > 1]
+                    parts = ax.violinplot([groups[k] for k in keep], positions=levels[keep], widths=width,
+                                          showextrema=False, showmedians=True)
+                    for body in parts["bodies"]:
+                        body.set(facecolor="lightgray", edgecolor="gray", alpha=0.5, zorder=1)
+                    parts["cmedians"].set(color="black", linewidth=1.2, zorder=3)
+                    xs = xs + np.random.default_rng(0).uniform(-width / 4, width / 4, len(xs))
+                ax.scatter(xs, d[y], s=10, alpha=0.5, c=colors, linewidths=0, marker="os^vD<>"[i % 7] if spec else "o",
+                           zorder=2)
+                rho = stats.spearmanr(d[x], d[y]).correlation if len(d) > 2 else np.nan
+                rhos.append((rho, len(d)))
+                if facet is not None:
+                    ax.text(0.02, 0.98 - 0.06 * i, f"ρ={rho:.2f}, n={len(d)}", transform=ax.transAxes, fontsize=7, va="top",
+                            color="black" if spec else _config_color(i))
+            if not rhos:
                 continue
-            colors = [_color_of(spec, v) for v in _color_codes(spec, list(d[c]))] if spec else [_config_color(i)] * len(d)
-            ax.scatter(d[x], d[y], s=10, alpha=0.5, c=colors, linewidths=0, marker="os^vD<>"[i % 7] if spec else "o")
-            rho = stats.spearmanr(d[x], d[y]).correlation if len(d) > 2 else np.nan
             handles.append(matplotlib.lines.Line2D([], [], marker="os^vD<>"[i % 7] if spec else "o", linestyle="",
                                                    color="gray" if spec else _config_color(i)))
-            labels.append(f"{label} (ρ={rho:.2f}, n={len(d)})")
+            labels.append(label if facet is not None else f"{label} (ρ={rhos[0][0]:.2f}, n={rhos[0][1]})")
         if not handles:
             raise ValueError(f"No {x}/{y} values for {[l for l, _ in configs]}")
-        if options.get("logx"):
-            ax.set_xscale("log")
-        if options.get("logy") is True:
-            ax.set_yscale("log")
-        ax.set_xlabel(_scatter_axis_label(x, self._gt_hd_topologies))
-        ax.set_ylabel(_scatter_axis_label(y, self._gt_hd_topologies))
-        ax.grid(alpha=0.25)
-        if spec and spec["cats"] is None:
-            fig.colorbar(matplotlib.cm.ScalarMappable(norm=spec["norm"], cmap=spec["cmap"]), ax=ax,
-                         label="branch length (CU)" if color == "bl" else color)
-        elif spec:
+        for ax, fv in zip(axs.flat, facets):
+            if options.get("logx"):
+                ax.set_xscale("log")
+            if options.get("logy") is True:
+                ax.set_yscale("log")
+            if options.get("diagonal"):
+                ax.axline((0, 0), slope=1, color="black", linestyle="--", linewidth=1, alpha=0.6, zorder=0)
+            ax.grid(alpha=0.25)
+            if facet is not None:
+                ax.set_title(f"{_ROW_AXIS_TITLE_PREFIX.get(facet, facet)} {_row_axis_display(facet, fv)}", fontsize=9)
+        for ax in axs[-1]:
+            ax.set_xlabel(_scatter_axis_label(x, self._gt_hd_topologies))
+        for ax in axs[:, 0]:
+            ax.set_ylabel(_scatter_axis_label(y, self._gt_hd_topologies))
+        ax = axs.flat[0]
+        bar = spec and spec["cats"] is None
+        right = 1 - 1.2 / fig.get_figwidth() if bar else 1.0
+        if spec and not bar:
             ax.legend([matplotlib.lines.Line2D([], [], color=_color_of(spec, k), linewidth=2) for k in range(len(spec["cats"]))],
                       spec["cats"], title=color, fontsize=7, title_fontsize=8, loc="best")
         _suptitle(fig, _compose_title(suffix, title, f"{_scatter_axis_label(y, self._gt_hd_topologies)} vs "
                                                      f"{_scatter_axis_label(x, self._gt_hd_topologies)} (Spearman ρ)"), fontsize=10)
-        _legend_below_axes(fig, handles, labels, ncol=1, fontsize=8)
+        _legend_below_axes(fig, handles, labels, ncol=1, fontsize=8, right=right)
+        if bar:
+            top, bottom = axs[0][-1].get_position().y1, axs[-1][-1].get_position().y0
+            cax = fig.add_axes([right + 0.15 / fig.get_figwidth(), bottom, 0.15 / fig.get_figwidth(), top - bottom])
+            fig.colorbar(matplotlib.cm.ScalarMappable(norm=spec["norm"], cmap=spec["cmap"]), cax=cax,
+                         label=_scatter_axis_label(c))
         return fig
 
     @property
@@ -4090,7 +4219,7 @@ def _report_window_labels(report, scores_path, pattern):
     return scores, y_true, y_pred, occupancy
 
 
-_CASTER_VARIANT_DIRS = {"site", "pair", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"}
+_CASTER_VARIANT_DIRS = {"site", "pair", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"}
 _WINDOW_ECDF_LINTHRESH = 1e-2
 
 
@@ -4863,7 +4992,7 @@ def _recorded_from_report_path(report):
     mode, window, step, is_site, is_z, is_ilr, is_norm, norm_eps = parse_ws_from_path(report)
     parts = report.parent.parts
     size_idx = next(i for i, part in enumerate(parts) if _OUT_SIZE_SEGMENT.match(part))
-    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus")]
+    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus")]
     recorded = {
         "window_size": window, "step_size": step, "site": is_site, "zscale": is_z, "ilr": is_ilr,
         "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "signal": signal_of_path(report), "pair": mode == "c" and not is_site,
@@ -5862,11 +5991,15 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None, columns=None):
 
 
 _SCATTER_COLUMN_ALIASES = {"bl": "branch_length_cu"}
+_SCATTER_COLUMN_LABELS = {"alt_prop_gt": "ground-truth outlier proportion", "alt_prop_pred": "predicted outlier proportion",
+                          "roc_auc": "ROC-AUC", "f1": "F1"}
 
 
 def _scatter_axis_label(col, gt_hd_topologies=None):
     if col == "branch_length_cu":
         return "branch length (CU)"
+    if col in _SCATTER_COLUMN_LABELS:
+        return _SCATTER_COLUMN_LABELS[col]
     if col == "em_gt_hd" and gt_hd_topologies:
         return f"em_gt_hd ({','.join(gt_hd_topologies)})"
     return col

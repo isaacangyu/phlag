@@ -549,7 +549,7 @@ def get_short_sim_name(sim_name):
 
 
 _NODE_NAME_PATH_MODIFIERS = {
-    "site", "snr", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
+    "site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
     "var2x", "repulsion", "annealing", "floor-fix", "no-floor", "null-majority", "no-null-majority",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
@@ -738,11 +738,11 @@ PHLAG_SEGMENT_DEFAULTS = {
     "topologies": None,
 }
 TOPOLOGY_NAMES = ("ABBA", "BABA", "AABB")
-SIGNAL_MODES = ("snr", "signal-max", "signal-avg")
+SIGNAL_MODES = ("snr-max", "snr-avg", "signal-max", "signal-avg")
 TOPOLOGIES_HELP = ("Fit Null/Outlier Gaussians on only these score columns, e.g. "
                    "'--topologies ABBA AABB' or 'ABBA,AABB' (default: all of ABBA BABA AABB). "
-                   "Or one 1D per-window signal (--site only): snr = mean(d_max)/std(d_max), "
-                   "signal-max = mean(d_max), signal-avg = mean(d_avg), with per-site "
+                   "Or one 1D per-window signal (--site only): snr-max = mean(d_max)/std(d_max), "
+                   "snr-avg = mean(d_avg)/std(d_avg) (mean/std over the window's sites), signal-max = mean(d_max), signal-avg = mean(d_avg), with per-site "
                    "d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA)/2.")
 
 
@@ -1309,6 +1309,15 @@ def resolve_locus_spec(spec):
     """
     import pathlib
     parts = pathlib.PurePath(str(spec)).parts
+    if len(parts) == 3 and parts[0] == NULL_SIM_CATEGORY:
+        if null_sim_mapping(parts[1]) is None:
+            return None
+        for d in _sim_roots():
+            for ext in FASTA_EXTS:
+                cand = d / NULL_SIM_CATEGORY / "concat" / f"{parts[2]}{ext}"
+                if cand.is_file():
+                    return cand.resolve()
+        return None
     if len(parts) != 4:
         return None
     cat, sub, node, pattern = parts
@@ -1321,16 +1330,43 @@ def resolve_locus_spec(spec):
 
 
 FASTA_EXTS = (".fa", ".fasta", ".fa.gz")
+NULL_SIM_CATEGORY = "null"
 
 
-def _locus_node_dirs(cat, sub, node):
+def _sim_roots():
     import pathlib
     roots = [get_repo_root() / "store" / "simulations", get_repo_root() / "simulations", pathlib.Path("/drive2/iang/simulations")]
     try:
         roots.insert(1, get_data_dir() / "simulations")
     except Exception:
         pass
-    for root in roots:
+    return roots
+
+
+def null_sim_mapping(node):
+    for cat, sub in sorted(SIM_CATEGORY_PAIRS):
+        for d in _locus_node_dirs(cat, sub, node):
+            mappings = sorted(d.glob("neoaves_*_mapping.tsv"))
+            if mappings:
+                return mappings[0].resolve()
+    return None
+
+
+def _is_ordered_null_stem(stem):
+    nums = [int(n) for n in re.findall(r'n(\d+)', stem)]
+    return bool(nums) and stem == "".join(f"n{n}" for n in nums) and nums == sorted(nums)
+
+
+def is_null_sim_fasta(fasta_file):
+    import pathlib
+    d = pathlib.Path(fasta_file).parent
+    if d.name == "concat" or d.name.startswith("concat_"):
+        d = d.parent
+    return d.name == NULL_SIM_CATEGORY and d.parent.name == "simulations"
+
+
+def _locus_node_dirs(cat, sub, node):
+    for root in _sim_roots():
         level = root / cat / sub
         if not level.is_dir():
             continue
@@ -1348,6 +1384,11 @@ def expand_node_spec(spec):
     parts = pathlib.PurePath(str(spec)).parts
     if pathlib.Path(spec).exists():
         return None
+    if len(parts) == 2 and parts[0] == NULL_SIM_CATEGORY:
+        stems = sorted({f.name[:-len(ext)] for root in _sim_roots() for ext in FASTA_EXTS
+                        for f in (root / NULL_SIM_CATEGORY / "concat").glob(f"*{ext}")
+                        if _is_ordered_null_stem(f.name[:-len(ext)])})
+        return [str(pathlib.PurePath(*parts, s)) for s in stems] if stems and null_sim_mapping(parts[1]) else None
     if len(parts) == 1:
         expanded = [s for cat, sub in sorted(SIM_CATEGORY_PAIRS)
                     for s in (expand_node_spec(pathlib.PurePath(cat, sub, parts[0])) or [])]

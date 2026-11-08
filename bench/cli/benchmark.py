@@ -1561,7 +1561,7 @@ class BenchmarkStats:
             "tp": record.tp, "fp": record.fp,
             "fn": record.fn, "tn": record.tn,
             "alt_prop_pred": (
-                (record.tp + record.fn) / total
+                (record.tp + record.fp) / total
                 if None not in (record.tp, record.fp, record.fn, record.tn)
                 and (total := record.tp + record.fp + record.fn + record.tn) > 0
                 else None
@@ -2364,7 +2364,7 @@ PHLAG_ARG_SPECS = [
     ("n_iters", "-L", False),
     ("emission_lambda", "--lam", False),
     ("double_variance_init", "--double-variance-init", True),
-    ("floor_fix", "--floor-fix", True),
+    ("floor_fix", "--floor-fix", "bool"),
     ("no_floor", "--no-floor", True),
     ("null_majority", "--null-majority", "tristate"),
     ("repulsion_optimizer", "--repulsion-optimizer", False),
@@ -2619,8 +2619,8 @@ def _build_parser():
         help="Forwarded to phlag's --double-variance-init.",
     )
     parser.add_argument(
-        "--floor-fix", dest="floor_fix", action="store_true",
-        help="Forwarded to phlag's --floor-fix.",
+        "--floor-fix", dest="floor_fix", action=argparse.BooleanOptionalAction, default=True,
+        help="Forwarded to phlag's --floor-fix/--no-floor-fix (default: on).",
     )
     parser.add_argument(
         "--no-floor", dest="no_floor", action="store_true",
@@ -3121,6 +3121,8 @@ def run_all(args, sim_root, out_dir):
                 report_progress(progress.n, 2 * len(items))
     progress.close()
 
+    from phlag.phlag import pinned_ws_args
+
     def run_phlag_item(item):
         rel_path, fasta_path, scores_path, report_path = item
         with core_token():
@@ -3128,7 +3130,7 @@ def run_all(args, sim_root, out_dir):
                 [sys.executable, "-m", "phlag.phlag", str(scores_path)]
                 + ["--output-base", report_base_override, "--bench"]
                 + phlag_forward_args
-                + ["-s", str(args.step_size)],
+                + pinned_ws_args(scores_path),
                 "phlag",
                 cwd=str(snapshot_root), env=snapshot_env,
             )

@@ -1986,8 +1986,9 @@ def build_parser():
         nargs="+",
         action=TopologiesAction,
         default=None,
-        help="snr, signal-max or signal-avg (--site only): write a 1D per-window 'Signal' column from per-site "
-             "d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA) / 2 (snr = mean(d_max) / std(d_max), "
+        help="snr-max, snr-avg, signal-max or signal-avg (--site only): write a 1D per-window 'Signal' column from per-site "
+             "d_max = AABB - max(ABBA, BABA), d_avg = AABB - (ABBA + BABA) / 2 (over the window's sites: snr-max = mean(d_max) / std(d_max), "
+             "snr-avg = mean(d_avg) / std(d_avg), "
              "signal-max = mean(d_max), signal-avg = mean(d_avg)) under its own nested '<mode>' cache entry. "
              "Column subsets (ABBA AABB, ...) are a phlag fit option; caster always writes all three.",
     )
@@ -2418,8 +2419,18 @@ def run_caster_site(args, repo_root, data_dir, final_output_path, locus_pattern)
     return chunk_scores_path
 
 
+def sim_location(args):
+    from .utils import get_simulation_categories, get_short_sim_name, is_null_sim_fasta, NULL_SIM_CATEGORY
+    if is_null_sim_fasta(args.fasta_file):
+        return None, f"{NULL_SIM_CATEGORY}/{get_short_sim_name(args.mapping.parent.name)}"
+    sim_dir = args.fasta_file.parent
+    if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
+        sim_dir = sim_dir.parent
+    return get_simulation_categories(args.fasta_file), get_short_sim_name(sim_dir.name)
+
+
 def canonical_scores_path(args, normalize_flag, ilr_flag):
-    from .utils import get_data_dir, clean_locus_name, parse_filename_to_dir_structure, get_simulation_categories, get_short_sim_name
+    from .utils import get_data_dir, clean_locus_name, parse_filename_to_dir_structure
     data_dir = get_data_dir()
     window_str = format_val(args.window_size)
     step_str = format_val(args.step_size)
@@ -2429,13 +2440,7 @@ def canonical_scores_path(args, normalize_flag, ilr_flag):
     right_str = format_val(args.right if args.right is not None else 0)
     parsed = parse_filename_to_dir_structure(clean_stem)
     is_sim = "simulations" in args.fasta_file.parts
-    cats = short_sim = None
-    if is_sim:
-        sim_dir = args.fasta_file.parent
-        if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
-            sim_dir = sim_dir.parent
-        cats = get_simulation_categories(args.fasta_file)
-        short_sim = get_short_sim_name(sim_dir.name)
+    cats, short_sim = sim_location(args) if is_sim else (None, None)
     # --bench (set only by benchmark's own subprocess invocations) keeps
     # scores.tsv in the shared canonical tree, keyed only by window/step
     # -- caster's windowed dstar statistics don't depend on dist_type or
@@ -2520,8 +2525,15 @@ def _strip_ws_flags(argv):
     return result
 
 
+_BANNER_SHOWN = False
+
+
 def main(argv=None):
+    global _BANNER_SHOWN
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if not _BANNER_SHOWN:
+        _BANNER_SHOWN = True
+        print(f"[caster] running caster: {' '.join(map(str, raw_argv))}", flush=True)
     args = parse_arguments(argv)
 
     from .utils import expand_node_spec
@@ -2591,11 +2603,14 @@ def main(argv=None):
             sys.exit("Error: No input file found in store/msa/concat or candidate MSA directories.")
         args.fasta_file = recent_fasta
 
+    from .utils import NULL_SIM_CATEGORY, is_null_sim_fasta, null_sim_mapping, get_simulation_node_name
+    null_node = None
     if not args.fasta_file.exists():
         from .utils import resolve_locus_spec
         spec_fasta = resolve_locus_spec(args.fasta_file)
         if spec_fasta is not None:
             print(f"[caster] Resolved locus spec '{args.fasta_file}' -> '{spec_fasta}'")
+            null_node = args.fasta_file.parts[1] if args.fasta_file.parts[0] == NULL_SIM_CATEGORY else None
             args.fasta_file = spec_fasta
 
     # Regenerate mode: a scores.tsv (or chunk_scores.tsv) path was passed
@@ -2669,23 +2684,23 @@ def main(argv=None):
             args.output_file = regen_output_path
         args.bench = False
 
+    if is_null_sim_fasta(args.fasta_file) and args.mapping is None:
+        if null_node is None and regen_output_path is not None:
+            null_node = get_simulation_node_name(regen_output_path)
+        args.mapping = null_sim_mapping(null_node) if null_node else None
+        if args.mapping is None:
+            sys.exit(f"Error: null FASTA '{args.fasta_file}' needs a focal branch: pass null/<node> or -m <mapping>.")
+        print(f"[caster] null simulation scored on {null_node}'s branch: {args.mapping}")
+
     # Ground-truth locus pattern (e.g. '37-62') for CasterPlotter's scatter.png shading.
     clean_stem = clean_locus_name(args.fasta_file.stem)
 
-    from .utils import parse_filename_to_dir_structure, get_simulation_categories, get_short_sim_name
+    from .utils import parse_filename_to_dir_structure, get_short_sim_name
     parsed = parse_filename_to_dir_structure(clean_stem)
     locus_pattern = parsed["pattern"] if parsed else clean_stem
 
-    parts = args.fasta_file.parts
-    is_sim = "simulations" in parts
-    cats = None
-    short_sim = None
-    if is_sim:
-        sim_dir = args.fasta_file.parent
-        if sim_dir.name in ["concat"] or sim_dir.name.startswith("concat_"):
-            sim_dir = sim_dir.parent
-        cats = get_simulation_categories(args.fasta_file)
-        short_sim = get_short_sim_name(sim_dir.name)
+    is_sim = "simulations" in args.fasta_file.parts
+    cats, short_sim = sim_location(args) if is_sim else (None, None)
 
     def _derive_output_path(normalize_flag, ilr_flag, bench=None):
         """
@@ -2748,7 +2763,7 @@ def main(argv=None):
             _write_stats_and_plots()
         return final_output_path
 
-    same_as_bench = not args.shift_caster and args.left == 0 and args.right is None and args.mapping is None
+    same_as_bench = not args.shift_caster and args.left == 0 and args.right is None and (args.mapping is None or is_null_sim_fasta(args.fasta_file))
     if not args.bench and same_as_bench and args.output_file != regen_output_path:
         store_path = _derive_output_path(args.normalize, args.ilr, bench=True)
         if store_path.exists() and store_path.resolve() != final_output_path.resolve():

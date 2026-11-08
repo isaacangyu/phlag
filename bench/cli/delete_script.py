@@ -31,8 +31,8 @@ def resolve_phlag_input(spec, variant_tokens=()):
 
 
 def phlag_targets(argv):
-    from phlag.phlag import Phlag, build_parser
-    from phlag.caster import substitute_ws_in_path
+    from phlag.phlag import Phlag, build_parser, DEFAULT_WINDOW_SIZE
+    from phlag.caster import substitute_ws_in_path, parse_ws_from_path
     args = build_parser().parse_args(argv)
     variant_flags = {"pair": "--pair", "zscale": "-z", "normalize": "-n",
                      "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus"}
@@ -41,12 +41,12 @@ def phlag_targets(argv):
     if args.site is not None:
         variant_tokens += ("--site" if args.site else "--no-site",)
     base = resolve_phlag_input(str(args.caster_scores[0]), variant_tokens)
-    if args.window_size is None:
+    if parse_ws_from_path(base) is None:
         ws_paths = [base]
     else:
         steps = args.step_size if isinstance(args.step_size, list) else [1.0]
         ws_paths = [substitute_ws_in_path(base, w, s if isinstance(s, int) else max(1, round(s * w)))
-                    for w, s in itertools.product(args.window_size, steps)]
+                    for w, s in itertools.product(args.window_size or [DEFAULT_WINDOW_SIZE], steps)]
     beta_primes = [None] if args.beta else (args.beta_prime or [None])
     dirs = []
     for path, (rho, beta, beta_prime) in itertools.product(

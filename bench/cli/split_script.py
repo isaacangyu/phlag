@@ -51,8 +51,12 @@ def get_parser(cmd):
 
 
 def read_commands(path):
+    return parse_commands(pathlib.Path(path).read_text())
+
+
+def parse_commands(text):
     commands = []
-    for line in re.sub(r"\\\n", " ", pathlib.Path(path).read_text()).splitlines():
+    for line in re.sub(r"\\\n", " ", text).splitlines():
         lex = shlex.shlex(line, posix=True, punctuation_chars=";&|")
         lex.whitespace_split = True
         current = []

@@ -210,8 +210,9 @@ def build_parser(input_file=True):
     parser.add_argument(
         "--floor-fix",
         dest="floor_fix",
-        action="store_true",
-        help="Forwarded to phlag's --floor-fix.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Forwarded to phlag's --floor-fix/--no-floor-fix (default: on).",
     )
     parser.add_argument(
         "--no-floor",
@@ -426,8 +427,7 @@ def main(argv=None):
         phlag_extra_args += ["--lam", str(args.emission_lambda)]
     if args.double_variance_init:
         phlag_extra_args += ["--double-variance-init"]
-    if args.floor_fix:
-        phlag_extra_args += ["--floor-fix"]
+    phlag_extra_args += ["--floor-fix" if args.floor_fix else "--no-floor-fix"]
     if args.no_floor:
         phlag_extra_args += ["--no-floor"]
     if args.null_majority is not None:
@@ -463,7 +463,7 @@ def main(argv=None):
         print(f"[phlagster] Running phlag on '{scores_path}'...")
         phlag_main.main(
             [str(scores_path)] + output_base_args + bench_args
-            + phlag_extra_args + phlag_plot_args
+            + phlag_extra_args + phlag_plot_args + phlag_main.pinned_ws_args(scores_path)
         )
 
 
