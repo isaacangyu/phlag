@@ -155,7 +155,7 @@ GT_STATS_FILENAME = "gt_stats.txt"
 STATE_LABELS = {"Null": "Null", "Alt": "Outlier", "Overall": "Overall"}
 _GT_STATS_KEYS = {"Outlier": "Alt"}
 
-PHLAG_PLOT_CHOICES = ["em", "states", "relerr", "correlations", "topologies_3d"]
+PHLAG_PLOT_CHOICES = ["em", "states", "relerr", "correlations", "topologies_3d", "pareto"]
 EM_ITERS_RE = re.compile(r"em_iters_([1-9]\d*)")
 
 
@@ -531,6 +531,7 @@ def clean_locus_name(locus_str):
     s = re.sub(r'_(?:10m_|10m|10M_|10M_)?concat(?:_\w+)?$', '', s, flags=re.IGNORECASE)
     s = re.sub(r'_concat$', '', s, flags=re.IGNORECASE)
     s = re.sub(r'^(?:neoaves_|avian_)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'_inc$', '', s)
     return s
 
 def get_short_sim_name(sim_name):
@@ -549,7 +550,7 @@ def get_short_sim_name(sim_name):
 
 
 _NODE_NAME_PATH_MODIFIERS = {
-    "site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "gaussian", "gmm",
+    "site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null", "gaussian", "gmm",
     "var2x", "repulsion", "annealing", "floor-fix", "no-floor", "null-majority", "no-null-majority",
 }
 _NODE_NAME_WINDOW_RE = re.compile(r'^[wc]\d+[kKmM]?_s\d+[kKmM]?(_z)?$')
@@ -739,6 +740,27 @@ PHLAG_SEGMENT_DEFAULTS = {
 }
 TOPOLOGY_NAMES = ("ABBA", "BABA", "AABB")
 SIGNAL_MODES = ("snr-max", "snr-avg", "signal-max", "signal-avg")
+ALL_NULL_SEGMENT = "all-null"
+ALL_NULL_PATTERN = "n1"
+SHUFFLE_NULL_SEGMENT = "shuffle-null"
+INC_SUFFIX = "_inc"
+
+
+def shuffle_null_fasta(fasta, shuffle=None):
+    import pathlib
+    p = pathlib.Path(fasta)
+    ext = next((e for e in FASTA_EXTS if p.name.endswith(e)), None)
+    if ext is None:
+        return p, False
+    stem = p.name[:-len(ext)]
+    is_inc = stem.endswith(INC_SUFFIX)
+    base_stem = stem[:-len(INC_SUFFIX)] if is_inc else stem
+    base, inc = p.with_name(base_stem + ext), p.with_name(base_stem + INC_SUFFIX + ext)
+    if not (base.is_file() and inc.is_file()):
+        return p, False
+    if shuffle is None:
+        shuffle = not is_inc
+    return (base, True) if shuffle else (inc, False)
 TOPOLOGIES_HELP = ("Fit Null/Outlier Gaussians on only these score columns, e.g. "
                    "'--topologies ABBA AABB' or 'ABBA,AABB' (default: all of ABBA BABA AABB). "
                    "Or one 1D per-window signal (--site only): snr-max = mean(d_max)/std(d_max), "
@@ -1400,7 +1422,7 @@ def expand_node_spec(spec):
     if len(parts) != 3:
         return None
     for d in _locus_node_dirs(*parts):
-        patterns = sorted({f.name[:-len(ext)] for ext in FASTA_EXTS for f in (d / "concat").glob(f"*{ext}")})
+        patterns = sorted({f.name[:-len(ext)] for ext in FASTA_EXTS for f in (d / "concat").glob(f"*{ext}") if not f.name[:-len(ext)].endswith(INC_SUFFIX)})
         if patterns:
             return [str(pathlib.PurePath(*parts, p)) for p in patterns]
     return None

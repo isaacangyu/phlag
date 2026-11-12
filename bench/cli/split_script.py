@@ -9,6 +9,7 @@ import shlex
 import sys
 
 BATCH_DESTS = {"window_size", "step_size", "rho", "beta", "beta_prime"}
+PRIOR_DESTS = {"rho", "beta", "beta_prime"}
 PATH_DESTS = {"create", "output_file"}
 TOGGLE_FLAG = "-b"
 
@@ -80,7 +81,8 @@ def group_tokens(tokens, parser):
         if tok == TOGGLE_FLAG and tok not in options:
             groups.append([tok, None, []])
         elif groups and groups[-1][1] is None and tok in options and (
-                not groups[-1][2] or options[tok].nargs == 0 and options.get(groups[-1][2][0], options[tok]).nargs == 0):
+                not groups[-1][2] or options[tok].nargs == 0 and options.get(groups[-1][2][0], options[tok]).nargs == 0
+                or options[tok].dest in PRIOR_DESTS and getattr(options.get(groups[-1][2][0]), "dest", None) in PRIOR_DESTS):
             groups[-1][2].append(tok)
         elif tok.startswith("-") and (tok in options or (eq and flag in options)):
             name = flag if eq else tok
@@ -239,6 +241,13 @@ def toggle_actions(groups, parser):
                     raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: missing value")
                 given = vals[i + 1:j]
                 alts = [[v] for v in given] if act.nargs in (None, "?") and given else [given]
+                while act.dest in PRIOR_DESTS and j < len(vals) and getattr(
+                        parser._option_string_actions.get(vals[j]), "dest", None) in PRIOR_DESTS:
+                    if j + 1 >= len(vals):
+                        raise SystemExit(f"split_script: {TOGGLE_FLAG} {vals[j]}: missing value")
+                    for alt in alts:
+                        alt += vals[j:j + 2]
+                    j += 2
             elif act is None or act.nargs != 0:
                 raise SystemExit(f"split_script: {TOGGLE_FLAG} {name}: not an on/off flag")
             else:
@@ -251,7 +260,11 @@ def toggle_actions(groups, parser):
 def toggle_label(action, on, vals=()):
     from phlag.utils import PHLAG_SEGMENT_DEFAULTS, phlag_param_segment
     value = " ".join(vals) if vals else True
-    if action.dest in PHLAG_SEGMENT_DEFAULTS:
+    if action.dest in PRIOR_DESTS and len(vals) > 1:
+        given = {action.dest: vals[0], **{f.lstrip("-").replace("-", "_"): v for f, v in zip(vals[1::2], vals[2::2])}}
+        name = (f"rho{float(given['rho'])}_beta{float(given['beta'])}" if "beta" in given
+                else f"rho{float(given['rho'])}_betaprime{float(given['beta_prime'])}")
+    elif action.dest in PHLAG_SEGMENT_DEFAULTS:
         name = phlag_param_segment(action.dest, value)
     else:
         name = action.dest.replace("_", "-") + (f"={','.join(vals)}" if vals else "")

@@ -135,8 +135,8 @@ def substitute_ws_in_path(path, new_val, new_step):
     return None
 
 
-from .utils import SIGNAL_MODES
-VARIANT_MARKERS = ("site", *SIGNAL_MODES, "ilr", "normalize", "norm-eps", "exp-minus")
+from .utils import SIGNAL_MODES, ALL_NULL_SEGMENT, ALL_NULL_PATTERN, SHUFFLE_NULL_SEGMENT
+VARIANT_MARKERS = ("site", *SIGNAL_MODES, "ilr", "normalize", "norm-eps", "exp-minus", ALL_NULL_SEGMENT, SHUFFLE_NULL_SEGMENT)
 
 
 def signal_of_path(path):
@@ -157,7 +157,8 @@ def variant_of_path(path):
     return {
         "pair": mode == "c" and not site, "site": site, "zscale": zscale, "ilr": ilr,
         "normalize": normalize, "norm_eps": norm_eps and normalize, "exp_minus": "exp-minus" in path.parts,
-        "signal": signal_of_path(path),
+        "signal": signal_of_path(path), "all_null": ALL_NULL_SEGMENT in path.parts,
+        "shuffle_null": SHUFFLE_NULL_SEGMENT in path.parts,
     }
 
 
@@ -179,6 +180,10 @@ def substitute_variant_in_path(path, variant):
                 nested += ["normalize", "norm-eps"] if variant["norm_eps"] else ["normalize"]
             if variant["exp_minus"]:
                 nested.append("exp-minus")
+            if variant.get("all_null"):
+                nested.append(ALL_NULL_SEGMENT)
+            if variant.get("shuffle_null"):
+                nested.append(SHUFFLE_NULL_SEGMENT)
             return pathlib.Path(*parts[:i], size, *nested, *parts[j:])
     return None
 
@@ -213,6 +218,10 @@ def adhoc_scores_path(repo_root, args, cats, node_rel, normalize_flag, ilr_flag)
             path = path / "norm-eps"
     if args.exp_minus:
         path = path / "exp-minus"
+    if getattr(args, "all_null", False):
+        path = path / ALL_NULL_SEGMENT
+    if getattr(args, "shuffle_null", False):
+        path = path / SHUFFLE_NULL_SEGMENT
     return path / "scores.tsv"
 
 
@@ -472,6 +481,38 @@ def apply_ilr_to_scores_file(src_path, dst_path, has_q123):
 
 def strip_exp_minus(path):
     return pathlib.Path(*[p for p in pathlib.Path(path).parts if p != "exp-minus"])
+
+
+def strip_all_null(path):
+    return pathlib.Path(*[p for p in pathlib.Path(path).parts if p != ALL_NULL_SEGMENT])
+
+
+def apply_all_null_to_scores_file(src_path, dst_path, locus_pattern):
+    from .utils import parse_pattern_string
+    df = pd.read_csv(src_path, sep="\t")
+    pos = df["pos"].to_numpy(dtype=float)
+    _, intervals, _ = parse_pattern_string(locus_pattern, block_size_bp=500000, total_span=pos.max() if len(pos) else None)
+    alt = np.zeros(len(pos), dtype=bool)
+    for start_bp, end_bp in intervals:
+        alt |= (pos >= start_bp) & (pos <= end_bp)
+    if not alt.any() or alt.all():
+        sys.exit(f"Error: --all-null found {'no' if not alt.any() else 'only'} anomaly windows for pattern '{locus_pattern}' in '{src_path}'.")
+    kept = df["pos"].to_numpy()[~alt]
+    step = np.diff(df["pos"].to_numpy()).min() if len(df) > 1 else 0
+    df = df[~alt].copy()
+    df["pos"] = kept[0] + np.concatenate([[0], np.cumsum(np.minimum(np.diff(kept), step))]).astype(kept.dtype)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(dst_path.parent), prefix=".scores_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            df.to_csv(f, sep="\t", index=False)
+        os.replace(tmp_path, dst_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def apply_exp_minus_to_scores_file(src_path, dst_path):
@@ -1752,7 +1793,7 @@ def write_ground_truth_stats(scores_file, output_dir, locus_pattern=None, dist_t
         stats["OverallWithinMean"] = bucket_means.mean(axis=0).to_numpy().tolist()
         stats["OverallWithinVariance"] = bucket_vars.mean(axis=0).to_numpy().tolist()
 
-    pattern_str = locus_pattern
+    pattern_str = ALL_NULL_PATTERN if ALL_NULL_SEGMENT in pathlib.Path(scores_file).parts else locus_pattern
     if not pattern_str:
         m = re.search(r'((?:[an]\d+(?:-[an]?\d+)?(?:_)?)+|\d+-\d+(?:[;_,]\d+-\d+)*)', str(scores_file))
         pattern_str = m.group(1) if m else None
@@ -1899,6 +1940,25 @@ def build_parser():
              f"{DEFAULT_NORM_EPS} otherwise. Off by default to keep existing "
              f"normalize output bit-for-bit reproducible; on writes to its own "
              f"'normalize/norm-eps' cache entry instead of overwriting it."
+    )
+    parser.add_argument(
+        "--shuffle-null",
+        dest="shuffle_null",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Simulation FASTAs: read <pattern>.fa (shuffled Null blocks, nested "
+             "'shuffle-null' cache entry; default) or, with --no-shuffle-null, the "
+             "ordered <pattern>_inc.fa (no segment). Default follows the input: "
+             "an _inc FASTA or a scores.tsv path without the segment means off."
+    )
+    parser.add_argument(
+        "--all-null",
+        dest="all_null",
+        action="store_true",
+        help="Drop the ground-truth anomaly windows and close the gap (positions after it "
+             "shift down), leaving a shorter all-Null sequence; applied last. Reuses the "
+             "untransformed sibling scores.tsv if present; nested 'all-null' cache "
+             "entry, ground truth all Null."
     )
     parser.add_argument(
         "--exp-minus",
@@ -2489,6 +2549,10 @@ def canonical_scores_path(args, normalize_flag, ilr_flag):
             caster_root = caster_root / "norm-eps"
     if args.exp_minus:
         caster_root = caster_root / "exp-minus"
+    if getattr(args, "all_null", False):
+        caster_root = caster_root / ALL_NULL_SEGMENT
+    if getattr(args, "shuffle_null", False):
+        caster_root = caster_root / SHUFFLE_NULL_SEGMENT
     if parsed:
         rel_dir = parsed["relative_dir_no_window"]
         return caster_root / rel_dir / "scores.tsv"
@@ -2659,6 +2723,10 @@ def main(argv=None):
             args.normalize = is_normalize
             args.norm_eps = norm_eps
             args.exp_minus = "exp-minus" in regen_output_path.parts
+            if args.all_null and ALL_NULL_SEGMENT not in regen_output_path.parts:
+                regen_output_path = substitute_variant_in_path(regen_output_path, {**variant_of_path(regen_output_path), "all_null": True})
+            args.all_null = ALL_NULL_SEGMENT in regen_output_path.parts
+            args.shuffle_null = SHUFFLE_NULL_SEGMENT in regen_output_path.parts
             args.signal = signal_of_path(regen_output_path)
             if mode == "c" and is_site:
                 args.site = True
@@ -2683,6 +2751,9 @@ def main(argv=None):
         if not explicit_ws:
             args.output_file = regen_output_path
         args.bench = False
+
+    from .utils import shuffle_null_fasta
+    args.fasta_file, args.shuffle_null = shuffle_null_fasta(args.fasta_file, args.shuffle_null)
 
     if is_null_sim_fasta(args.fasta_file) and args.mapping is None:
         if null_node is None and regen_output_path is not None:
@@ -2793,9 +2864,23 @@ def main(argv=None):
     # with --plot as the only other flag) also takes this path: final_output_path
     # IS the passed-in file here, so no ilr/normalize is needed to justify
     # skipping recompute -- just redraw the plots from what's already there.
-    if (args.ilr or args.normalize or args.exp_minus or regen_plot_only) and final_output_path.exists():
+    if (args.ilr or args.normalize or args.exp_minus or args.all_null or regen_plot_only) and final_output_path.exists():
         print(f"Found existing scores at '{final_output_path}' -- skipping regeneration.")
-        copy_quartet_counts_if_missing(strip_exp_minus(_derive_output_path(False, False)).parent, plot_data_dir)
+        copy_quartet_counts_if_missing(strip_exp_minus(strip_all_null(_derive_output_path(False, False))).parent, plot_data_dir)
+        _write_stats_and_plots()
+        return final_output_path
+
+    if args.all_null:
+        if regen_output_path is not None:
+            base_path = strip_all_null(regen_output_path)
+            if not base_path.exists():
+                sys.exit(f"Error: --all-null regen needs its untransformed sibling '{base_path}'.")
+        else:
+            base_path = main([t for t in raw_argv if t != "--all-null"])
+        print(f"Dropping anomaly windows ({locus_pattern}) of '{base_path}'...")
+        apply_all_null_to_scores_file(base_path, final_output_path, locus_pattern)
+        print(f"Success: TSV output file generated at: {final_output_path}")
+        copy_quartet_counts_if_missing(base_path.parent, plot_data_dir)
         _write_stats_and_plots()
         return final_output_path
 

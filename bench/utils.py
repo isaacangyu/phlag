@@ -2922,6 +2922,8 @@ class CrossRunAnalysis:
         x, y = (_SCATTER_COLUMN_ALIASES.get(m, m) for m in metrics)
         c = _SCATTER_COLUMN_ALIASES.get(color, color)
         dfs = _load_configs_runs(configs, self._row_filters, self._bin_specs, self._get_args, self._gt_hd_topologies)
+        if {x, y, c} & set(_TOPOLOGY_GT_HD_COLUMNS):
+            dfs = {label: _topology_gt_hd(d, self._get_args) for label, d in dfs.items()}
         for col in (x, y) + ((c,) if c else ()):
             if not any(col in d.columns for d in dfs.values()):
                 raise ValueError(f"{col!r} is not a runs.tsv column (see cra.columns)")
@@ -4174,7 +4176,7 @@ _ECDF_TOPO_COLORS = {"ABBA": "#1F77B4", "BABA": "#D62728", "AABB": "#2CA02C"}
 _RE_STATE_OCCUPANCY = re.compile(r"^State occupancy \(posterior, windows\): Null ([-\d.eE+na]+), (?:Alt|Outlier) ([-\d.eE+na]+)")
 
 
-_SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus", "signal")
+_SCORES_VARIANT_DESTS = ("pair", "site", "chunk_size", "normalize", "zscale", "ilr", "norm_eps", "exp_minus", "signal", "all_null", "shuffle_null")
 
 
 def _scores_with_truth(scores_path, pattern):
@@ -4219,7 +4221,7 @@ def _report_window_labels(report, scores_path, pattern):
     return scores, y_true, y_pred, occupancy
 
 
-_CASTER_VARIANT_DIRS = {"site", "pair", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"}
+_CASTER_VARIANT_DIRS = {"site", "pair", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"}
 _WINDOW_ECDF_LINTHRESH = 1e-2
 
 
@@ -4992,10 +4994,10 @@ def _recorded_from_report_path(report):
     mode, window, step, is_site, is_z, is_ilr, is_norm, norm_eps = parse_ws_from_path(report)
     parts = report.parent.parts
     size_idx = next(i for i, part in enumerate(parts) if _OUT_SIZE_SEGMENT.match(part))
-    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus")]
+    rest = [p for p in parts[size_idx + 1:] if p not in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null")]
     recorded = {
         "window_size": window, "step_size": step, "site": is_site, "zscale": is_z, "ilr": is_ilr,
-        "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "signal": signal_of_path(report), "pair": mode == "c" and not is_site,
+        "normalize": is_norm, "norm_eps": norm_eps, "exp_minus": "exp-minus" in parts, "all_null": "all-null" in parts, "shuffle_null": "shuffle-null" in parts, "signal": signal_of_path(report), "pair": mode == "c" and not is_site,
         "rho": None, "beta": None, "beta_prime": None, **PHLAG_SEGMENT_DEFAULTS, "emission_lambda": None,
     }
     if rest:
@@ -5992,7 +5994,8 @@ def _load_raw_config_df(dirs, get_args, bin_specs=None, columns=None):
 
 _SCATTER_COLUMN_ALIASES = {"bl": "branch_length_cu"}
 _SCATTER_COLUMN_LABELS = {"alt_prop_gt": "ground-truth outlier proportion", "alt_prop_pred": "predicted outlier proportion",
-                          "roc_auc": "ROC-AUC", "f1": "F1"}
+                          "roc_auc": "ROC-AUC", "f1": "F1", "alt_gt_hd": "em_gt_hd (ABBA,BABA)",
+                          "dominant_gt_hd": "em_gt_hd (AABB)"}
 
 
 def _scatter_axis_label(col, gt_hd_topologies=None):
@@ -6041,14 +6044,15 @@ def _gt_moments(row, get_args):
             leaf, leaf, window_size=a.get("window_size"), step_size=a.get("step_size"),
             pair=bool(a.get("pair")), site=bool(a.get("site")), chunk_size=a.get("chunk_size"),
             normalize=bool(a.get("normalize")), zscale=bool(a.get("zscale")), ilr=bool(a.get("ilr")),
-            norm_eps=bool(a.get("norm_eps")), exp_minus=bool(a.get("exp_minus")), signal=signal_of_path(d))
+            norm_eps=bool(a.get("norm_eps")), exp_minus=bool(a.get("exp_minus")), signal=signal_of_path(d),
+            all_null=bool(a.get("all_null")), shuffle_null=bool(a.get("shuffle_null")))
         stats = _gt_stats_cached(str(caster_dir / str(row["pattern"]) / "gt_stats.txt"))
         if "Null" in stats and "Alt" in stats:
             return tuple(tuple(np.array(x, dtype=float) for x in stats[k]) for k in ("Null", "Alt"))
     return _gt_moments_columns(row, "null"), _gt_moments_columns(row, "alt")
 
 
-def _em_gt_hd_subset(df, topologies, get_args):
+def _em_gt_hd_subset(df, topologies, get_args, col="em_gt_hd"):
     """em_gt_hd with every topology outside `topologies` made identical in
     Null and Outlier (mean, variance and covariances set to the Null/Outlier
     average), so only the listed topologies separate the two states."""
@@ -6070,7 +6074,16 @@ def _em_gt_hd_subset(df, topologies, get_args):
             c[:, fixed] = c_avg[:, fixed]
         return gaussian_hellinger2_nd(m0, c0, m1, c1)
 
-    return df.assign(em_gt_hd=df.apply(one, axis=1))
+    return df.assign(**{col: df.apply(one, axis=1)})
+
+
+_TOPOLOGY_GT_HD_COLUMNS = {"alt_gt_hd": ("ABBA", "BABA"), "dominant_gt_hd": ("AABB",)}
+
+
+def _topology_gt_hd(df, get_args):
+    for col, topologies in _TOPOLOGY_GT_HD_COLUMNS.items():
+        df = _em_gt_hd_subset(df, topologies, get_args, col)
+    return df
 
 
 def _load_configs_runs(configs, row_filters=None, bin_specs=None, get_args=None, gt_hd_topologies=None):

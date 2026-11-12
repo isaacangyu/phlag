@@ -929,6 +929,7 @@ class Figure3Data:
     n_runs_hd_alt: int = 0
     n_runs_excluded: int = 0
     exclusions: Dict[str, int] = field(default_factory=dict)
+    all_null: bool = False
 
 
 
@@ -993,7 +994,7 @@ class BenchmarkStats:
     def __init__(self, sim_root=None, dist_type=DEFAULT_DIST_TYPE,
                  window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                  pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                 norm_eps=False, exp_minus=False, signal=None, errorbar="sd"):
+                 norm_eps=False, exp_minus=False, signal=None, errorbar="sd", all_null=False, shuffle_null=False):
         from phlag.utils import get_data_dir
 
         if errorbar not in ERRORBAR_KINDS:
@@ -1018,6 +1019,8 @@ class BenchmarkStats:
         self.exp_minus = exp_minus
         self.signal = signal
         self.errorbar = errorbar
+        self.all_null = all_null
+        self.shuffle_null = shuffle_null
 
         self.runs = []
         self.notes = []
@@ -1174,7 +1177,7 @@ class BenchmarkStats:
             leaf_dir, leaf_dir, window_size=self.window_size, step_size=self.step_size,
             pair=self.pair, site=self.site, chunk_size=self.chunk_size,
             normalize=self.normalize, zscale=self.zscale, ilr=self.ilr, norm_eps=self.norm_eps,
-            exp_minus=self.exp_minus, signal=self.signal,
+            exp_minus=self.exp_minus, signal=self.signal, all_null=self.all_null, shuffle_null=self.shuffle_null,
         )
         gt_stats = read_gt_stats_file(caster_dir / pattern / "gt_stats.txt")
         for label, prefix in (("Null", "null"), ("Alt", "alt"), ("Overall", "pooled")):
@@ -1222,7 +1225,8 @@ class BenchmarkStats:
         else:
             record.anomaly_fraction = nominal_anomaly_fraction(pattern)
             record.anomaly_fraction_source = "nominal" if record.anomaly_fraction is not None else "missing"
-        record.fraction_bin = assign_bin(record.anomaly_fraction, FRACTION_BIN_EDGES)
+        record.fraction_bin = assign_bin(nominal_anomaly_fraction(pattern) if self.all_null else record.anomaly_fraction,
+                                         FRACTION_BIN_EDGES)
 
         if column == COL_ADMIXTURE:
             from phlag.utils import get_admixture_divergence_time, ADMIXTURE_DIVERGENCE_THRESHOLD_MYR
@@ -1252,7 +1256,7 @@ class BenchmarkStats:
 
         record.in_panel_b = True
 
-        if record.f1 is None:
+        if (record.accuracy if self.all_null else record.f1) is None:
             record.exclusion = "no F1 in report (panel B only)"
         elif record.x_bin is None:
             record.exclusion = f"x value {record.x_value} outside every x bin (panel B only)"
@@ -1326,7 +1330,9 @@ class BenchmarkStats:
         self._compute_hd_bins()
         for record in self.runs:
             record.hd_bin = assign_bin(record.em_gt_hd, self.hd_bin_edges)
-            if record.hd_bin is not None and record.f1 is not None:
+            if self.all_null:
+                pass
+            elif record.hd_bin is not None and record.f1 is not None:
                 record.in_panel_hd_alt = True
             elif not record.exclusion:
                 record.exclusion = (
@@ -1360,7 +1366,7 @@ class BenchmarkStats:
         for key, records in panel_a_groups.items():
             column, fraction_bin, x_bin = key
             mean, sd, err_minus, err_plus = summarize_values(
-                [r.f1 for r in records], self.errorbar
+                [r.accuracy if self.all_null else r.f1 for r in records], self.errorbar
             )
             panel_a[key] = PanelACell(
                 column=column, fraction_bin=fraction_bin, x_bin=x_bin,
@@ -1469,6 +1475,7 @@ class BenchmarkStats:
             n_runs_relerr=sum(1 for r in self.runs if r.in_panel_relerr),
             n_runs_em_divergence=sum(1 for r in self.runs if r.in_panel_em_divergence),
             n_runs_hd_alt=sum(1 for r in self.runs if r.in_panel_hd_alt),
+            all_null=self.all_null,
             n_runs_excluded=sum(exclusions.values()),
             exclusions=dict(exclusions),
         )
@@ -1656,7 +1663,7 @@ class BenchmarkStats:
 
             for key in sorted(figure_data.panel_a.keys()):
                 cell = figure_data.panel_a[key]
-                emit("A", cell.column, cell.fraction_bin, cell.x_bin, "f1", cell.n_runs,
+                emit("A", cell.column, cell.fraction_bin, cell.x_bin, "accuracy" if figure_data.all_null else "f1", cell.n_runs,
                      cell.mean_f1, cell.sd_f1, cell.err_minus, cell.err_plus, cell.run_ids)
 
             for key in sorted(figure_data.panel_b.keys()):
@@ -1864,11 +1871,12 @@ class BenchmarkFigurePlotter:
                 else:
                     ax.tick_params(axis="x", labelbottom=False)
                 if col_idx == 0:
-                    ax.set_ylabel(f"alt proportion {fraction_bin}", fontsize=8.5)
+                    ax.set_ylabel(f"{'dropped ' if data.all_null else ''}alt proportion {fraction_bin}", fontsize=8.5)
                 else:
                     ax.tick_params(axis="y", labelleft=False)
 
         fig.suptitle(
+            "Phlag all-Null: accuracy by branch length and dropped alternative fraction" if data.all_null else
             "Phlag anomaly detection: F1 by branch length and alternative sequence fraction",
             fontsize=12, color=_INK_PRIMARY, y=0.995,
         )
@@ -2323,14 +2331,12 @@ class BenchmarkFigurePlotter:
     def render(self):
         """Renders all figures; returns the list of written PNG paths."""
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        return [
-            path for path in [
-                self.render_panel_a(), self.render_panel_b(),
-                self.render_relerr(), self.render_em_divergence(),
-                self.render_hd_alt_f1(), self.render_hd_alt_auc(),
-            ]
-            if path is not None
-        ]
+        if self.data.all_null:
+            renders = [lambda: self.render_panel_a("accuracy.png"), self.render_relerr, self.render_em_divergence]
+        else:
+            renders = [self.render_panel_a, self.render_panel_b, self.render_relerr, self.render_em_divergence,
+                       self.render_hd_alt_f1, self.render_hd_alt_auc]
+        return [path for path in (r() for r in renders) if path is not None]
 
 
 
@@ -2348,6 +2354,8 @@ CASTER_ARG_SPECS = [
     ("normalize", "-n", True),
     ("norm_eps", "--norm-eps", True),
     ("exp_minus", "--exp-minus", True),
+    ("all_null", "--all-null", True),
+    ("shuffle_null", "--shuffle-null", "bool"),
     ("signal", "--topologies", False),
     ("shift_caster", "--shift-caster", True),
     ("pair", "--pair", True),
@@ -2380,6 +2388,7 @@ PHLAG_ARG_SPECS = [
     ("rho", "--rho", False),
     ("beta", "--beta", False),
     ("beta_prime", "--beta-prime", False),
+    ("pareto", "--pareto", True),
 ]
 MIRRORED_DESTS = [dest for dest, _, _ in CASTER_ARG_SPECS] + [dest for dest, _, _ in PHLAG_ARG_SPECS]
 
@@ -2406,6 +2415,13 @@ SEGMENT_CONVENTIONS = [
         is_set=lambda d: d.get("beta") is None and d.get("beta_prime") is not None,
         matches=lambda m, d: d.get("rho") == float(m.group(1)) and d.get("beta_prime") == float(m.group(2)),
         expected=lambda d: f"rho{d.get('rho')}_betaprime{d.get('beta_prime')}",
+    ),
+    dict(
+        name="shuffle_null",
+        regex=re.compile(r"^shuffle-null$"),
+        is_set=lambda d: bool(d.get("shuffle_null")),
+        matches=lambda m, d: bool(d.get("shuffle_null")),
+        expected=lambda d: "shuffle-null",
     ),
 ]
 
@@ -2640,6 +2656,11 @@ def _build_parser():
         help="Forwarded to phlag's --annealing.",
     )
     phlag_group.add_argument(
+        "--pareto", dest="pareto", action="store_true",
+        help="Forwarded to phlag's --pareto (per-locus preset sweep -> <pattern>_pareto.png/.tsv next to each report; "
+             "sweep configs' reports in <label>/ subdirs, not summarized).",
+    )
+    phlag_group.add_argument(
         "--mu", dest="lm_damping", type=float, default=1.0,
         help="Forwarded to phlag's --mu (default: 1.0).",
     )
@@ -2686,6 +2707,18 @@ def _build_parser():
              "ignored if --beta is set).",
     )
 
+    parser.add_argument(
+        "--shuffle-null", dest="shuffle_null", action=argparse.BooleanOptionalAction, default=True,
+        help="Forwarded to caster's --shuffle-null: score the shuffled-Null-block <pattern>.fa "
+             "(default, 'shuffle-null' caster/run-dir segment) or, with --no-shuffle-null, the "
+             "ordered <pattern>_inc.fa (no segment; matches pre-shuffle runs).",
+    )
+    parser.add_argument(
+        "--all-null", dest="all_null", action="store_true",
+        help="Forwarded to caster's --all-null: each run's anomaly windows dropped, leaving "
+             "a shorter all-Null sequence; ground truth all Null. "
+             "Adds an 'all-null' run-dir segment.",
+    )
     parser.add_argument(
         "change",
         nargs="?",
@@ -2785,7 +2818,7 @@ def get_expected_sim_output_dir(sim_path, leaf_dir, dist_type=DEFAULT_DIST_TYPE,
 def get_expected_caster_sim_dir(sim_path, leaf_dir,
                                 window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                                 pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                                norm_eps=False, exp_minus=False, signal=None):
+                                norm_eps=False, exp_minus=False, signal=None, all_null=False, shuffle_null=False):
     """
     Where caster's scores.tsv for ``leaf_dir`` lands -- always the canonical,
     --output-base/dist_type-independent store/caster/w<W>_s<S>/ location (see
@@ -2842,6 +2875,10 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
             base = base / "norm-eps"
     if exp_minus:
         base = base / "exp-minus"
+    if all_null:
+        base = base / "all-null"
+    if shuffle_null:
+        base = base / "shuffle-null"
     if cats:
         return base / cats[0] / cats[1] / short_sim
     return base / short_sim
@@ -2850,14 +2887,14 @@ def get_expected_caster_sim_dir(sim_path, leaf_dir,
 def get_expected_scores_path(fasta_path, leaf_dir,
                              window_size=DEFAULT_WINDOW_SIZE, step_size=DEFAULT_STEP_SIZE,
                              pair=False, site=False, chunk_size=None, normalize=False, zscale=False, ilr=False,
-                             norm_eps=False, exp_minus=False, signal=None):
+                             norm_eps=False, exp_minus=False, signal=None, all_null=False, shuffle_null=False):
     from phlag.utils import clean_locus_name
 
     sim_output_dir = get_expected_caster_sim_dir(
         fasta_path, leaf_dir,
         window_size=window_size, step_size=step_size,
         pair=pair, site=site, chunk_size=chunk_size, normalize=normalize, zscale=zscale, ilr=ilr,
-        norm_eps=norm_eps, exp_minus=exp_minus, signal=signal,
+        norm_eps=norm_eps, exp_minus=exp_minus, signal=signal, all_null=all_null, shuffle_null=shuffle_null,
     )
     pattern_stem = clean_locus_name(fasta_path.stem)
     return sim_output_dir / pattern_stem / "scores.tsv"
@@ -2951,7 +2988,7 @@ def scores_path_for(args, fasta_path, leaf_dir):
         fasta_path, leaf_dir, window_size=args.window_size, step_size=args.step_size,
         pair=args.pair, site=args.site, chunk_size=args.chunk_size,
         normalize=args.normalize, zscale=args.zscale, ilr=args.ilr, norm_eps=args.norm_eps,
-        exp_minus=args.exp_minus, signal=args.signal,
+        exp_minus=args.exp_minus, signal=args.signal, all_null=args.all_null, shuffle_null=args.shuffle_null,
     )
 
 
@@ -3072,7 +3109,6 @@ def run_all(args, sim_root, out_dir):
 
     items = []
     for leaf_dir, rel_path, fasta_path in work_items:
-        pattern_rel = f"{rel_path}/{fasta_path.stem}"
         scores_path = scores_path_for(args, fasta_path, leaf_dir)
         report_path = get_expected_report_path(
             fasta_path, leaf_dir, base_override=report_base_override
@@ -3130,6 +3166,7 @@ def run_all(args, sim_root, out_dir):
                 [sys.executable, "-m", "phlag.phlag", str(scores_path)]
                 + ["--output-base", report_base_override, "--bench"]
                 + phlag_forward_args
+                + (["-o", str(report_path)] if args.pareto else [])
                 + pinned_ws_args(scores_path),
                 "phlag",
                 cwd=str(snapshot_root), env=snapshot_env,
@@ -3140,7 +3177,7 @@ def run_all(args, sim_root, out_dir):
     for item in items:
         rel_path, fasta_path, scores_path, report_path = item
         pattern_rel = f"{rel_path}/{fasta_path.stem}"
-        if report_path.exists():
+        if report_path.exists() and not (args.pareto and not report_path.with_name(f"{report_path.stem}_pareto.tsv").exists()):
             skipped_present += 1
         elif not scores_path.exists():
             msg = f"{pattern_rel}: scores.tsv missing (caster failed above), skipping phlag"
@@ -3344,6 +3381,10 @@ def default_create_path(args):
               for dest in ("chunk_size", "chunk_scores") if getattr(args, dest) is not None]
     parts += [seg for seg in get_phlag_param_segments(args)[1:]
               if not (args.dist_type == "gmm" and seg.startswith("n-clusters="))]
+    if args.all_null:
+        parts.append("all-null")
+    if args.shuffle_null:
+        parts.append("shuffle-null")
     return "/".join(parts)
 
 
@@ -3406,6 +3447,7 @@ def finished_with_same_args(args, out_dir):
     current = json.loads(json.dumps({dest: getattr(args, dest) for dest in MIRRORED_DESTS}, default=str))
     defaults = json.loads(json.dumps({dest: parser.get_default(dest) for dest in MIRRORED_DESTS}, default=str))
     defaults["site"] = False
+    defaults["shuffle_null"] = False
     return all(recorded.get(dest, defaults[dest]) == value for dest, value in current.items())
 
 
@@ -3527,6 +3569,8 @@ def main(argv=None):
             exp_minus=for_args.exp_minus,
             signal=for_args.signal,
             errorbar=for_args.errorbar,
+            all_null=for_args.all_null,
+            shuffle_null=for_args.shuffle_null,
         )
 
     out_dir = resolve_run_dir(args)

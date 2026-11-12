@@ -35,9 +35,11 @@ def phlag_targets(argv):
     from phlag.caster import substitute_ws_in_path, parse_ws_from_path
     args = build_parser().parse_args(argv)
     variant_flags = {"pair": "--pair", "zscale": "-z", "normalize": "-n",
-                     "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus"}
+                     "norm_eps": "--norm-eps", "ilr": "-i", "exp_minus": "--exp-minus", "all_null": "--all-null"}
     variant_tokens = tuple(f for d, f in variant_flags.items() if getattr(args, d))
     variant_tokens += ("--topologies", args.signal) if args.signal else ()
+    if args.shuffle_null is not None:
+        variant_tokens += ("--shuffle-null" if args.shuffle_null else "--no-shuffle-null",)
     if args.site is not None:
         variant_tokens += ("--site" if args.site else "--no-site",)
     base = resolve_phlag_input(str(args.caster_scores[0]), variant_tokens)

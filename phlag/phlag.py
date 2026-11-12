@@ -512,7 +512,7 @@ class Phlag:
                     break
             if size_dir_idx is not None and "caster" not in parts:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"):
                     variant_end += 1
                 if "out" in parts[:size_dir_idx]:
                     prefix_start = len(parts[:size_dir_idx]) - parts[:size_dir_idx][::-1].index("out")
@@ -528,7 +528,7 @@ class Phlag:
                 )
             if size_dir_idx is not None:
                 variant_end = size_dir_idx + 1
-                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while variant_end < len(parts) - 1 and parts[variant_end] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"):
                     variant_end += 1
                 locus = parts[variant_end:-1]
                 if (len(locus) == 4 and tuple(locus[:2]) in SIM_CATEGORY_PAIRS) or (len(locus) == 3 and locus[0] == utils.NULL_SIM_CATEGORY):
@@ -598,7 +598,7 @@ class Phlag:
                 # too, or it leaks into out_dir the same way 'norm-eps'
                 # would have (see phlag/caster.py's own naming-convention
                 # note in _derive_output_path).
-                while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+                while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"):
                     rel_parts.pop(0)
             else:
                 w_s_part = None
@@ -793,6 +793,11 @@ class Phlag:
         # metrics/ground-truth plots) instead of erroring, since standalone
         # runs on non-simulation data or flat-output paths legitimately have
         # no ground truth to compare against.
+        all_null = utils.ALL_NULL_SEGMENT in input_path_obj.parts and not getattr(self.args, "locus_pattern", None)
+        self.gt_pattern_label = (f"pattern {pattern_str} (all-null: anomaly windows removed, ground truth all Null)"
+                                 if all_null else f"pattern {pattern_str}") if pattern_str or all_null else None
+        if all_null:
+            pattern_str = utils.ALL_NULL_PATTERN
         self.has_ground_truth = False
         self.flipped_for_eval = False
         self.anomaly_intervals = None
@@ -967,7 +972,7 @@ class Phlag:
             )
         else:
             metrics_str = "N/A (no ground truth pattern)"
-        print(f"\n[Evaluation Metrics] {metrics_str}\n")
+        print(f"\n[Evaluation Metrics] {self.gt_pattern_label + ': ' if getattr(self, 'gt_pattern_label', None) else ''}{metrics_str}\n")
 
         # Build headers
         from .utils import get_simulation_clade, get_cu_branch_length_from_population_info, get_population_info
@@ -1322,12 +1327,12 @@ class Phlag:
         # only reliably produced in ad-hoc, non-`--bench` runs -- see
         # caster.py's --plot default) and independent of this run's own
         # --plot choice, since it doesn't touch this run's own report/pngs.
-        if not getattr(self.args, "bench", False) and paths:
+        if not getattr(self.args, "bench", False) and not _IN_PARETO and paths:
             scatter_path = pathlib.Path(self.args.caster_scores).parent / "scatter.png"
             if scatter_path.exists():
                 try:
                     primary_path = np.asarray((1 - paths[0]) if flipped_for_eval else paths[0])
-                    predicted_intervals = self._predicted_alt_intervals(sorted_positions, primary_path)
+                    predicted_intervals = self._predicted_alt_intervals(sorted(self.pos_to_caster.keys()), primary_path)
                     CasterPlotter(
                         str(self.args.caster_scores),
                         distribution=getattr(self.args, "model_design", "gaussian"),
@@ -1648,6 +1653,7 @@ class Phlag:
             fasta_file=fasta, window_size=val, step_size=step,
             pair=(mode == "c" and not is_site), site=is_site, chunk_size=(val if mode == "c" else None),
             zscale=is_zscale, norm_eps=norm_eps, exp_minus="exp-minus" in src.parts, signal=signal_of_path(src), left=0, right=None,
+            all_null=utils.ALL_NULL_SEGMENT in src.parts, shuffle_null=utils.SHUFFLE_NULL_SEGMENT in src.parts,
             mapping=utils.null_sim_mapping(utils.get_simulation_node_name(src)) if utils.is_null_sim_fasta(fasta) else None,
         )
         return canonical_scores_path(ns, is_normalize, is_ilr).resolve(), caster_root
@@ -1662,7 +1668,7 @@ class Phlag:
         if src != store_scores and not filecmp.cmp(src, store_scores, shallow=False):
             return None
         rel_parts = list(store_scores.relative_to(caster_root).parts[1:-1])
-        while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"):
+        while rel_parts and rel_parts[0] in ("site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"):
             rel_parts.pop(0)
         if not rel_parts:
             return None
@@ -2332,11 +2338,11 @@ def build_parser():
         type=utils.phlag_plot_choice,
         default=None,
         help="List of plots to generate (choices: em, states, relerr, "
-             "correlations, topologies_3d, em_iters_<N>. Default: em, states and "
+             "correlations, topologies_3d, pareto, em_iters_<N>. Default: em, states and "
              "correlations (em and states with --bench); relerr is "
              "opt-in, saving relerr.png -- fitted-vs-ground-truth relative error "
              "per topology/state/statistic, requires ground truth; "
-             "topologies_3d is opt-in too; em_iters_<N> saves em_iters_<N>.png, "
+             "topologies_3d is opt-in too; pareto (opt-in, needs -b/multi-value flags) runs every config (every flag after -b toggled; --rho/--beta/--beta-prime toggle together, multi-values split), then saves pareto.png/pareto.tsv (fitted em_hd vs posterior Null occupancy, frontier maximizes both) in the reports' common directory and prints frontier metrics -- not part of bare --plot; em_iters_<N> saves em_iters_<N>.png, "
              "ECDFs of the HMM-assigned split after every inner EM step of the "
              "first N outer iterations (one row per outer iteration; always reruns EM). "
              "Passing --plot with no choices explicitly requests all but em_iters).",
@@ -2385,6 +2391,13 @@ def build_parser():
              "if it also has multiple values)."
     )
 
+    parser.add_argument(
+        "--pareto",
+        dest="pareto",
+        action="store_true",
+        help=f"Shorthand for '--plot pareto {' '.join(PARETO_PRESET)}' (appended to any -b already given).",
+    )
+
     hidden = argparse.SUPPRESS
     parser.add_argument("--pair", dest="pair", action="store_true", help=hidden)
     parser.add_argument("--site", dest="site", action=argparse.BooleanOptionalAction, default=None, help=hidden)
@@ -2393,6 +2406,8 @@ def build_parser():
     parser.add_argument("--norm-eps", dest="norm_eps", action="store_true", help=hidden)
     parser.add_argument("-i", "--ilr", dest="ilr", action="store_true", help=hidden)
     parser.add_argument("--exp-minus", dest="exp_minus", action="store_true", help=hidden)
+    parser.add_argument("--all-null", dest="all_null", action="store_true", help=hidden)
+    parser.add_argument("--shuffle-null", dest="shuffle_null", action=argparse.BooleanOptionalAction, default=None, help=hidden)
 
     parser.add_argument(
         "--agg",
@@ -2651,12 +2666,15 @@ def parse_arguments(argv=None):
         parser.error("-i/--ilr and -z/--zscale are mutually exclusive")
     if args.norm_eps and not args.normalize:
         parser.error("--norm-eps requires -n")
-    variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus", "signal")
-    explicit_variant = args.site is not None or any(getattr(args, d) for d in variant_dests)
+    variant_dests = ("pair", "site", "zscale", "ilr", "normalize", "norm_eps", "exp_minus", "signal", "all_null")
+    explicit_variant = args.site is not None or args.shuffle_null is not None or any(getattr(args, d) for d in variant_dests)
     if args.site is None:
         args.site = not args.pair
     variant = {d: getattr(args, d) if d == "signal" else bool(getattr(args, d)) for d in variant_dests} if explicit_variant else None
     default_variant = {d: None if d == "signal" else d == "site" for d in variant_dests}
+    default_variant["shuffle_null"] = True
+    if variant is not None:
+        variant["shuffle_null"] = args.shuffle_null
     if variant and variant["ilr"]:
         variant["normalize"] = variant["norm_eps"] = False
 
@@ -2716,7 +2734,7 @@ def parse_arguments(argv=None):
         # Bare "--plot" (no choices given): plot everything, same as
         # caster.py's own --plot (see phlag/caster.py's main()).
         args.plot = list(utils.PHLAG_PLOT_CHOICES)
-    args.plot = [p for p in args.plot if p != "none"]
+    args.plot = [p for p in args.plot if p not in ("none", "pareto")]
 
     from .utils import get_data_dir, get_repo_root, resolve_input_file, get_most_recent_file
     repo_root = get_repo_root()
@@ -2848,7 +2866,7 @@ def parse_arguments(argv=None):
         def is_variant(sfile):
             ws = parse_ws_from_path(sfile)
             return (ws is None or any(ws[3:])
-                    or bool({"site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus"} & set(sfile.parts)))
+                    or bool({"site", "snr-max", "snr-avg", "signal-max", "signal-avg", "ilr", "normalize", "norm-eps", "exp-minus", "all-null", "shuffle-null"} & set(sfile.parts)))
 
         def ws_config(sfile):
             ws = parse_ws_from_path(sfile)
@@ -2859,9 +2877,13 @@ def parse_arguments(argv=None):
                 src = recover_source_fasta(sfile)
             except (OSError, UnicodeDecodeError):
                 return False
-            return src is not None and src.resolve() == fasta_resolved
+            return src is not None and src.resolve() in fasta_names
 
-        fasta_resolved = fasta_path.resolve()
+        if variant is not None:
+            fasta_path, shuffled = utils.shuffle_null_fasta(fasta_path, variant["shuffle_null"])
+            variant = {**variant, "shuffle_null": shuffled}
+        base_fasta = utils.shuffle_null_fasta(fasta_path, True)[0]
+        fasta_names = {fasta_path.resolve()} | ({base_fasta.resolve()} if variant is not None and not variant["shuffle_null"] else set())
         candidates = resolve_model_scores(target_name=node_name, return_all=True)
         if variant is not None:
             candidates = [c for c in candidates if variant_of_path(c) == variant]
@@ -2906,6 +2928,11 @@ def parse_arguments(argv=None):
             # erroring out later at -w/-s substitution (which needs an
             # existing 'w<...>_s<...>' path segment a raw FASTA never has).
             sibling = resolve_sibling_scores(resolved, variant or default_variant, null_node)
+            if sibling is None and variant is not None and variant["all_null"]:
+                raw = resolve_sibling_scores(resolved, {**variant, "all_null": False}, null_node)
+                if raw is not None:
+                    from .caster import substitute_variant_in_path, variant_of_path
+                    sibling = ensure_all_null_scores(substitute_variant_in_path(raw, {**variant_of_path(raw), "all_null": True}))
             if sibling is None:
                 which = f" matching {[d for d, v in (variant or default_variant).items() if v]}"
                 sys.exit(f"Error: '{resolved}' is a FASTA file with no caster-produced scores.tsv{which} found for it yet -- run caster.py on it first.")
@@ -2915,16 +2942,31 @@ def parse_arguments(argv=None):
             args.caster_scores = resolved
             if variant is not None:
                 from .caster import substitute_variant_in_path
+                if variant["shuffle_null"] is None:
+                    variant["shuffle_null"] = utils.SHUFFLE_NULL_SEGMENT in resolved.parts
                 swapped = substitute_variant_in_path(resolved, variant)
                 if swapped is None:
                     sys.exit(f"Error: caster variant flags need a 'w<...>_s<...>'/'c<...>_s<...>' segment in '{resolved}'.")
-                if not swapped.exists():
+                if not swapped.exists() and not (variant["all_null"] and ensure_all_null_scores(swapped)):
                     sys.exit(f"Error: no scores file at '{swapped}' for the given caster variant flags.")
                 args.caster_scores = swapped
         else:
             sys.exit(f"Error: Score file not found for '{args.caster_scores}' under model output directories or relative paths.")
 
     return args
+
+
+def ensure_all_null_scores(target):
+    from .caster import strip_all_null, main as caster_main
+    target = pathlib.Path(target)
+    if target.exists():
+        return target
+    raw = strip_all_null(target)
+    if not raw.exists():
+        return None
+    print(f"[phlag] --all-null: dropping anomaly windows via caster from '{raw}'", flush=True)
+    caster_main([str(raw), "--all-null", "--plot", "none"])
+    return target if target.exists() else None
 
 
 EM_ARG_DESTS = ("model_design", *(d for d in PHLAG_SEGMENT_DEFAULTS if d != "null_majority"), "rho", "beta", "beta_prime")
@@ -3064,7 +3106,15 @@ def take_values(argv, j, act, options):
     return vals, j
 
 
-def split_toggles(raw_argv, parser):
+PRIOR_DESTS = {"rho", "beta", "beta_prime"}
+
+
+def is_chain_toggle(parser, act):
+    group = next((g for g in parser._action_groups if g.title == "HMM parameters"), None)
+    return group is not None and act in group._group_actions and act.dest not in ("output_base", "locus_pattern", "bench")
+
+
+def split_toggles(raw_argv, parser, chain=False):
     options = parser._option_string_actions
     rest, toggles = [], []
     i = 0
@@ -3085,7 +3135,7 @@ def split_toggles(raw_argv, parser):
                 toggles.append([[opt]])
                 i += 1
                 continue
-            if len(toggles) > start or tok != opt:
+            if (len(toggles) > start and not (chain and is_chain_toggle(parser, act))) or tok != opt:
                 break
             vals, i = take_values(raw_argv, i + 1, act, options)
             if not vals and act.nargs != "?":
@@ -3094,7 +3144,13 @@ def split_toggles(raw_argv, parser):
                 toggles.append([[opt, v] for v in vals])
             else:
                 toggles.append([[opt, *vals]])
-            break
+            while act.dest in PRIOR_DESTS and i < len(raw_argv) and getattr(options.get(raw_argv[i]), "dest", None) in PRIOR_DESTS:
+                nxt = raw_argv[i]
+                more, i = take_values(raw_argv, i + 1, options[nxt], options)
+                for alt in toggles[-1]:
+                    alt += [nxt, *more]
+            if not chain:
+                break
         if len(toggles) == start:
             parser.error(f"{TOGGLE_FLAG} must be followed by the flag(s) to run both with and without")
     return rest, toggles
@@ -3126,29 +3182,28 @@ def toggle_out_path(run_argv, on):
     return run_argv
 
 
-def expand_toggles_and_multi(raw_argv, parser, prog):
+def expand_toggles_and_multi(raw_argv, parser, prog, chain=False, labeled=False):
     import itertools
-    rest, toggles = split_toggles(raw_argv, parser)
+    rest, toggles = split_toggles(raw_argv, parser, chain)
+    runs = []
     if toggles:
-        runs = []
         for choice in itertools.product(*[[[]] + alts for alts in toggles]):
             on = [tok for alt in choice for tok in alt]
             print(f"[{prog}] {TOGGLE_FLAG} -- queued {' '.join(on) or 'baseline'}")
-            runs.append(toggle_out_path(list(rest), on) + on)
-        return runs
-    base, multis = split_multi(raw_argv, parser)
-    if not multis:
-        return None
-    runs = []
-    for combo in itertools.product(*[vals for _, _, vals in multis]):
-        run_argv = list(base)
-        on = []
-        for (idx, flag, _), v in zip(multis, combo):
-            run_argv[idx] = v
-            on += [flag, v]
-        print(f"[{prog}] multi-value -- queued {' '.join(on)}")
-        runs.append(toggle_out_path(run_argv, on))
-    return runs
+            runs.append((" ".join(on) or "baseline", toggle_out_path(list(rest), on) + on))
+    else:
+        base, multis = split_multi(raw_argv, parser)
+        if not multis:
+            return None
+        for combo in itertools.product(*[vals for _, _, vals in multis]):
+            run_argv = list(base)
+            on = []
+            for (idx, flag, _), v in zip(multis, combo):
+                run_argv[idx] = v
+                on += [flag, v]
+            print(f"[{prog}] multi-value -- queued {' '.join(on)}")
+            runs.append((" ".join(on), toggle_out_path(run_argv, on)))
+    return runs if labeled else [argv for _, argv in runs]
 
 
 def pinned_ws_args(scores_path):
@@ -3162,8 +3217,270 @@ def main(argv=None):
     run(argv)
 
 
+def _flatten_reports(result):
+    if isinstance(result, list):
+        return [p for r in result for p in _flatten_reports(r)]
+    return [] if result is None else [pathlib.Path(result)]
+
+
+PARETO_PRESET = ["-b", "--rho", "0.9", "0.7", "0.5", "--beta", "2", "4", "--ap", "repulsion", "--lam", "0.5", "2"]
+
+
+def expand_pareto_flag(argv):
+    argv = [t for t in argv if t != "--pareto"]
+    if "--plot" in argv:
+        argv.insert(argv.index("--plot") + 1, "pareto")
+    else:
+        argv = argv + ["--plot", "pareto"]
+    return argv + (PARETO_PRESET[1:] if "-b" in argv else PARETO_PRESET)
+
+
+PARETO_METRICS = ("TPR", "FPR", "Precision", "F1", "Accuracy", "ROC-AUC")
+
+
+def read_pareto_point(report):
+    point = {"em_hd": np.nan, "null_frac": np.nan, "gt_hd": np.nan, "gt_null_frac": np.nan, **{m: np.nan for m in PARETO_METRICS}}
+    hd_col, gt_col = 6, 7
+    for line in report.read_text().splitlines():
+        if line.startswith("--- Bookkeeping"):
+            break
+        cells = [c.strip() for c in line.split("\t")]
+        if line.startswith("em_hd:"):
+            point["em_hd"] = float(line.split(":", 1)[1])
+        elif cells[0] == "Topology" and "HD" in cells:
+            hd_col = cells.index("HD")
+            gt_col = cells.index("GTHD") if "GTHD" in cells else None
+        elif cells[0] == "Joint":
+            if len(cells) > hd_col and cells[hd_col] not in ("", "-"):
+                point["em_hd"] = float(cells[hd_col])
+            if gt_col is not None and len(cells) > gt_col and cells[gt_col] not in ("", "-"):
+                point["gt_hd"] = float(cells[gt_col])
+        elif m := re.match(r"Anomaly fraction: [^(]*\((\d+)/(\d+) windows\)", line):
+            point["gt_null_frac"] = 1 - int(m.group(1)) / int(m.group(2))
+        elif m := re.match(r"State occupancy \(posterior, windows\): Null ([\d.eE+-]+), Outlier ([\d.eE+-]+)", line):
+            null, alt = float(m.group(1)), float(m.group(2))
+            point["null_frac"] = null / (null + alt)
+        elif line.startswith("TPR:"):
+            for part in line.split(","):
+                key, _, val = part.partition(":")
+                if key.strip() in PARETO_METRICS:
+                    point[key.strip()] = float(val) if val.strip() not in ("", "-", "N/A") else np.nan
+    return point
+
+
+def pareto_mask(xs, ys):
+    pts = np.column_stack([xs, ys])
+    ok = np.isfinite(pts).all(axis=1)
+    return np.array([ok[i] and not any(ok[j] and (pts[j] >= pts[i]).all() and (pts[j] > pts[i]).any()
+                                       for j in range(len(pts))) for i in range(len(pts))])
+
+
+def spread_labels(wants, gap):
+    n = len(wants)
+    wants = [min(max(w, (n - 1 - k) * gap), 1 - k * gap) for k, w in enumerate(wants)]
+    blocks = []
+    for w in wants:
+        blocks.append([w, 1])
+        while len(blocks) > 1:
+            (c1, n1), (c2, n2) = blocks[-2], blocks[-1]
+            if (c1 - (n1 - 1) * gap / 2) - (c2 + (n2 - 1) * gap / 2) >= gap:
+                break
+            blocks[-2:] = [[(c1 * n1 + c2 * n2) / (n1 + n2), n1 + n2]]
+    ys = [c + (n - 1) * gap / 2 - k * gap for c, n in blocks for k in range(n)]
+    if ys and ys[0] > 1:
+        ys = [y - (ys[0] - 1) for y in ys]
+    if ys and ys[-1] < 0:
+        ys = [y - ys[-1] for y in ys]
+    return ys
+
+
+def strip_pareto_plot(argv):
+    if "--plot" not in argv:
+        return argv, False
+    i = argv.index("--plot")
+    j = i + 1
+    while j < len(argv) and not argv[j].startswith("-"):
+        j += 1
+    vals = argv[i + 1:j]
+    kept = [v for v in vals if v != "pareto"]
+    return argv[:i + 1] + (kept if kept or not vals else ["none"]) + argv[j:], "pareto" in vals
+
+
+PARETO_TARGET_NULL_FRAC = 0.9
+
+
+def pareto_score(em_hd, null_frac, rho):
+    if null_frac >= 1 - 1e-3:
+        return np.nan
+    target = PARETO_TARGET_NULL_FRAC if rho is None or not np.isfinite(rho) else rho
+    return em_hd + 1 - abs(null_frac - target)
+
+
+def write_pareto(labels, reports, rhos=None):
+    import os
+    import pandas as pd
+
+    rhos = rhos or [None] * len(labels)
+    df = pd.DataFrame([{"config": lab, **read_pareto_point(rep), "rho": rho, "report": str(rep)}
+                       for lab, rep, rho in zip(labels, reports, rhos)])
+    df["score"] = [pareto_score(h, n, r) for h, n, r in zip(df["em_hd"], df["null_frac"], df["rho"].astype(float))]
+    df["pareto"] = pareto_mask(df["em_hd"].to_numpy(), df["null_frac"].to_numpy())
+    out_dir = pathlib.Path(os.path.commonpath([str(r.parent) for r in reports]))
+    prefix = "" if reports[0].stem == "report" else f"{reports[0].stem}_"
+    df = df.sort_values("score", ascending=False, na_position="last", kind="stable").reset_index(drop=True)
+    df.to_csv(out_dir / f"{prefix}pareto.tsv", sep="\t", index=False)
+    gt = df[["gt_null_frac", "gt_hd"]].dropna()
+    draw_pareto(df, gt, out_dir / f"{prefix}pareto.png")
+
+    cols = ["config", "score", "em_hd", "null_frac", *PARETO_METRICS]
+    if not gt.empty:
+        print(f"[phlag] pareto -- ground truth: HD {gt.iloc[0]['gt_hd']:.3f}, Null fraction {gt.iloc[0]['gt_null_frac']:.3f}")
+    print(f"[phlag] pareto -- frontier ({int(df['pareto'].sum())}/{len(df)} configs):")
+    print(df[df["pareto"]][cols].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    if (~df["pareto"]).any():
+        print("[phlag] pareto -- dominated:")
+        print(df[~df["pareto"]][cols].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    if df["score"].notna().any():
+        best = df.iloc[0]
+        print(f"[phlag] pareto -- performance: {best['score']:.3f} ({best['config']})")
+    print(f"[phlag] pareto -- saved {out_dir / f'{prefix}pareto.png'} and {out_dir / f'{prefix}pareto.tsv'}")
+    return df
+
+
+def draw_pareto(df, gt, png_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    line_pt = 11
+    n_lines = len(df.dropna(subset=["null_frac", "em_hd"])) + (not gt.empty)
+    fig_h = max(4.8, n_lines * line_pt / 72 + 1.3)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
+    fig.subplots_adjust(left=0.09, right=0.6, top=1 - 0.45 / fig_h, bottom=0.6 / fig_h)
+    auc = df["ROC-AUC"].to_numpy(dtype=float)
+    norm = matplotlib.colors.Normalize(*(np.nanmin(auc), np.nanmax(auc)) if np.isfinite(auc).any() else (0, 1))
+    cmap = matplotlib.colormaps["viridis"].with_extremes(bad="#a3a29c")
+    for flag, marker, size, edge, name in ((False, "o", 64, "#fcfcfb", "Dominated"), (True, "^", 130, "#0b0b0b", "Pareto frontier")):
+        sub = df[df["pareto"] == flag]
+        sc = ax.scatter(sub["null_frac"], sub["em_hd"], s=size, marker=marker, c=sub["ROC-AUC"].astype(float), cmap=cmap, norm=norm,
+                        plotnonfinite=True, edgecolor=edge, linewidth=1.2, zorder=3 + flag, label=name)
+    front = df[df["pareto"]].sort_values("null_frac")
+    ax.plot(front["null_frac"], front["em_hd"], color="#0b0b0b", linewidth=1.5, alpha=0.4, zorder=2)
+    cax = ax.inset_axes([0.03, 0.95, 0.3, 0.025])
+    fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation="horizontal")
+    cax.tick_params(labelsize=7)
+    cax.set_title("ROC-AUC", fontsize=8, loc="left")
+    points = [(row["config"], row["null_frac"], row["em_hd"], "#0b0b0b" if row["pareto"] else "#52514e")
+              for _, row in df.dropna(subset=["null_frac", "em_hd"]).iterrows()]
+    if not gt.empty:
+        gx, gy = gt.iloc[0]
+        ax.scatter([gx], [gy], s=260, marker="*", facecolor="none", edgecolor="#0b0b0b", linewidth=1.2, zorder=4, label="Ground truth")
+        points.append(("Ground truth", gx, gy, "#0b0b0b"))
+    ax.margins(x=0.1, y=0.12)
+    fig.canvas.draw()
+    to_axes = ax.transData + ax.transAxes.inverted()
+    gap = line_pt / (ax.get_window_extent().height * 72 / fig.dpi)
+    clusters = []
+    for label, x, y, color in sorted(points, key=lambda p: -to_axes.transform((p[1], p[2]))[1]):
+        pos = to_axes.transform((x, y))
+        hit = next((c for c in clusters if label != "Ground truth" and c["labels"][0][0] != "Ground truth"
+                    and np.hypot(*(c["pos"] - pos)) < 0.015), None)
+        if hit is None:
+            clusters.append({"pos": pos, "xy": (x, y), "labels": [(label, color)]})
+        else:
+            hit["labels"].append((label, color))
+    lines = [(ci, lab, col) for ci, c in enumerate(clusters) for lab, col in c["labels"]]
+    ys = spread_labels([clusters[ci]["pos"][1] for ci, _, _ in lines], gap)
+    for ci, c in enumerate(clusters):
+        cy = [ly for (cj, _, _), ly in zip(lines, ys) if cj == ci]
+        mid = (cy[0] + cy[-1]) / 2
+        ax.annotate("", c["xy"], xytext=(1.02, mid), textcoords="axes fraction", annotation_clip=False,
+                    arrowprops=dict(arrowstyle="-", color="#c3c2b7", linewidth=0.8, shrinkA=0, shrinkB=5))
+        if len(cy) > 1:
+            ax.plot([1.02, 1.02], [cy[-1], cy[0]], transform=ax.transAxes, clip_on=False, color="#c3c2b7", linewidth=0.8)
+    for (_, label, color), ly in zip(lines, ys):
+        ax.text(1.03, ly, label, transform=ax.transAxes, va="center", ha="left", fontsize=8, color=color)
+    ax.set_xlabel("Null fraction of windows (fitted: posterior; GT: true)")
+    ax.set_ylabel("Hellinger distance (Null vs Outlier)")
+    ax.set_title(f"Pareto frontier ({int(df['pareto'].sum())}/{len(df)} configs)", fontsize=10)
+    ax.grid(color="#e8e7e3", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], marker="o", linestyle="none", markersize=7, markerfacecolor="#a3a29c", markeredgecolor="#fcfcfb", label="Dominated"),
+               Line2D([], [], marker="^", linestyle="none", markersize=9, markerfacecolor="#a3a29c", markeredgecolor="#0b0b0b", label="Pareto frontier")]
+    if not gt.empty:
+        handles.append(Line2D([], [], marker="*", linestyle="none", markersize=13, markerfacecolor="none", markeredgecolor="#0b0b0b", label="Ground truth"))
+    ax.legend(handles=handles, frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(0, 0.92))
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+
+
+def _pop_prior_flags(tokens):
+    flags = ("--rho", "--beta", "--beta-prime")
+    rest, vals, i = [], {}, 0
+    while i < len(tokens):
+        if tokens[i] in flags:
+            j = i + 1
+            while j < len(tokens) and not tokens[j].startswith("--"):
+                j += 1
+            vals[tokens[i]] = tokens[i + 1:j]
+            i = j
+        else:
+            rest.append(tokens[i])
+            i += 1
+    return rest, vals
+
+
+def split_prior_values(label, argv):
+    import itertools
+    rest, vals = _pop_prior_flags(argv)
+    if "--beta" in vals:
+        vals.pop("--beta-prime", None)
+    if all(len(v) <= 1 for v in vals.values()):
+        return [(label, argv)]
+    base = [t for t in _pop_prior_flags(label.split())[0] if t != "baseline"]
+    out = []
+    for combo in itertools.product(*vals.values()):
+        pairs = [tok for f, v in zip(vals, combo) for tok in (f, v)]
+        out.append((" ".join(pairs + base), rest + pairs))
+    return out
+
+
+_IN_PARETO = False
+
+
+def run_pareto(raw_argv):
+    global _IN_PARETO
+    runs = expand_toggles_and_multi(raw_argv, build_parser(), "phlag", chain=True, labeled=True)
+    runs = [r for lab, argv in runs or [] for r in split_prior_values(lab, argv)]
+    if "-o" in raw_argv[:-1]:
+        out = pathlib.Path(raw_argv[raw_argv.index("-o") + 1])
+        for lab, argv in runs:
+            if lab != "baseline":
+                argv[argv.index("-o") + 1] = str(out.parent / "_".join(t.lstrip("-") for t in lab.split()) / out.name)
+    if not runs or len(runs) < 2:
+        sys.exit("[phlag] --plot pareto needs multiple configs (-b toggles or multi-value flags)")
+    labels = [lab for lab, _ in runs]
+    _IN_PARETO = True
+    try:
+        per_config = [_flatten_reports(run(run_argv)) for _, run_argv in runs]
+    finally:
+        _IN_PARETO = False
+    if len({len(r) for r in per_config}) != 1:
+        sys.exit("[phlag] pareto: configs produced different numbers of reports; can't pair them up")
+    rhos = [float(v[0]) if (v := _pop_prior_flags(argv)[1].get("--rho")) else None for _, argv in runs]
+    return [write_pareto(labels, list(reports), rhos) for reports in zip(*per_config)]
+
+
 def run(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if "--pareto" in raw_argv:
+        raw_argv = expand_pareto_flag(raw_argv)
+    stripped, pareto = strip_pareto_plot(raw_argv)
+    if pareto:
+        return run_pareto(stripped)
     runs = expand_toggles_and_multi(raw_argv, build_parser(), "phlag")
     if runs is not None:
         return [run(run_argv) for run_argv in runs]
@@ -3206,7 +3523,7 @@ def run(argv=None):
         for w, s in itertools.product(window_sizes, step_sizes):
             step = s if isinstance(s, int) else max(1, round(s * w))
             new_path = substitute_ws_in_path(base_path, w, step)
-            if not new_path.exists():
+            if not new_path.exists() and not (utils.ALL_NULL_SEGMENT in new_path.parts and ensure_all_null_scores(new_path)):
                 seg_dir = next(pathlib.Path(*base_path.parts[:i]) for i in range(len(base_path.parts), 0, -1) if parse_ws_from_path(pathlib.Path(*base_path.parts[:i])) is None)
                 have = sorted(d.name for d in seg_dir.iterdir() if d.is_dir() and parse_ws_from_path(d)) if seg_dir.is_dir() else []
                 sys.exit(f"[phlag] Error: caster has not been run at window {w} / step {step} for this locus.\n"
